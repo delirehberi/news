@@ -1,0 +1,63 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "worker",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-06-29",
+	"routes": [
+		{
+			"pattern": "news-api.emre.xyz",
+			"custom_domain": true
+		}
+	],
+	"d1_databases": [
+		{
+			"binding": "news_db",
+			"database_name": "news-db",
+			"database_id": "60a9e43e-5c7d-4900-842d-82b7f588d36b"
+		}
+	],
+	"vectorize": [
+		{
+			"binding": "VECTORIZE",
+			"index_name": "news-index"
+		}
+	],
+	"triggers": {
+		"crons": ["0 0 * * *"]
+	},
+	"ai": {
+		"binding": "AI"
+	}
+	// "compatibility_flags": [
+	//   "nodejs_compat"
+	// ],
+	// "vars": {
+	//   "MY_VAR": "my-variable"
+	// },
+	// "kv_namespaces": [
+	//   {
+	//     "binding": "MY_KV_NAMESPACE",
+	//     "id": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+	//   }
+	// ],
+	// "r2_buckets": [
+	//   {
+	//     "binding": "MY_BUCKET",
+	//     "bucket_name": "my-bucket"
+	//   }
+	// ],
+	// "d1_databases": [
+	//   {
+	//     "binding": "MY_DB",
+	//     "database_name": "my-database",
+	//     "database_id": ""
+	//   }
+	// ],
+	// "ai": {
+	//   "binding": "AI"
+	// },
+	// "observability": {
+	//   "enabled": true,
+	//   "head_sampling_rate": 1
+	// }
+}

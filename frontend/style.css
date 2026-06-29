@@ -1,0 +1,39 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", "Outfit", sans-serif;
+  
+  /* Custom vibrant colors */
+  --color-accent: #8b5cf6; /* violet-500 */
+  --color-accent-glow: rgba(139, 92, 246, 0.5);
+  
+  /* Dark mode background */
+  --color-bg: #0f172a; /* slate-900 */
+  --color-surface: #1e293b; /* slate-800 */
+  --color-surface-hover: #334155; /* slate-700 */
+}
+
+/* Base resets and dark mode setup */
+html, body {
+  background-color: var(--color-bg);
+  color: #f8fafc; /* slate-50 */
+  font-family: var(--font-sans);
+  min-height: 100vh;
+}
+
+/* Glassmorphism utility */
+.glass {
+  background: rgba(30, 41, 59, 0.7);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+/* Micro-animations */
+.card-hover {
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+.card-hover:hover {
+  transform: translateY(-4px);
+  box-shadow: 0 10px 25px -5px var(--color-accent-glow), 0 8px 10px -6px var(--color-accent-glow);
+}
