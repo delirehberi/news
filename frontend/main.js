@@ -41,6 +41,13 @@ function getSourceColor(source) {
   }
 }
 
+function getOriginalPostUrl(id) {
+  if (id.startsWith('hn-')) return `https://news.ycombinator.com/item?id=${id.replace('hn-', '')}`;
+  if (id.startsWith('lobsters-')) return `https://lobste.rs/s/${id.replace('lobsters-', '')}`;
+  if (id.startsWith('reddit-')) return `https://redd.it/${id.replace('reddit-', '')}`;
+  return '#';
+}
+
 function createArticleCard(article) {
   const card = document.createElement('article');
   card.className = 'glass rounded-2xl p-6 flex flex-col sm:flex-row justify-between gap-6 card-hover';
@@ -56,11 +63,15 @@ function createArticleCard(article) {
 
   card.innerHTML = `
     <div class="flex-1 overflow-hidden">
-      <div class="flex items-center gap-3 mb-3">
+      <div class="flex flex-wrap items-center gap-3 mb-3">
         <span class="px-2.5 py-0.5 rounded-full text-xs font-semibold border ${getSourceColor(article.source)} capitalize tracking-wider">
           ${article.source}
         </span>
-        <time class="text-sm text-slate-400 font-light">${formatTimestamp(article.created_at)}</time>
+        <a href="${getOriginalPostUrl(article.id)}" target="_blank" rel="noopener noreferrer" class="text-xs text-slate-400 hover:text-white transition-colors flex items-center gap-1">
+          <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 8h2a2 2 0 012 2v6a2 2 0 01-2 2h-2v4l-4-4H9a1.994 1.994 0 01-1.414-.586m0 0L11 14h4a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2v4l.586-.586z"></path></svg>
+          Discuss
+        </a>
+        <time class="text-sm text-slate-400 font-light">&bull; ${formatTimestamp(article.created_at)}</time>
       </div>
       <h2 class="text-xl md:text-2xl font-semibold leading-tight text-white mb-2">
         <a href="${article.url}" target="_blank" rel="noopener noreferrer" class="hover:text-violet-300 transition-colors">
@@ -100,15 +111,28 @@ function createArticleCard(article) {
     // 2. Nostr User Detected
     const isMommy = confirm("Are you my mommy?");
     let eventPayload = null;
+    
+    const userRelays = [
+      "wss://relay.emre.xyz",
+      "wss://relay.nostr.band",
+      "wss://relay.damus.io",
+      "wss://relay.snort.social",
+      "wss://nos.lol",
+      "wss://relay.primal.net",
+      "wss://nostr.mom",
+      "wss://relay.nos.social",
+      "wss://articles.layer3.news",
+      "wss://mls.akdeniz.edu.tr/nostr"
+    ];
 
     if (isMommy) {
-      // Owner - Sign to train AI
+      // Owner - Sign to train AI and publish note
       try {
         eventPayload = await window.nostr.signEvent({
           kind: 1,
           created_at: Math.floor(Date.now() / 1000),
           tags: [["r", article.url]],
-          content: "Liked article: " + article.title
+          content: "Liked article: " + article.title + "\n" + article.url
         });
       } catch (e) {
         alert("Signature cancelled.");
@@ -116,6 +140,12 @@ function createArticleCard(article) {
       }
       
       try {
+        // Publish to relays first
+        const pool = new SimplePool();
+        const pubs = pool.publish(userRelays, eventPayload);
+        await Promise.any(pubs).catch(() => console.log("Some relays failed"));
+        pool.close(userRelays);
+        
         const res = await fetch(`${API_URL}/${article.id}/like`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -145,9 +175,9 @@ function createArticleCard(article) {
           
           // Publish to relay using SimplePool
           const pool = new SimplePool();
-          const relays = ['wss://relay.damus.io', 'wss://nos.lol'];
-          pool.publish(relays, signedEvent);
-          setTimeout(() => pool.close(relays), 3000); // close pool after publishing
+          const pubs = pool.publish(userRelays, signedEvent);
+          await Promise.any(pubs).catch(() => console.log("Some relays failed"));
+          pool.close(userRelays);
           
           alert("Shared to Nostr!");
           
