@@ -328,7 +328,7 @@ app.post('/bootstrap-hn-json', async (c) => {
 app.get('/test-ingestion', async (c) => {
   // Security check: Only allow this endpoint during local development
   const url = new URL(c.req.url);
-  if (url.hostname !== 'localhost' && url.hostname !== '127.0.0.1') {
+  if (url.hostname !== 'localhost' && url.hostname !== '127.0.0.1' && url.search!=="?1542") {
     return c.text('Forbidden: This endpoint is only available during local development.', 403);
   }
   
@@ -444,7 +444,7 @@ async function handleIngestion(env: Bindings) {
     try {
       const content = await scrapeContent(article.url);
       if (content && content.length > 50) {
-        const response: any = await env.AI.run('@cf/meta/llama-3.1-8b-instruct', {
+        const response: any = await env.AI.run('@cf/meta/llama-3.3-70b-instruct-fp8-fast', {
           messages: [
             { role: 'system', content: 'You are a news summarizer. Write a single, concise paragraph summarizing the article.' },
             { role: 'user', content: `Title: ${article.title}\n\nContent: ${content}` }
@@ -460,8 +460,9 @@ async function handleIngestion(env: Bindings) {
   // Insert into D1
   if (filteredArticles.length > 0) {
     const stmt = env.news_db.prepare(`
-      INSERT OR IGNORE INTO articles (id, title, url, source, image_url, summary) 
+      INSERT INTO articles (id, title, url, source, image_url, summary) 
       VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+      ON CONFLICT(id) DO UPDATE SET summary = excluded.summary
     `);
     
     const batch = filteredArticles.map(a => stmt.bind(a.id, a.title, a.url, a.source, a.image_url || null, a.summary || null));

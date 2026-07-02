@@ -1,7 +1,9 @@
 import './style.css'
 import { SimplePool } from 'nostr-tools/pool'
 
-const API_URL = 'https://news-api.emre.xyz/api/articles'
+const API_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1' 
+  ? 'http://localhost:8787/api/articles' 
+  : 'https://news-api.emre.xyz/api/articles';
 
 const feedContainer = document.getElementById('feed');
 const loadingIndicator = document.getElementById('loading');
