@@ -10,7 +10,8 @@ const curatedStatus = document.getElementById('curated-status');
 
 function formatTimestamp(isoString) {
   if (!isoString) return '';
-  const date = new Date(isoString);
+  const dateStr = isoString.endsWith('Z') ? isoString : isoString + 'Z';
+  const date = new Date(dateStr);
   return new Intl.DateTimeFormat('en-US', {
     month: 'short', day: 'numeric', hour: 'numeric', minute: 'numeric'
   }).format(date);
@@ -18,7 +19,8 @@ function formatTimestamp(isoString) {
 
 function timeSince(isoString) {
   if (!isoString) return '';
-  const seconds = Math.floor((new Date() - new Date(isoString)) / 1000);
+  const dateStr = isoString.endsWith('Z') ? isoString : isoString + 'Z';
+  const seconds = Math.floor((new Date() - new Date(dateStr)) / 1000);
   let interval = seconds / 31536000;
   if (interval > 1) return Math.floor(interval) + " years ago";
   interval = seconds / 2592000;
@@ -61,6 +63,25 @@ function createArticleCard(article) {
     `;
   }
 
+  let summaryHtml = '';
+  if (article.summary) {
+    summaryHtml = `
+      <p class="text-sm text-slate-300 mt-3 leading-relaxed border-l-2 border-violet-500/50 pl-3 bg-white/5 py-2 pr-2 rounded-r">
+        ${article.summary}
+      </p>
+    `;
+  }
+
+  const likedArticles = JSON.parse(localStorage.getItem('likedArticles') || '[]');
+  const isLikedLocally = likedArticles.includes(article.id);
+  const likeBtnClass = isLikedLocally 
+    ? "like-btn px-5 py-2.5 rounded-xl bg-violet-500/20 border border-violet-500/50 text-white font-medium transition-all flex items-center gap-2 cursor-default"
+    : "like-btn px-5 py-2.5 rounded-xl bg-white/5 hover:bg-violet-500/20 border border-white/10 hover:border-violet-500/50 text-white font-medium transition-all flex items-center gap-2 group cursor-pointer";
+    
+  const svgClass = isLikedLocally
+    ? "w-5 h-5 text-violet-400 fill-violet-400/20 transition-colors like-icon"
+    : "w-5 h-5 text-slate-400 group-hover:text-violet-400 transition-colors like-icon";
+
   card.innerHTML = `
     <div class="flex-1 overflow-hidden">
       <div class="flex flex-wrap items-center gap-3 mb-3">
@@ -78,15 +99,17 @@ function createArticleCard(article) {
           ${article.title}
         </a>
       </h2>
+      ${summaryHtml}
       ${imgHtml}
     </div>
     <div class="flex sm:flex-col items-center justify-center sm:items-end shrink-0 gap-2 mt-4 sm:mt-0">
       <div class="flex flex-col items-center gap-1">
-        <button class="like-btn px-5 py-2.5 rounded-xl bg-white/5 hover:bg-violet-500/20 border border-white/10 hover:border-violet-500/50 text-white font-medium transition-all flex items-center gap-2 group cursor-pointer" data-id="${article.id}">
-          <svg class="w-5 h-5 text-slate-400 group-hover:text-violet-400 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z"></path></svg>
-          <span>Like</span>
+        <button class="${likeBtnClass}" data-id="${article.id}" ${isLikedLocally ? 'disabled' : ''}>
+          <svg class="${svgClass}" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z"></path></svg>
+          <svg class="w-5 h-5 animate-spin hidden loading-icon" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+          <span class="like-text">${isLikedLocally ? 'Liked' : 'Like'}</span>
         </button>
-        <span class="text-xs text-slate-500 font-medium like-count-display ${article.follower_likes > 0 ? '' : 'hidden'}">${article.follower_likes || 0} likes</span>
+        <span class="text-xs text-slate-500 font-medium like-count-display">${article.follower_likes || 0} likes</span>
       </div>
     </div>
   `;
@@ -94,16 +117,40 @@ function createArticleCard(article) {
   const likeBtn = card.querySelector('.like-btn');
   const countDisplay = card.querySelector('.like-count-display');
   
+  const setLikeLoading = (isLoading) => {
+    const icon = likeBtn.querySelector('.like-icon');
+    const loading = likeBtn.querySelector('.loading-icon');
+    if (isLoading) {
+      likeBtn.disabled = true;
+      if (icon) icon.classList.add('hidden');
+      if (loading) loading.classList.remove('hidden');
+    } else {
+      likeBtn.disabled = false;
+      if (icon) icon.classList.remove('hidden');
+      if (loading) loading.classList.add('hidden');
+    }
+  };
+  
   likeBtn.addEventListener('click', async () => {
+    if (likeBtn.disabled) return;
+    
     // 1. Anonymous
     if (!window.nostr) {
+      setLikeLoading(true);
       try {
-        const res = await fetch(`${API_URL}/${article.id}/like`, { method: 'POST' });
+        const res = await fetch(`${API_URL}/${article.id}/like`, { 
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({})
+        });
         if (res.ok) {
           updateLikeUI(likeBtn, countDisplay, article);
+        } else {
+          setLikeLoading(false);
         }
       } catch (e) {
         console.error(e);
+        setLikeLoading(false);
       }
       return;
     }
@@ -139,6 +186,7 @@ function createArticleCard(article) {
         return;
       }
       
+      setLikeLoading(true);
       try {
         // Publish to relays first
         const pool = new SimplePool();
@@ -154,11 +202,17 @@ function createArticleCard(article) {
         
         if (res.status === 403) {
           alert("You are not my mommy! (Wrong Pubkey)");
+          setLikeLoading(false);
           return;
         }
-        if (res.ok) updateLikeUI(likeBtn, countDisplay, article);
+        if (res.ok) {
+          updateLikeUI(likeBtn, countDisplay, article);
+        } else {
+          setLikeLoading(false);
+        }
       } catch (e) {
         console.error(e);
+        setLikeLoading(false);
       }
       
     } else {
@@ -170,9 +224,10 @@ function createArticleCard(article) {
             kind: 1,
             created_at: Math.floor(Date.now() / 1000),
             tags: [["r", article.url]],
-            content: "Check out this curated article: " + article.title + "\\n" + article.url
+            content: "Check out this curated article: " + article.title + "\n" + article.url
           });
           
+          setLikeLoading(true);
           // Publish to relay using SimplePool
           const pool = new SimplePool();
           const pubs = pool.publish(userRelays, signedEvent);
@@ -187,17 +242,33 @@ function createArticleCard(article) {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ event: signedEvent })
           });
-          if (res.ok) updateLikeUI(likeBtn, countDisplay, article);
-          
+          if (res.ok) {
+            updateLikeUI(likeBtn, countDisplay, article);
+          } else {
+            setLikeLoading(false);
+          }
         } catch (e) {
           alert("Failed to share. " + e.message);
+          setLikeLoading(false);
         }
       } else {
         // Declined to share, fallback to Anonymous Like
+        setLikeLoading(true);
         try {
-          const res = await fetch(`${API_URL}/${article.id}/like`, { method: 'POST' });
-          if (res.ok) updateLikeUI(likeBtn, countDisplay, article);
-        } catch (e) { console.error(e) }
+          const res = await fetch(`${API_URL}/${article.id}/like`, { 
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({})
+          });
+          if (res.ok) {
+            updateLikeUI(likeBtn, countDisplay, article);
+          } else {
+            setLikeLoading(false);
+          }
+        } catch (e) { 
+          console.error(e);
+          setLikeLoading(false);
+        }
       }
     }
   });
@@ -206,14 +277,31 @@ function createArticleCard(article) {
 }
 
 function updateLikeUI(btn, countDisplay, article) {
-  btn.classList.add('bg-violet-500/20', 'border-violet-500/50');
-  const svg = btn.querySelector('svg');
-  svg.classList.add('text-violet-400', 'fill-violet-400/20');
+  // Update classes
+  btn.className = "like-btn px-5 py-2.5 rounded-xl bg-violet-500/20 border border-violet-500/50 text-white font-medium transition-all flex items-center gap-2 cursor-default";
+  btn.disabled = true;
+  
+  const icon = btn.querySelector('.like-icon');
+  if(icon) {
+    icon.setAttribute('class', "w-5 h-5 text-violet-400 fill-violet-400/20 transition-colors like-icon");
+    icon.classList.remove('hidden');
+  }
+  const loading = btn.querySelector('.loading-icon');
+  if(loading) loading.classList.add('hidden');
+  
+  const text = btn.querySelector('.like-text');
+  if(text) text.textContent = 'Liked';
   
   // increment visual count
   article.follower_likes = (article.follower_likes || 0) + 1;
   countDisplay.textContent = `${article.follower_likes} likes`;
-  countDisplay.classList.remove('hidden');
+  
+  // save to localStorage
+  const likedArticles = JSON.parse(localStorage.getItem('likedArticles') || '[]');
+  if (!likedArticles.includes(article.id)) {
+    likedArticles.push(article.id);
+    localStorage.setItem('likedArticles', JSON.stringify(likedArticles));
+  }
 }
 
 function interleaveArticles(articles) {

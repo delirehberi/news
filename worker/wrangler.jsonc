@@ -23,7 +23,7 @@
 		}
 	],
 	"triggers": {
-		"crons": ["0 0 * * *"]
+		"crons": ["0 */4 * * *"]
 	},
 	"ai": {
 		"binding": "AI"

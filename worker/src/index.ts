@@ -30,12 +30,12 @@ app.get('/', (c) => {
 
 app.get('/api/articles', async (c) => {
   const { results } = await c.env.news_db.prepare(
-    'SELECT * FROM articles ORDER BY created_at DESC LIMIT 100'
+    "SELECT * FROM articles WHERE created_at >= datetime('now', '-1 day') ORDER BY created_at DESC LIMIT 100"
   ).all();
   
   const latest: any = await c.env.news_db.prepare('SELECT MAX(created_at) as last_curated_at FROM articles').first();
   
-  c.header('Cache-Control', 'public, max-age=86400');
+  c.header('Cache-Control', 'no-cache');
   return c.json({
     meta: {
       last_curated_at: latest?.last_curated_at || null
@@ -78,7 +78,7 @@ app.post('/api/articles/:id/like', async (c) => {
   }
 
   // If it is the owner, mark as liked in DB and train AI
-  await env.news_db.prepare('UPDATE articles SET is_liked = 1 WHERE id = ?').bind(id).run();
+  await env.news_db.prepare('UPDATE articles SET is_liked = 1, follower_likes = follower_likes + 1 WHERE id = ?').bind(id).run();
 
   // Scrape content and upsert to AI memory
   const content = await scrapeContent(article.url as string);
@@ -344,7 +344,7 @@ export default {
 }
 
 async function handleIngestion(env: Bindings) {
-  const rawArticles: { id: string, title: string, url: string, source: string, image_url?: string }[] = [];
+  const rawArticles: { id: string, title: string, url: string, source: string, image_url?: string, summary?: string }[] = [];
 
   // Fetch Hacker News
   try {
@@ -439,14 +439,32 @@ async function handleIngestion(env: Bindings) {
     filteredArticles.push(...rawArticles);
   }
 
+  // Generate summaries for filtered articles
+  for (const article of filteredArticles) {
+    try {
+      const content = await scrapeContent(article.url);
+      if (content && content.length > 50) {
+        const response: any = await env.AI.run('@cf/meta/llama-3.1-8b-instruct', {
+          messages: [
+            { role: 'system', content: 'You are a news summarizer. Write a single, concise paragraph summarizing the article.' },
+            { role: 'user', content: `Title: ${article.title}\n\nContent: ${content}` }
+          ]
+        });
+        article.summary = response.response;
+      }
+    } catch (e) {
+      console.error('Summarization failed for', article.title, e);
+    }
+  }
+
   // Insert into D1
   if (filteredArticles.length > 0) {
     const stmt = env.news_db.prepare(`
-      INSERT OR IGNORE INTO articles (id, title, url, source, image_url) 
-      VALUES (?1, ?2, ?3, ?4, ?5)
+      INSERT OR IGNORE INTO articles (id, title, url, source, image_url, summary) 
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6)
     `);
     
-    const batch = filteredArticles.map(a => stmt.bind(a.id, a.title, a.url, a.source, a.image_url || null));
+    const batch = filteredArticles.map(a => stmt.bind(a.id, a.title, a.url, a.source, a.image_url || null, a.summary || null));
     
     try {
       await env.news_db.batch(batch);
@@ -454,6 +472,13 @@ async function handleIngestion(env: Bindings) {
     } catch (e) {
       console.error('Failed to insert into D1', e);
     }
+  }
+
+  // Cleanup old articles to keep DB small
+  try {
+    await env.news_db.prepare("DELETE FROM articles WHERE created_at < datetime('now', '-2 days')").run();
+  } catch (e) {
+    console.error('Failed to clean up old articles', e);
   }
 }
 

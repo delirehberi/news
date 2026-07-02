@@ -8,5 +8,6 @@ CREATE TABLE articles (
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     is_liked BOOLEAN DEFAULT 0,
     image_url TEXT,
+    summary TEXT,
     follower_likes INTEGER DEFAULT 0
 );
