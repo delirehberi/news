@@ -1,7 +1,7 @@
 @import "tailwindcss";
 
 @theme {
-  --font-sans: "Inter", "Outfit", sans-serif;
+  --font-sans: "Fira Sans", sans-serif;
   
   /* Custom vibrant colors */
   --color-accent: #8b5cf6; /* violet-500 */
