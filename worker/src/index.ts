@@ -14,19 +14,27 @@ type Bindings = {
   GMAIL_CLIENT_SECRET: string;
   GMAIL_REFRESH_TOKEN: string;
   GMAIL_SEARCH_QUERY?: string;
+  FRONTEND_URL?: string;
+  ENABLE_HN?: string;
+  ENABLE_REDDIT?: string;
+  ENABLE_LOBSTERS?: string;
+  ENABLE_GMAIL?: string;
 }
 
 const app = new Hono<{ Bindings: Bindings }>()
 
-app.use('*', cors({
-  origin: (origin) => {
-    // Allow local development and the production frontend
-    if (origin === 'http://localhost:5173' || origin === 'http://127.0.0.1:5173') {
-      return origin;
+app.use('*', async (c, next) => {
+  const corsMiddleware = cors({
+    origin: (origin) => {
+      // Allow local development and the production frontend
+      if (origin === 'http://localhost:5173' || origin === 'http://127.0.0.1:5173') {
+        return origin;
+      }
+      return c.env.FRONTEND_URL || 'https://news.emre.xyz';
     }
-    return 'https://news.emre.xyz';
-  }
-}))
+  });
+  return corsMiddleware(c, next);
+});
 
 app.get('/', (c) => {
   return c.text('News Aggregator API')
@@ -101,6 +109,56 @@ app.post('/api/articles/:id/like', async (c) => {
   } catch (e) {
     console.error('Failed to embed liked article', e);
   }
+
+  return c.json({ success: true });
+})
+
+app.post('/api/articles/:id/dislike', async (c) => {
+  const id = c.req.param('id');
+  const payload = await c.req.json();
+  const event = payload.event;
+  const env = c.env;
+
+  if (!event) {
+    return c.json({ error: 'Signature required for dislike' }, 400);
+  }
+
+  try {
+    const isValid = verifyEvent(event);
+    if (!isValid) {
+      return c.json({ error: 'Invalid signature' }, 400);
+    }
+  } catch (e) {
+    return c.json({ error: 'Error verifying signature' }, 400);
+  }
+
+  if (event.pubkey !== env.AUTHORIZED_NOSTR_PUBKEY) {
+    return c.json({ error: 'Only owner can dislike' }, 403);
+  }
+
+  const article: any = await env.news_db.prepare('SELECT * FROM articles WHERE id = ?').bind(id).first();
+  if (!article) {
+    return c.json({ error: 'Article not found' }, 404);
+  }
+
+  const content = await scrapeContent(article.url as string);
+  const textToEmbed = `Title: ${article.title}\n\nContent: ${content}`;
+  
+  try {
+    const embedRes: any = await env.AI.run('@cf/baai/bge-base-en-v1.5', { text: [textToEmbed] });
+    const embedding = embedRes.data[0];
+    
+    const vectorId = `disliked-${id}`;
+    await env.VECTORIZE.upsert([{
+      id: vectorId,
+      values: embedding,
+      metadata: { source: article.source, type: 'dislike', url: article.url }
+    }]);
+  } catch (e) {
+    console.error('Failed to embed disliked article', e);
+  }
+
+  await env.news_db.prepare('DELETE FROM articles WHERE id = ?').bind(id).run();
 
   return c.json({ success: true });
 })
@@ -330,87 +388,143 @@ app.post('/bootstrap-hn-json', async (c) => {
 });
 
 app.get('/test-ingestion', async (c) => {
-  // Security check: Only allow this endpoint during local development
+  // Security check: Only allow this endpoint during local development or with the secret
   const url = new URL(c.req.url);
-  if (url.hostname !== 'localhost' && url.hostname !== '127.0.0.1' && url.search!=="?1542") {
+  if (url.hostname !== 'localhost' && url.hostname !== '127.0.0.1' && !url.search.includes('1542')) {
     return c.text('Forbidden: This endpoint is only available during local development.', 403);
   }
   
-  await handleIngestion(c.env);
-  return c.text('Ingestion complete! Check your frontend.');
+  const source = c.req.query('source');
+  const stats = await handleIngestion(c.env, source);
+  return c.json({ message: 'Ingestion complete!', stats });
 });
 
 export default {
   fetch: app.fetch,
   async scheduled(event: ScheduledEvent, env: Bindings, ctx: ExecutionContext) {
-    ctx.waitUntil(handleIngestion(env))
+    const sources = [];
+    if (env.ENABLE_HN !== 'false') sources.push('hn');
+    if (env.ENABLE_LOBSTERS !== 'false') sources.push('lobsters');
+    if (env.ENABLE_REDDIT !== 'false') sources.push('reddit');
+    if (env.ENABLE_GMAIL === 'true') sources.push('gmail');
+
+    if (sources.length === 0) return;
+
+    // Run exactly one source per hour to bypass the 50 subrequest limit without using multiple cron triggers
+    const hour = new Date(event.scheduledTime).getUTCHours();
+    const cycle = hour % sources.length;
+    
+    ctx.waitUntil(handleIngestion(env, sources[cycle]));
   }
 }
 
-async function handleIngestion(env: Bindings) {
+async function handleIngestion(env: Bindings, targetSource?: string) {
+  const stats: any = { raw: 0, filtered: 0, inserted: 0, errors: [] };
   const rawArticles: { id: string, title: string, url: string, source: string, image_url?: string, summary?: string }[] = [];
 
-  // Fetch Hacker News
-  try {
-    const hnRes = await fetch('https://hacker-news.firebaseio.com/v0/topstories.json');
-    if (hnRes.ok) {
-      const topIds: number[] = await hnRes.json();
-      const top10 = topIds.slice(0, 10);
-      for (const id of top10) {
-        const itemRes = await fetch(`https://hacker-news.firebaseio.com/v0/item/${id}.json`);
-        if (itemRes.ok) {
-          const item: any = await itemRes.json();
+  if (!targetSource || targetSource === 'hn') {
+    // Fetch Hacker News
+    try {
+      const hnRes = await fetch('https://hacker-news.firebaseio.com/v0/topstories.json');
+      if (hnRes.ok) {
+        const topIds: number[] = await hnRes.json();
+        const top10 = topIds.slice(0, 10);
+        for (const id of top10) {
+          const itemRes = await fetch(`https://hacker-news.firebaseio.com/v0/item/${id}.json`);
+          if (itemRes.ok) {
+            const item: any = await itemRes.json();
+            if (item.url) {
+              rawArticles.push({
+                id: `hn-${item.id}`,
+                title: item.title,
+                url: item.url,
+                source: 'hackernews'
+              });
+            }
+          }
+        }
+      }
+    } catch (e: any) { stats.errors.push('HN error: ' + e.message); console.error('HN error', e); }
+  }
+
+  if (!targetSource || targetSource === 'lobsters') {
+    // Fetch Lobsters
+    try {
+      const lobstersRes = await fetch('https://lobste.rs/hottest.json');
+      if (lobstersRes.ok) {
+        const lobsters: any[] = await lobstersRes.json();
+        const top10 = lobsters.slice(0, 10);
+        for (const item of top10) {
           if (item.url) {
             rawArticles.push({
-              id: `hn-${item.id}`,
+              id: `lobsters-${item.short_id}`,
               title: item.title,
               url: item.url,
-              source: 'hackernews'
+              source: 'lobsters'
             });
           }
         }
       }
-    }
-  } catch (e) { console.error('HN error', e); }
+    } catch (e: any) { stats.errors.push('Lobsters error: ' + e.message); console.error('Lobsters error', e); }
+  }
 
-  // Fetch Lobsters
-  try {
-    const lobstersRes = await fetch('https://lobste.rs/hottest.json');
-    if (lobstersRes.ok) {
-      const lobsters: any[] = await lobstersRes.json();
-      const top10 = lobsters.slice(0, 10);
-      for (const item of top10) {
-        if (item.url) {
-          rawArticles.push({
-            id: `lobsters-${item.short_id}`,
-            title: item.title,
-            url: item.url,
-            source: 'lobsters'
-          });
+  if (!targetSource || targetSource === 'reddit') {
+    // Fetch Reddit
+    try {
+      const redditArticles = await fetchRedditPosts(env);
+      rawArticles.push(...redditArticles);
+    } catch (e: any) { stats.errors.push('Reddit error: ' + e.message); console.error('Reddit error', e); }
+  }
+
+  if (!targetSource || targetSource === 'gmail') {
+    // Fetch Gmail Newsletters
+    try {
+      const newsletterArticles = await fetchGmailNewsletters(env);
+      rawArticles.push(...newsletterArticles);
+    } catch (e: any) { stats.errors.push('Gmail error: ' + e.message); console.error('Gmail error', e); }
+  }
+
+  stats.raw = rawArticles.length;
+  if (rawArticles.length === 0) return stats;
+
+  // Deduplicate rawArticles by URL before slicing to ensure we don't try to insert duplicates in the same batch
+  const uniqueRawArticles = [];
+  const seenUrls = new Set();
+  for (const a of rawArticles) {
+    if (!seenUrls.has(a.url)) {
+      seenUrls.add(a.url);
+      uniqueRawArticles.push(a);
+    }
+  }
+
+  // Cloudflare Workers have a 50 subrequest limit per invocation.
+  // If we run ALL sources (no targetSource), API calls use ~20 subrequests, so we cap scraping to 20.
+  // If we run a SINGLE source (via cron), API calls use ~5 subrequests, so we can safely scrape up to 40.
+  const limit = targetSource ? 40 : 20;
+  const limitedRawArticles = uniqueRawArticles.slice(0, limit);
+
+  // PREVENT UNIQUE(url) constraints by mapping existing URLs to their existing IDs!
+  if (limitedRawArticles.length > 0) {
+    const urls = limitedRawArticles.map(a => a.url);
+    const placeholders = urls.map(() => '?').join(',');
+    try {
+      const existing = await env.news_db.prepare(`SELECT url, id FROM articles WHERE url IN (${placeholders})`).bind(...urls).all();
+      const existingMap = new Map(existing.results.map((r: any) => [r.url, r.id]));
+      for (const article of limitedRawArticles) {
+        if (existingMap.has(article.url)) {
+          article.id = existingMap.get(article.url); // Use existing DB id to trigger ON CONFLICT(id) properly
         }
       }
+    } catch (e) {
+      console.error('URL map check error', e);
     }
-  } catch (e) { console.error('Lobsters error', e); }
-
-  // Fetch Reddit
-  try {
-    const redditArticles = await fetchRedditPosts(env);
-    rawArticles.push(...redditArticles);
-  } catch (e) { console.error('Reddit error', e); }
-
-  // Fetch Gmail Newsletters
-  try {
-    const newsletterArticles = await fetchGmailNewsletters(env);
-    rawArticles.push(...newsletterArticles);
-  } catch (e) { console.error('Gmail error', e); }
-
-  if (rawArticles.length === 0) return;
+  }
 
   // Filter based on Vectorize AI
   const filteredArticles = [];
   try {
     // We scrape all contents concurrently
-    const textsToEmbed = await Promise.all(rawArticles.map(async a => {
+    const textsToEmbed = await Promise.all(limitedRawArticles.map(async a => {
       const content = await scrapeContent(a.url);
       return `Title: ${a.title}\n\nContent: ${content}`;
     }));
@@ -420,12 +534,12 @@ async function handleIngestion(env: Bindings) {
     const embeddings = embedRes.data;
 
     // Query Vectorize for each
-    for (let i = 0; i < rawArticles.length; i++) {
-      const article = rawArticles[i];
+    for (let i = 0; i < limitedRawArticles.length; i++) {
+      const article = limitedRawArticles[i];
       const embedding = embeddings[i];
       
       try {
-        const queryRes = await env.VECTORIZE.query(embedding, { topK: 1 });
+        const queryRes = await env.VECTORIZE.query(embedding, { topK: 1, returnMetadata: 'all' });
         const matches = queryRes.matches;
         // Accept if no history (Cold Start) OR if there's a highly similar upvoted item
         if (matches.length === 0) {
@@ -434,20 +548,27 @@ async function handleIngestion(env: Bindings) {
           const bestMatch = matches[0];
           // Cosine similarity threshold (adjust as needed, typically 0.65 - 0.75 is a good start)
           if (bestMatch.score >= 0.70) {
-            filteredArticles.push(article);
+            if (bestMatch.metadata?.type === 'dislike') {
+              // Reject, do nothing
+            } else {
+              filteredArticles.push(article);
+            }
           }
         }
-      } catch (e) {
+      } catch (e: any) {
         console.error('Vectorize query error', e);
         // If error querying vectorize, fallback to insert
         filteredArticles.push(article);
       }
     }
-  } catch (e) {
+  } catch (e: any) {
+    stats.errors.push('AI Embed error: ' + e.message);
     console.error('AI Embed error', e);
     // If AI fails, fallback to insert all
-    filteredArticles.push(...rawArticles);
+    filteredArticles.push(...limitedRawArticles);
   }
+
+  stats.filtered = filteredArticles.length;
 
   // Generate summaries for filtered articles
   for (const article of filteredArticles) {
@@ -479,8 +600,10 @@ async function handleIngestion(env: Bindings) {
     
     try {
       await env.news_db.batch(batch);
+      stats.inserted = batch.length;
       console.log(`Successfully attempted to insert ${batch.length} articles`);
-    } catch (e) {
+    } catch (e: any) {
+      stats.errors.push('D1 Batch error: ' + e.message);
       console.error('Failed to insert into D1', e);
     }
   }
@@ -488,9 +611,12 @@ async function handleIngestion(env: Bindings) {
   // Cleanup old articles to keep DB small
   try {
     await env.news_db.prepare("DELETE FROM articles WHERE created_at < datetime('now', '-2 days')").run();
-  } catch (e) {
+  } catch (e: any) {
+    stats.errors.push('Cleanup error: ' + e.message);
     console.error('Failed to clean up old articles', e);
   }
+
+  return stats;
 }
 
 async function fetchRedditPosts(env: Bindings) {
@@ -610,18 +736,31 @@ async function fetchGmailNewsletters(env: Bindings) {
     
     // Extract body content
     let bodyData = "";
+    let isHtml = false;
     if (msgData.payload.parts) {
-      // Find text/plain or text/html
-      const part = msgData.payload.parts.find((p: any) => p.mimeType === "text/plain") || msgData.payload.parts.find((p: any) => p.mimeType === "text/html");
-      if (part && part.body && part.body.data) {
-        bodyData = part.body.data;
+      // Find text/html first, fallback to text/plain
+      const htmlPart = msgData.payload.parts.find((p: any) => p.mimeType === "text/html");
+      const textPart = msgData.payload.parts.find((p: any) => p.mimeType === "text/plain");
+      
+      if (htmlPart && htmlPart.body && htmlPart.body.data) {
+        bodyData = htmlPart.body.data;
+        isHtml = true;
+      } else if (textPart && textPart.body && textPart.body.data) {
+        bodyData = textPart.body.data;
       } else if (msgData.payload.parts[0]?.parts) {
          // Handle nested multipart
-         const subpart = msgData.payload.parts[0].parts.find((p: any) => p.mimeType === "text/plain");
-         if (subpart && subpart.body && subpart.body.data) bodyData = subpart.body.data;
+         const subHtml = msgData.payload.parts[0].parts.find((p: any) => p.mimeType === "text/html");
+         const subText = msgData.payload.parts[0].parts.find((p: any) => p.mimeType === "text/plain");
+         if (subHtml && subHtml.body && subHtml.body.data) {
+           bodyData = subHtml.body.data;
+           isHtml = true;
+         } else if (subText && subText.body && subText.body.data) {
+           bodyData = subText.body.data;
+         }
       }
     } else if (msgData.payload.body && msgData.payload.body.data) {
       bodyData = msgData.payload.body.data;
+      if (msgData.payload.mimeType === "text/html") isHtml = true;
     }
 
     if (!bodyData) continue;
@@ -629,15 +768,46 @@ async function fetchGmailNewsletters(env: Bindings) {
     // Base64url decode
     const textContent = decodeBase64Utf8(bodyData);
     
-    // Limit text size to avoid token overflow
-    const truncatedText = textContent.substring(0, 4000);
+    let textToAnalyze = "";
+    if (isHtml) {
+      const linksMap: { href: string, text: string }[] = [];
+      let currentLink: any = null;
+      
+      const rewriter = new HTMLRewriter().on('a', {
+        element(el) {
+          const href = el.getAttribute('href');
+          if (href && href.startsWith('http')) {
+            currentLink = { href, text: '' };
+            linksMap.push(currentLink);
+          } else {
+            currentLink = null;
+          }
+        },
+        text(textChunk) {
+          if (currentLink) {
+            currentLink.text += textChunk.text;
+          }
+        }
+      });
+      
+      await rewriter.transform(new Response(textContent)).text();
+      
+      const validLinks = linksMap
+        .map(l => ({ href: l.href, text: l.text.replace(/\s+/g, ' ').trim() }))
+        .filter(l => l.text.length > 2 && !l.href.toLowerCase().includes('unsubscribe') && !l.href.includes('twitter.com') && !l.href.includes('facebook.com') && !l.href.includes('instagram.com') && !l.href.includes('linkedin.com'));
+        
+      const linkStrings = validLinks.map(l => `- [${l.text}](${l.href})`);
+      textToAnalyze = linkStrings.slice(0, 150).join('\n');
+    } else {
+      textToAnalyze = textContent.substring(0, 4000);
+    }
 
     // 3. Extract Links using AI
     try {
       const aiResponse: any = await env.AI.run('@cf/meta/llama-3.3-70b-instruct-fp8-fast', {
         messages: [
-          { role: 'system', content: 'You are an assistant that extracts news article links and their titles from a newsletter email. Return ONLY a raw JSON array of objects with "title" and "url" properties. Do not include markdown formatting or any other text. Ignore unsubscribe links, social media profiles, and sponsor links.' },
-          { role: 'user', content: truncatedText }
+          { role: 'system', content: 'You are an assistant that curates news. You are given a list of markdown links (or raw text) extracted from a newsletter. Filter out unsubscribe links, social media profiles, navigation links, and sponsor links. Return ONLY a raw JSON array of objects with "title" and "url" properties representing the actual news articles/content. Do not include markdown formatting or any other text.' },
+          { role: 'user', content: textToAnalyze }
         ]
       });
 
@@ -649,7 +819,17 @@ async function fetchGmailNewsletters(env: Bindings) {
         responseText = responseText.replace(/^\`\`\`\n?/, '').replace(/\n?\`\`\`$/, '');
       }
 
-      const extractedLinks = JSON.parse(responseText);
+      let extractedLinks = [];
+      try {
+        extractedLinks = JSON.parse(responseText);
+      } catch(e) {
+        // Fallback: If JSON is malformed, use regex to extract titles and URLs safely.
+        const regex = /"title"\s*:\s*"([^"]+)"\s*,\s*"url"\s*:\s*"([^"]+)"/g;
+        let match;
+        while ((match = regex.exec(responseText)) !== null) {
+          extractedLinks.push({ title: match[1], url: match[2] });
+        }
+      }
       
       for (const link of extractedLinks) {
         if (link.url && link.title) {

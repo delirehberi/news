@@ -5,18 +5,16 @@
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>AI Curated News</title>
-    <!-- Theme CSS and Components -->
-    <link rel="stylesheet" href="https://emre.xyz/components/theme.css">
-    <script type="module" src="https://emre.xyz/components/ui.js"></script>
+    <!-- Theme configuration is handled dynamically in main.js -->
   </head>
-  <body class="antialiased emre-unified">
-    <emre-header active-page="news"></emre-header>
+  <body class="antialiased">
+    <div id="header-container"></div>
     
     <div class="fixed inset-0 bg-gradient-to-br from-slate-900 via-[#111827] to-[#1e1b4b] -z-10"></div>
     
     <div class="pt-4 pb-8 text-center relative">
-      <p class="text-slate-400 text-lg md:text-xl font-light tracking-wide mb-2">
-        delirehberi's personalized feed from HN, Lobsters, and Reddit
+      <p id="app-subtitle" class="text-slate-400 text-lg md:text-xl font-light tracking-wide mb-2">
+        %VITE_APP_SUBTITLE%
       </p>
       <p id="curated-status" class="text-xs text-violet-400/80 font-mono hidden"></p>
     </div>
@@ -32,7 +30,7 @@
       </div>
     </main>
 
-    <emre-footer></emre-footer>
+    <div id="footer-container"></div>
 
     <script type="module" src="/main.js"></script>
   </body>

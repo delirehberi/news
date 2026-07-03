@@ -23,12 +23,19 @@
 		}
 	],
 	"triggers": {
-		"crons": ["0 */4 * * *"]
+		"crons": [
+			"0 * * * *"
+		]
 	},
 	"ai": {
 		"binding": "AI"
 	},
 	"vars": {
+		"FRONTEND_URL": "https://news.emre.xyz",
+		"ENABLE_HN": "true",
+		"ENABLE_REDDIT": "true",
+		"ENABLE_LOBSTERS": "true",
+		"ENABLE_GMAIL": "false",
 		"GMAIL_SEARCH_QUERY": "label:newsletter"
 		// Require secrets: GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN
 	}

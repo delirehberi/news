@@ -1,0 +1,45 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "worker",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-06-29",
+	// "routes": [
+	// 	{
+	// 		"pattern": "api.yourdomain.com",
+	// 		"custom_domain": true
+	// 	}
+	// ],
+	"d1_databases": [
+		{
+			"binding": "news_db",
+			"database_name": "news-db",
+			"database_id": "<YOUR_D1_DATABASE_ID>"
+		}
+	],
+	"vectorize": [
+		{
+			"binding": "VECTORIZE",
+			"index_name": "news-index"
+		}
+	],
+	"triggers": {
+		"crons": [
+			"0 * * * *"
+		]
+	},
+	"ai": {
+		"binding": "AI"
+	},
+	"vars": {
+		"FRONTEND_URL": "https://yourfrontend.com",
+		"ENABLE_HN": "true",
+		"ENABLE_REDDIT": "true",
+		"ENABLE_LOBSTERS": "true",
+		"ENABLE_GMAIL": "false",
+		"GMAIL_SEARCH_QUERY": "label:newsletter"
+		// Require secrets:
+		// AUTHORIZED_NOSTR_PUBKEY
+		// REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, REDDIT_REFRESH_TOKEN (if ENABLE_REDDIT is true)
+		// GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN (if ENABLE_GMAIL is true)
+	}
+}

@@ -10,14 +10,18 @@ init:
 	@echo "Initializing project for local development..."
 	bash -c '$(NVM_CMD) cd worker && npm install'
 	bash -c '$(NVM_CMD) cd frontend && npm install'
+	@echo "Creating configuration files from templates..."
+	@if [ ! -f worker/wrangler.jsonc ]; then cp worker/wrangler.example.jsonc worker/wrangler.jsonc; echo "Created worker/wrangler.jsonc"; fi
+	@if [ ! -f frontend/.env ]; then cp frontend/.env.example frontend/.env; echo "Created frontend/.env"; fi
 	@echo "--------------------------------------------------------"
-	@echo "✅ Dependencies installed!"
+	@echo "✅ Dependencies installed and config templates created!"
 	@echo "Next steps for new developers:"
 	@echo "1. Run 'make db-init' to create your Cloudflare D1 database."
 	@echo "2. Run 'make vectorize-init' to create your Vectorize index."
 	@echo "3. Update 'worker/wrangler.jsonc' with the new IDs generated from steps 1 & 2."
-	@echo "4. Export your secrets to your terminal (or use .envrc), then run 'make push-secrets'."
-	@echo "5. Run 'make db-apply-remote' to build the DB tables."
+	@echo "4. Update 'frontend/.env' with your desired API URL and frontend configuration."
+	@echo "5. Export your secrets to your terminal (or use .envrc), then run 'make push-secrets'."
+	@echo "6. Run 'make db-apply-remote' to build the DB tables."
 	@echo "--------------------------------------------------------"
 
 push-secrets:
@@ -25,6 +29,9 @@ push-secrets:
 	bash -c '$(NVM_CMD) cd worker && echo "$$REDDIT_CLIENT_ID" | npx wrangler secret put REDDIT_CLIENT_ID'
 	bash -c '$(NVM_CMD) cd worker && echo "$$REDDIT_CLIENT_SECRET" | npx wrangler secret put REDDIT_CLIENT_SECRET'
 	bash -c '$(NVM_CMD) cd worker && echo "$$REDDIT_REFRESH_TOKEN" | npx wrangler secret put REDDIT_REFRESH_TOKEN'
+	bash -c '$(NVM_CMD) cd worker && echo "$$GMAIL_CLIENT_ID" | npx wrangler secret put GMAIL_CLIENT_ID'
+	bash -c '$(NVM_CMD) cd worker && echo "$$GMAIL_CLIENT_SECRET" | npx wrangler secret put GMAIL_CLIENT_SECRET'
+	bash -c '$(NVM_CMD) cd worker && echo "$$GMAIL_REFRESH_TOKEN" | npx wrangler secret put GMAIL_REFRESH_TOKEN'
 	bash -c '$(NVM_CMD) cd worker && echo "$$AUTHORIZED_NOSTR_PUBKEY" | npx wrangler secret put AUTHORIZED_NOSTR_PUBKEY'
 	@echo "Secrets pushed successfully!"
 

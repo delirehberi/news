@@ -1,9 +1,48 @@
 import './style.css'
 import { SimplePool } from 'nostr-tools/pool'
 
-const API_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1' 
-  ? 'http://localhost:8787/api/articles' 
-  : 'https://news-api.emre.xyz/api/articles';
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8787/api/articles';
+
+// Initialize Theme
+const headerContainer = document.getElementById('header-container');
+const footerContainer = document.getElementById('footer-container');
+
+if (import.meta.env.VITE_USE_EMRE_THEME === 'true') {
+  document.body.classList.add('emre-unified');
+  
+  const link = document.createElement('link');
+  link.rel = 'stylesheet';
+  link.href = 'https://emre.xyz/components/theme.css';
+  document.head.appendChild(link);
+  
+  const script = document.createElement('script');
+  script.type = 'module';
+  script.src = 'https://emre.xyz/components/ui.js';
+  document.head.appendChild(script);
+  
+  if (headerContainer) headerContainer.innerHTML = '<emre-header active-page="news"></emre-header>';
+  if (footerContainer) footerContainer.innerHTML = '<emre-footer></emre-footer>';
+} else {
+  if (headerContainer) {
+    headerContainer.innerHTML = `
+      <header class="w-full glass border-b border-white/10 sticky top-0 z-50">
+        <div class="max-w-3xl mx-auto px-4 h-16 flex items-center justify-between">
+          <h1 class="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-violet-400 to-fuchsia-400">AI News</h1>
+          <nav class="flex gap-4">
+            <a href="/" class="text-sm font-medium text-white hover:text-violet-300 transition-colors">Feed</a>
+          </nav>
+        </div>
+      </header>
+    `;
+  }
+  if (footerContainer) {
+    footerContainer.innerHTML = `
+      <footer class="w-full border-t border-white/10 mt-12 py-8 text-center text-slate-500 text-sm">
+        <p>Built with ❤️ and Cloudflare Workers.</p>
+      </footer>
+    `;
+  }
+}
 
 const feedContainer = document.getElementById('feed');
 const loadingIndicator = document.getElementById('loading');
@@ -49,7 +88,7 @@ function getOriginalPostUrl(id) {
   if (id.startsWith('hn-')) return `https://news.ycombinator.com/item?id=${id.replace('hn-', '')}`;
   if (id.startsWith('lobsters-')) return `https://lobste.rs/s/${id.replace('lobsters-', '')}`;
   if (id.startsWith('reddit-')) return `https://redd.it/${id.replace('reddit-', '')}`;
-  return '#';
+  return null;
 }
 
 function createArticleCard(article) {
@@ -84,16 +123,24 @@ function createArticleCard(article) {
     ? "w-5 h-5 text-violet-400 fill-violet-400/20 transition-colors like-icon"
     : "w-5 h-5 text-slate-400 group-hover:text-violet-400 transition-colors like-icon";
 
+  let discussHtml = '';
+  const discussLink = getOriginalPostUrl(article.id);
+  if (discussLink) {
+    discussHtml = `
+      <a href="${discussLink}" target="_blank" rel="noopener noreferrer" class="text-xs text-slate-400 hover:text-white transition-colors flex items-center gap-1">
+        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 8h2a2 2 0 012 2v6a2 2 0 01-2 2h-2v4l-4-4H9a1.994 1.994 0 01-1.414-.586m0 0L11 14h4a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2v4l.586-.586z"></path></svg>
+        Discuss
+      </a>
+    `;
+  }
+
   card.innerHTML = `
     <div class="flex-1 overflow-hidden">
       <div class="flex flex-wrap items-center gap-3 mb-3">
         <span class="px-2.5 py-0.5 rounded-full text-xs font-semibold border ${getSourceColor(article.source)} capitalize tracking-wider">
           ${article.source}
         </span>
-        <a href="${getOriginalPostUrl(article.id)}" target="_blank" rel="noopener noreferrer" class="text-xs text-slate-400 hover:text-white transition-colors flex items-center gap-1">
-          <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 8h2a2 2 0 012 2v6a2 2 0 01-2 2h-2v4l-4-4H9a1.994 1.994 0 01-1.414-.586m0 0L11 14h4a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2v4l.586-.586z"></path></svg>
-          Discuss
-        </a>
+        ${discussHtml}
         <time class="text-sm text-slate-400 font-light">&bull; ${formatTimestamp(article.created_at)}</time>
       </div>
       <h2 class="text-xl md:text-2xl font-semibold leading-tight text-white mb-2">
@@ -112,6 +159,11 @@ function createArticleCard(article) {
           <span class="like-text">${isLikedLocally ? 'Liked' : 'Like'}</span>
         </button>
         <span class="text-xs text-slate-500 font-medium like-count-display">${article.follower_likes || 0} likes</span>
+        <button class="dislike-btn px-2 py-1 mt-1 rounded-md bg-transparent hover:bg-red-500/10 text-slate-500 hover:text-red-400 text-[11px] transition-all flex items-center justify-center gap-1 cursor-pointer">
+          <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 14H5.236a2 2 0 01-1.789-2.894l3.5-7A2 2 0 018.736 3h4.018a2 2 0 01.485.06l3.76.94m-7 10v5a2 2 0 002 2h.096c.5 0 .905-.405.905-.904 0-.715.211-1.413.608-2.008L17 13V4m-7 10h2m5-10h2a2 2 0 012 2v6a2 2 0 01-2 2h-2.5"></path></svg>
+          <svg class="w-3 h-3 animate-spin hidden loading-icon-dislike" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+          <span>Dislike</span>
+        </button>
       </div>
     </div>
   `;
@@ -177,11 +229,12 @@ function createArticleCard(article) {
     if (isMommy) {
       // Owner - Sign to train AI and publish note
       try {
+        const shareUrl = discussLink ? discussLink : article.url;
         eventPayload = await window.nostr.signEvent({
           kind: 1,
           created_at: Math.floor(Date.now() / 1000),
-          tags: [["r", article.url]],
-          content: "Liked article: " + article.title + "\n" + article.url
+          tags: [["r", shareUrl]],
+          content: "Liked article: " + article.title + "\n" + shareUrl
         });
       } catch (e) {
         alert("Signature cancelled.");
@@ -222,11 +275,12 @@ function createArticleCard(article) {
       const wantShare = confirm("Do you want to share this article as a note on your Nostr account?");
       if (wantShare) {
         try {
+          const shareUrl = discussLink ? discussLink : article.url;
           const signedEvent = await window.nostr.signEvent({
             kind: 1,
             created_at: Math.floor(Date.now() / 1000),
-            tags: [["r", article.url]],
-            content: "Check out this curated article: " + article.title + "\n" + article.url
+            tags: [["r", shareUrl]],
+            content: "Check out this curated article: " + article.title + "\n" + shareUrl
           });
           
           setLikeLoading(true);
@@ -272,6 +326,69 @@ function createArticleCard(article) {
           setLikeLoading(false);
         }
       }
+    }
+  });
+
+  const dislikeBtn = card.querySelector('.dislike-btn');
+  const setDislikeLoading = (isLoading) => {
+    const icon = dislikeBtn.querySelector('svg:not(.loading-icon-dislike)');
+    const loading = dislikeBtn.querySelector('.loading-icon-dislike');
+    if (isLoading) {
+      dislikeBtn.disabled = true;
+      if (icon) icon.classList.add('hidden');
+      if (loading) loading.classList.remove('hidden');
+    } else {
+      dislikeBtn.disabled = false;
+      if (icon) icon.classList.remove('hidden');
+      if (loading) loading.classList.add('hidden');
+    }
+  };
+
+  dislikeBtn.addEventListener('click', async () => {
+    if (dislikeBtn.disabled) return;
+
+    if (!window.nostr) {
+      alert("Nostr extension not found. Only the owner can dislike articles.");
+      return;
+    }
+
+    let eventPayload = null;
+    try {
+      eventPayload = await window.nostr.signEvent({
+        kind: 1,
+        created_at: Math.floor(Date.now() / 1000),
+        tags: [["r", article.url]],
+        content: "Disliked article: " + article.title + "\n" + article.url
+      });
+    } catch (e) {
+      return;
+    }
+
+    setDislikeLoading(true);
+    try {
+      const res = await fetch(`${API_URL}/${article.id}/dislike`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ event: eventPayload })
+      });
+      
+      if (res.status === 403) {
+        alert("Only the owner can dislike articles.");
+        setDislikeLoading(false);
+        return;
+      }
+      
+      if (res.ok) {
+        card.style.opacity = '0';
+        card.style.transform = 'scale(0.95)';
+        card.style.transition = 'all 0.3s ease-out';
+        setTimeout(() => card.remove(), 300);
+      } else {
+        setDislikeLoading(false);
+      }
+    } catch (e) {
+      console.error(e);
+      setDislikeLoading(false);
     }
   });
 

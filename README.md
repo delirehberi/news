@@ -30,7 +30,7 @@ When you first clone the repository, run the initialization script:
 ```bash
 make init
 ```
-*This will automatically `npm install` for both the frontend and backend, and print a 5-step deployment checklist to your terminal.*
+*This will automatically install dependencies, copy configuration templates (`.env` and `wrangler.jsonc`), and print a step-by-step deployment checklist to your terminal.*
 
 ### 2. Provision Infrastructure
 Create your D1 database and Vectorize index on Cloudflare:
@@ -39,7 +39,8 @@ Create your D1 database and Vectorize index on Cloudflare:
 make db-init
 make vectorize-init
 ```
-Update the `worker/wrangler.jsonc` file with your new `database_id` and Vectorize `index_name`.
+Update your `worker/wrangler.jsonc` (which was created during `make init`) with your new `database_id` and Vectorize `index_name`. 
+You can also enable or disable specific sources (e.g., `"ENABLE_REDDIT": "false"`) in the `vars` block.
 
 ### 3. Configure Secrets
 The application requires Reddit OAuth credentials and a Nostr Pubkey for identity.
@@ -49,19 +50,25 @@ Export them to your environment (or use a `.envrc` file), and automatically push
 export REDDIT_CLIENT_ID="your_client_id"
 export REDDIT_CLIENT_SECRET="your_client_secret"
 export REDDIT_REFRESH_TOKEN="your_refresh_token"
+export GMAIL_CLIENT_ID="your_client_id"
+export GMAIL_CLIENT_SECRET="your_client_secret"
+export GMAIL_REFRESH_TOKEN="your_refresh_token"
 export AUTHORIZED_NOSTR_PUBKEY="your_nostr_pubkey_in_hex"
 
 make push-secrets
 ```
 *The `make push-secrets` command securely pipes your local environment variables directly into Cloudflare's vault without requiring manual interaction.*
 
-### 4. Initialize the Database
+### 4. Configure Frontend
+Update `frontend/.env` (which was created during `make init`) with your desired API URL, custom subtitle, and theme preferences.
+
+### 5. Initialize the Database
 Apply the SQL schema to your remote D1 instance so your tables are created:
 ```bash
 make db-apply-remote
 ```
 
-### 5. Deploy the Full Stack
+### 6. Deploy the Full Stack
 Deploy both the Hono backend API and the Vite frontend to Cloudflare in one go:
 ```bash
 make deploy
