@@ -10,6 +10,10 @@ type Bindings = {
   REDDIT_CLIENT_SECRET: string;
   REDDIT_REFRESH_TOKEN: string;
   AUTHORIZED_NOSTR_PUBKEY: string;
+  GMAIL_CLIENT_ID: string;
+  GMAIL_CLIENT_SECRET: string;
+  GMAIL_REFRESH_TOKEN: string;
+  GMAIL_SEARCH_QUERY?: string;
 }
 
 const app = new Hono<{ Bindings: Bindings }>()
@@ -394,6 +398,12 @@ async function handleIngestion(env: Bindings) {
     rawArticles.push(...redditArticles);
   } catch (e) { console.error('Reddit error', e); }
 
+  // Fetch Gmail Newsletters
+  try {
+    const newsletterArticles = await fetchGmailNewsletters(env);
+    rawArticles.push(...newsletterArticles);
+  } catch (e) { console.error('Gmail error', e); }
+
   if (rawArticles.length === 0) return;
 
   // Filter based on Vectorize AI
@@ -543,6 +553,116 @@ async function fetchRedditPosts(env: Bindings) {
         image_url
       });
       count++;
+    }
+  }
+
+  return articles;
+}
+
+function decodeBase64Utf8(base64: string) {
+  const binaryString = atob(base64.replace(/-/g, '+').replace(/_/g, '/'));
+  const bytes = new Uint8Array(binaryString.length);
+  for (let i = 0; i < binaryString.length; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  return new TextDecoder().decode(bytes);
+}
+
+async function fetchGmailNewsletters(env: Bindings) {
+  const articles: { id: string, title: string, url: string, source: string, image_url?: string }[] = [];
+  
+  if (!env.GMAIL_CLIENT_ID || !env.GMAIL_CLIENT_SECRET || !env.GMAIL_REFRESH_TOKEN) {
+    return articles;
+  }
+
+  // 1. Get Access Token
+  const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: `client_id=${env.GMAIL_CLIENT_ID}&client_secret=${env.GMAIL_CLIENT_SECRET}&refresh_token=${env.GMAIL_REFRESH_TOKEN}&grant_type=refresh_token`
+  });
+  if (!tokenRes.ok) {
+    console.error("Failed to get Gmail access token");
+    return articles;
+  }
+  const tokenData: any = await tokenRes.json();
+  const accessToken = tokenData.access_token;
+
+  // 2. Search for messages
+  const query = encodeURIComponent(env.GMAIL_SEARCH_QUERY || "label:newsletter");
+  // Fetch messages from the last day to limit processing
+  const searchRes = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${query} newer_than:1d&maxResults=5`, {
+    headers: { "Authorization": `Bearer ${accessToken}` }
+  });
+  if (!searchRes.ok) {
+    console.error("Failed to search Gmail messages");
+    return articles;
+  }
+  const searchData: any = await searchRes.json();
+  const messages = searchData.messages || [];
+
+  for (const msg of messages) {
+    const msgRes = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=full`, {
+      headers: { "Authorization": `Bearer ${accessToken}` }
+    });
+    if (!msgRes.ok) continue;
+    const msgData: any = await msgRes.json();
+    
+    // Extract body content
+    let bodyData = "";
+    if (msgData.payload.parts) {
+      // Find text/plain or text/html
+      const part = msgData.payload.parts.find((p: any) => p.mimeType === "text/plain") || msgData.payload.parts.find((p: any) => p.mimeType === "text/html");
+      if (part && part.body && part.body.data) {
+        bodyData = part.body.data;
+      } else if (msgData.payload.parts[0]?.parts) {
+         // Handle nested multipart
+         const subpart = msgData.payload.parts[0].parts.find((p: any) => p.mimeType === "text/plain");
+         if (subpart && subpart.body && subpart.body.data) bodyData = subpart.body.data;
+      }
+    } else if (msgData.payload.body && msgData.payload.body.data) {
+      bodyData = msgData.payload.body.data;
+    }
+
+    if (!bodyData) continue;
+    
+    // Base64url decode
+    const textContent = decodeBase64Utf8(bodyData);
+    
+    // Limit text size to avoid token overflow
+    const truncatedText = textContent.substring(0, 4000);
+
+    // 3. Extract Links using AI
+    try {
+      const aiResponse: any = await env.AI.run('@cf/meta/llama-3.3-70b-instruct-fp8-fast', {
+        messages: [
+          { role: 'system', content: 'You are an assistant that extracts news article links and their titles from a newsletter email. Return ONLY a raw JSON array of objects with "title" and "url" properties. Do not include markdown formatting or any other text. Ignore unsubscribe links, social media profiles, and sponsor links.' },
+          { role: 'user', content: truncatedText }
+        ]
+      });
+
+      let responseText = aiResponse.response;
+      // Clean up markdown if the AI mistakenly included it
+      if (responseText.startsWith('\`\`\`json')) {
+        responseText = responseText.replace(/^\`\`\`json\n?/, '').replace(/\n?\`\`\`$/, '');
+      } else if (responseText.startsWith('\`\`\`')) {
+        responseText = responseText.replace(/^\`\`\`\n?/, '').replace(/\n?\`\`\`$/, '');
+      }
+
+      const extractedLinks = JSON.parse(responseText);
+      
+      for (const link of extractedLinks) {
+        if (link.url && link.title) {
+           articles.push({
+             id: `newsletter-${msg.id}-${btoa(link.url).substring(0, 20).replace(/[^a-zA-Z0-9]/g, '')}`,
+             title: link.title,
+             url: link.url,
+             source: 'newsletter'
+           });
+        }
+      }
+    } catch (e) {
+      console.error('AI link extraction error for msg', msg.id, e);
     }
   }
 
