@@ -1,11 +1,15 @@
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "worker",
-	"main": "src/index.ts",
+	"name": "news-worker",
+	"main": "src/index.tsx",
 	"compatibility_date": "2026-06-29",
+	"assets": {
+		"directory": "./public",
+		"binding": "ASSETS"
+	},
 	"routes": [
 		{
-			"pattern": "news-api.emre.xyz",
+			"pattern": "news.emre.xyz",
 			"custom_domain": true
 		}
 	],
@@ -13,7 +17,8 @@
 		{
 			"binding": "news_db",
 			"database_name": "news-db",
-			"database_id": "60a9e43e-5c7d-4900-842d-82b7f588d36b"
+			"database_id": "60a9e43e-5c7d-4900-842d-82b7f588d36b",
+			"migrations_dir": "migrations"
 		}
 	],
 	"vectorize": [
@@ -32,43 +37,12 @@
 	},
 	"vars": {
 		"FRONTEND_URL": "https://news.emre.xyz",
+		"USE_EMRE_THEME": "true",
 		"ENABLE_HN": "true",
 		"ENABLE_REDDIT": "true",
 		"ENABLE_LOBSTERS": "true",
+		"ENABLE_STACKER": "true",
 		"ENABLE_GMAIL": "false",
 		"GMAIL_SEARCH_QUERY": "label:newsletter"
-		// Require secrets: GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN
 	}
-	// "compatibility_flags": [
-	//   "nodejs_compat"
-	// ],
-	// "vars": {
-	//   "MY_VAR": "my-variable"
-	// },
-	// "kv_namespaces": [
-	//   {
-	//     "binding": "MY_KV_NAMESPACE",
-	//     "id": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-	//   }
-	// ],
-	// "r2_buckets": [
-	//   {
-	//     "binding": "MY_BUCKET",
-	//     "bucket_name": "my-bucket"
-	//   }
-	// ],
-	// "d1_databases": [
-	//   {
-	//     "binding": "MY_DB",
-	//     "database_name": "my-database",
-	//     "database_id": ""
-	//   }
-	// ],
-	// "ai": {
-	//   "binding": "AI"
-	// },
-	// "observability": {
-	//   "enabled": true,
-	//   "head_sampling_rate": 1
-	// }
 }

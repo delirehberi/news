@@ -1,11 +1,15 @@
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"name": "worker",
-	"main": "src/index.ts",
+	"main": "src/index.tsx",
 	"compatibility_date": "2026-06-29",
+	"assets": {
+		"directory": "./public",
+		"binding": "ASSETS"
+	},
 	// "routes": [
 	// 	{
-	// 		"pattern": "api.yourdomain.com",
+	// 		"pattern": "news.yourdomain.com",
 	// 		"custom_domain": true
 	// 	}
 	// ],
@@ -13,7 +17,8 @@
 		{
 			"binding": "news_db",
 			"database_name": "news-db",
-			"database_id": "<YOUR_D1_DATABASE_ID>"
+			"database_id": "<YOUR_D1_DATABASE_ID>",
+			"migrations_dir": "migrations"
 		}
 	],
 	"vectorize": [
@@ -32,13 +37,16 @@
 	},
 	"vars": {
 		"FRONTEND_URL": "https://yourfrontend.com",
+		"USE_EMRE_THEME": "true",
 		"ENABLE_HN": "true",
 		"ENABLE_REDDIT": "true",
 		"ENABLE_LOBSTERS": "true",
+		"ENABLE_STACKER": "true",
 		"ENABLE_GMAIL": "false",
 		"GMAIL_SEARCH_QUERY": "label:newsletter"
 		// Require secrets:
 		// AUTHORIZED_NOSTR_PUBKEY
+		// INGESTION_SECRET (optional secret key for manual refetch/ingestion)
 		// REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, REDDIT_REFRESH_TOKEN (if ENABLE_REDDIT is true)
 		// GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN (if ENABLE_GMAIL is true)
 	}

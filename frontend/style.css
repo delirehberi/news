@@ -1,39 +1,650 @@
+/* Hallmark · macrostructure: HackerNews Dense Feed · genre: editorial · tokens: locked · mobile: pass · contrast: pass */
+
 @import "tailwindcss";
+@source "../worker/src";
 
 @theme {
-  --font-sans: "Fira Sans", sans-serif;
+  --font-display: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-body: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+
+  --color-bg: var(--color-bg);
+  --color-surface: var(--color-surface);
+  --color-surface-elevated: var(--color-surface-elevated);
+  --color-surface-hover: var(--color-surface-hover);
   
-  /* Custom vibrant colors */
-  --color-accent: #8b5cf6; /* violet-500 */
-  --color-accent-glow: rgba(139, 92, 246, 0.5);
-  
-  /* Dark mode background */
-  --color-bg: #0f172a; /* slate-900 */
-  --color-surface: #1e293b; /* slate-800 */
-  --color-surface-hover: #334155; /* slate-700 */
+  --color-border: var(--color-border);
+  --color-border-subtle: var(--color-border-subtle);
+
+  --color-ink: var(--color-ink);
+  --color-ink-muted: var(--color-ink-muted);
+  --color-ink-faint: var(--color-ink-faint);
+
+  --color-accent: var(--color-accent);
+  --color-accent-ink: var(--color-accent-ink);
+  --color-focus: var(--color-focus);
 }
 
-/* Base resets and dark mode setup */
+/* 1. Default Light Mode Tokens */
+:root,
+[data-theme="light"],
+html.light,
+body.light {
+  --color-bg: var(--bg, oklch(98.5% 0.003 260));
+  --color-surface: var(--surface, oklch(100% 0 0));
+  --color-surface-elevated: var(--surface-elevated, oklch(96.5% 0.005 260));
+  --color-surface-hover: var(--surface-hover, oklch(93.5% 0.008 260));
+  
+  --color-border: var(--border, oklch(85% 0.008 260));
+  --color-border-subtle: var(--border-subtle, oklch(91% 0.006 260));
+
+  --color-ink: var(--text-h, var(--text, oklch(18% 0.015 260)));
+  --color-ink-muted: var(--text, oklch(42% 0.015 260));
+  --color-ink-faint: var(--text-muted, oklch(58% 0.012 260));
+
+  --color-accent: var(--accent, oklch(55% 0.18 55));
+  --color-accent-ink: oklch(98% 0.005 55);
+  --color-focus: oklch(55% 0.18 55);
+
+  --dur-short: 140ms;
+  --dur-med: 240ms;
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* 2. System Dark Mode Preference */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]):not(.light) {
+    --color-bg: var(--bg, oklch(14% 0.008 260));
+    --color-surface: var(--surface, oklch(18% 0.010 260));
+    --color-surface-elevated: var(--surface-elevated, oklch(22% 0.012 260));
+    --color-surface-hover: var(--surface-hover, oklch(25% 0.015 260));
+    
+    --color-border: var(--border, oklch(28% 0.012 260));
+    --color-border-subtle: var(--border-subtle, oklch(22% 0.010 260));
+
+    --color-ink: var(--text-h, var(--text, oklch(96% 0.005 260)));
+    --color-ink-muted: var(--text, oklch(72% 0.010 260));
+    --color-ink-faint: var(--text-muted, oklch(52% 0.012 260));
+
+    --color-accent: var(--accent, oklch(75% 0.14 70));
+    --color-accent-ink: oklch(15% 0.02 70);
+    --color-focus: oklch(78% 0.16 70);
+  }
+}
+
+/* 3. Explicit Dark Mode Overrides (data-theme="dark", class="dark") */
+[data-theme="dark"],
+html.dark,
+body.dark {
+  --color-bg: var(--bg, oklch(14% 0.008 260));
+  --color-surface: var(--surface, oklch(18% 0.010 260));
+  --color-surface-elevated: var(--surface-elevated, oklch(22% 0.012 260));
+  --color-surface-hover: var(--surface-hover, oklch(25% 0.015 260));
+  
+  --color-border: var(--border, oklch(28% 0.012 260));
+  --color-border-subtle: var(--border-subtle, oklch(22% 0.010 260));
+
+  --color-ink: var(--text-h, var(--text, oklch(96% 0.005 260)));
+  --color-ink-muted: var(--text, oklch(72% 0.010 260));
+  --color-ink-faint: var(--text-muted, oklch(52% 0.012 260));
+
+  --color-accent: var(--accent, oklch(75% 0.14 70));
+  --color-accent-ink: oklch(15% 0.02 70);
+  --color-focus: oklch(78% 0.16 70);
+}
+
+/* Base reset & Page-edge clipping */
 html, body {
   background-color: var(--color-bg);
-  color: #f8fafc; /* slate-50 */
-  font-family: var(--font-sans);
+  color: var(--color-ink);
+  font-family: var(--font-body);
   min-height: 100vh;
+  overflow-x: clip;
+  transition: background-color var(--dur-med) var(--ease-out), color var(--dur-med) var(--ease-out);
 }
 
-/* Glassmorphism utility */
-.glass {
-  background: rgba(30, 41, 59, 0.7);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
-  border: 1px solid rgba(255, 255, 255, 0.1);
+/* Universal Page Layout Container - guarantees matching width */
+.news-container {
+  max-width: 48rem;
+  width: 100%;
+  margin-left: auto;
+  margin-right: auto;
+  padding-left: 1rem;
+  padding-right: 1rem;
+  box-sizing: border-box;
 }
 
-/* Micro-animations */
-.card-hover {
-  transition: transform 0.2s ease, box-shadow 0.2s ease;
+@media (min-width: 640px) {
+  .news-container {
+    padding-left: 1.25rem;
+    padding-right: 1.25rem;
+  }
 }
-.card-hover:hover {
-  transform: translateY(-4px);
-  box-shadow: 0 10px 25px -5px var(--color-accent-glow), 0 8px 10px -6px var(--color-accent-glow);
+
+/* -------------------------------------------------------------
+   Header Structure & Controls
+------------------------------------------------------------- */
+.news-header-top {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
+  border-bottom: 1px solid var(--color-border-subtle);
+  padding-bottom: 0.75rem;
+}
+
+.news-subtitle {
+  font-size: 0.875rem;
+  color: var(--color-ink-muted);
+  line-height: 1.4;
+  margin: 0;
+  font-weight: 400;
+}
+
+.rss-feed-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.75rem;
+  font-family: var(--font-mono);
+  font-weight: 500;
+  color: var(--color-accent);
+  text-decoration: none;
+  flex-shrink: 0;
+  white-space: nowrap;
+  transition: opacity var(--dur-short) var(--ease-out);
+}
+
+.rss-feed-link:hover {
+  opacity: 0.8;
+}
+
+.rss-icon {
+  width: 14px;
+  height: 14px;
+  min-width: 14px;
+  min-height: 14px;
+  max-width: 14px;
+  max-height: 14px;
+  display: inline-block;
+  flex-shrink: 0;
+  vertical-align: middle;
+}
+
+.news-controls-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-top: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.news-tabs-group {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+}
+
+.tab-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-size: 0.75rem;
+  font-weight: 500;
+  padding: 0.25rem 0.625rem;
+  border-radius: 9999px;
+  text-decoration: none;
+  color: var(--color-ink-muted);
+  border: 1px solid transparent;
+  transition: all var(--dur-short) var(--ease-out);
+}
+
+.tab-pill:hover {
+  color: var(--color-ink);
+  background-color: var(--color-surface-elevated);
+}
+
+.tab-pill.is-active {
+  background-color: var(--color-surface-elevated);
+  border-color: var(--color-border-subtle);
+  color: var(--color-ink);
+}
+
+.news-updated-time {
+  font-size: 0.75rem;
+  font-family: var(--font-mono);
+  color: var(--color-ink-faint);
+  letter-spacing: -0.01em;
+}
+
+.news-sources-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.625rem;
+  padding-top: 0.625rem;
+  border-top: 1px dashed var(--color-border-subtle);
+  flex-wrap: wrap;
+}
+
+.news-sources-label {
+  font-size: 0.6875rem;
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--color-ink-faint);
+}
+
+.news-sources-list {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+  flex-wrap: wrap;
+}
+
+.source-filter-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.15rem 0.5rem;
+  border-radius: 0.25rem;
+  font-size: 0.6875rem;
+  font-family: var(--font-mono);
+  text-decoration: none;
+  border: 1px solid var(--color-border-subtle);
+  color: var(--color-ink-muted);
+  transition: all var(--dur-short) var(--ease-out);
+}
+
+.source-filter-pill:hover {
+  background-color: var(--color-surface-elevated);
+  color: var(--color-ink);
+}
+
+.source-filter-pill.is-active {
+  background-color: var(--color-ink);
+  color: var(--color-bg);
+  font-weight: 600;
+  border-color: var(--color-ink);
+}
+
+/* -------------------------------------------------------------
+   Source Badges
+------------------------------------------------------------- */
+.source-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.125rem 0.35rem;
+  font-size: 0.625rem; /* 10px */
+  font-family: var(--font-mono);
+  font-weight: 600;
+  line-height: 1;
+  text-transform: uppercase;
+  border-radius: 0.25rem;
+  letter-spacing: 0.02em;
+  border: 1px solid transparent;
+  flex-shrink: 0;
+}
+
+.source-badge-hn {
+  background-color: color-mix(in oklch, oklch(65% 0.18 55) 15%, transparent);
+  border-color: color-mix(in oklch, oklch(65% 0.18 55) 40%, transparent);
+  color: oklch(65% 0.18 55);
+}
+
+.source-badge-lobsters {
+  background-color: color-mix(in oklch, oklch(60% 0.22 25) 15%, transparent);
+  border-color: color-mix(in oklch, oklch(60% 0.22 25) 40%, transparent);
+  color: oklch(60% 0.22 25);
+}
+
+.source-badge-reddit {
+  background-color: color-mix(in oklch, oklch(65% 0.2 40) 15%, transparent);
+  border-color: color-mix(in oklch, oklch(65% 0.2 40) 40%, transparent);
+  color: oklch(65% 0.2 40);
+}
+
+.source-badge-stacker {
+  background-color: color-mix(in oklch, oklch(60% 0.2 300) 15%, transparent);
+  border-color: color-mix(in oklch, oklch(60% 0.2 300) 40%, transparent);
+  color: oklch(60% 0.2 300);
+}
+
+.source-badge-newsletter {
+  background-color: color-mix(in oklch, oklch(60% 0.18 240) 15%, transparent);
+  border-color: color-mix(in oklch, oklch(60% 0.18 240) 40%, transparent);
+  color: oklch(60% 0.18 240);
+}
+
+.source-badge-default {
+  background-color: var(--color-surface-elevated);
+  border-color: var(--color-border);
+  color: var(--color-ink-muted);
+}
+
+/* -------------------------------------------------------------
+   HackerNews Title-Only Row Layout & 12-13px Typography
+------------------------------------------------------------- */
+.news-item {
+  background-color: var(--color-surface);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: 0.375rem;
+  transition: border-color var(--dur-short) var(--ease-out),
+              background-color var(--dur-short) var(--ease-out);
+  overflow: hidden;
+}
+
+.news-item:hover {
+  border-color: var(--color-border);
+}
+
+.news-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.625rem;
+  padding: 0.45rem 0.75rem;
+}
+
+@media (max-width: 640px) {
+  .news-row {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0.45rem;
+    padding: 0.5rem 0.625rem;
+  }
+}
+
+.news-row-main {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 0.35rem 0.5rem;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.news-source-badges {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  flex-shrink: 0;
+}
+
+/* Headline Title: 12.5-13px Clean Typography */
+.news-title {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  font-size: 0.8125rem; /* 13px */
+  font-weight: 550;
+  line-height: 1.35;
+  color: var(--color-ink);
+  font-style: normal;
+  overflow-wrap: anywhere;
+  min-width: 0;
+  display: inline;
+}
+
+.news-link {
+  color: inherit;
+  text-decoration: none;
+  transition: color var(--dur-short) var(--ease-out);
+}
+
+.news-link:hover {
+  color: var(--color-accent);
+}
+
+.news-link:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+/* Domain in parentheses: 11px mono */
+.news-domain {
+  font-size: 0.6875rem; /* 11px */
+  font-family: var(--font-mono);
+  color: var(--color-ink-faint);
+  margin-left: 0.35rem;
+  white-space: nowrap;
+}
+
+/* Right Action Toolbar */
+.news-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  flex-shrink: 0;
+}
+
+@media (max-width: 640px) {
+  .news-actions {
+    align-self: flex-end;
+  }
+}
+
+/* -------------------------------------------------------------
+   Action Buttons (Summary Pill, Discuss Icon, Like Icon, Dislike Icon)
+------------------------------------------------------------- */
+.action-btn-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.2rem;
+  font-size: 0.6875rem; /* 11px */
+  font-family: var(--font-mono);
+  font-weight: 500;
+  line-height: 1;
+  padding: 0.2rem 0.45rem;
+  border-radius: 9999px;
+  border: 1px solid var(--color-border);
+  background-color: var(--color-surface-elevated);
+  color: var(--color-ink-muted);
+  cursor: pointer;
+  white-space: nowrap;
+  height: 1.625rem;
+  box-sizing: border-box;
+  transition: background-color var(--dur-short) var(--ease-out),
+              border-color var(--dur-short) var(--ease-out),
+              color var(--dur-short) var(--ease-out),
+              transform var(--dur-short) var(--ease-out);
+}
+
+.action-btn-pill:hover {
+  background-color: var(--color-surface-hover);
+  color: var(--color-ink);
+  border-color: var(--color-border);
+}
+
+.action-btn-pill:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 2px;
+}
+
+.action-btn-pill:active {
+  transform: translateY(1px);
+}
+
+.action-btn-pill.is-active {
+  background-color: color-mix(in oklch, var(--color-accent) 15%, transparent);
+  border-color: color-mix(in oklch, var(--color-accent) 40%, transparent);
+  color: var(--color-accent);
+}
+
+.action-btn-pill.is-active .summary-icon {
+  transform: rotate(180deg);
+}
+
+/* Icon-Only Action Buttons */
+.action-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 1.625rem;
+  min-width: 1.625rem;
+  padding: 0 0.35rem;
+  border-radius: 0.25rem;
+  border: 1px solid var(--color-border-subtle);
+  background-color: var(--color-surface);
+  color: var(--color-ink-muted);
+  cursor: pointer;
+  text-decoration: none;
+  line-height: 1;
+  box-sizing: border-box;
+  transition: background-color var(--dur-short) var(--ease-out),
+              border-color var(--dur-short) var(--ease-out),
+              color var(--dur-short) var(--ease-out),
+              transform var(--dur-short) var(--ease-out);
+}
+
+.action-icon-btn:hover {
+  background-color: var(--color-surface-hover);
+  color: var(--color-ink);
+  border-color: var(--color-border);
+}
+
+.action-icon-btn:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 2px;
+}
+
+.action-icon-btn:active {
+  transform: translateY(1px);
+}
+
+.action-icon-btn:disabled,
+.action-icon-btn[disabled] {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* Like icon & counter */
+.like-btn .like-count-display {
+  font-size: 0.6875rem; /* 11px */
+  margin-left: 0.25rem;
+}
+
+.like-btn.is-liked {
+  background-color: color-mix(in oklch, var(--color-accent) 15%, transparent);
+  border-color: color-mix(in oklch, var(--color-accent) 50%, transparent);
+  color: var(--color-accent);
+}
+
+/* Dislike button hover */
+.dislike-btn:hover {
+  background-color: color-mix(in oklch, var(--color-ink-faint) 15%, transparent);
+  color: var(--color-ink);
+}
+
+/* -------------------------------------------------------------
+   Collapsible Accordion Drawer
+------------------------------------------------------------- */
+.news-accordion-panel {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows var(--dur-med) var(--ease-out),
+              border-color var(--dur-med) var(--ease-out);
+  border-top: 0px solid transparent;
+}
+
+.news-accordion-panel.is-open {
+  grid-template-rows: 1fr;
+  border-top: 1px solid var(--color-border-subtle);
+}
+
+.news-accordion-inner {
+  overflow: hidden;
+  padding: 0 0.75rem;
+  transition: padding var(--dur-med) var(--ease-out);
+}
+
+.news-accordion-panel.is-open .news-accordion-inner {
+  padding: 0.625rem 0.75rem 0.75rem;
+}
+
+.news-summary-content {
+  font-size: 0.8125rem; /* 13px */
+  line-height: 1.55;
+  color: var(--color-ink-muted);
+  border-left: 2px solid var(--color-accent);
+  padding: 0.4rem 0.65rem;
+  background-color: var(--color-surface-elevated);
+  border-radius: 0 0.25rem 0.25rem 0;
+  margin-bottom: 0.5rem;
+}
+
+.news-summary-image-wrapper {
+  margin-bottom: 0.5rem;
+  border-radius: 0.375rem;
+  overflow: hidden;
+  border: 1px solid var(--color-border-subtle);
+}
+
+.news-summary-image {
+  width: 100%;
+  max-height: 18rem;
+  object-fit: cover;
+}
+
+.news-accordion-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding-top: 0.375rem;
+  border-top: 1px dashed var(--color-border-subtle);
+}
+
+.news-meta-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-size: 0.6875rem; /* 11px */
+  font-family: var(--font-mono);
+  color: var(--color-ink-faint);
+  text-decoration: none;
+  transition: color var(--dur-short) var(--ease-out);
+}
+
+.news-meta-link:hover {
+  color: var(--color-ink);
+}
+
+.news-meta-time {
+  font-size: 0.6875rem;
+  color: var(--color-ink-faint);
+}
+
+/* Skeleton Loading */
+.skeleton-card {
+  background-color: var(--color-surface);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: 0.375rem;
+  padding: 0.625rem 0.75rem;
+}
+
+.skeleton-bar {
+  background-color: var(--color-surface-elevated);
+  border-radius: 0.25rem;
+  animation: pulse 1.8s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 0.7; }
+  50% { opacity: 0.3; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html, body,
+  .news-item,
+  .action-btn-pill,
+  .action-icon-btn,
+  .news-accordion-panel,
+  .news-link {
+    transition: none !important;
+  }
+  .skeleton-bar {
+    animation: none !important;
+    opacity: 0.5;
+  }
 }

@@ -1,4 +1,4 @@
-.PHONY: setup init push-secrets worker-init db-init db-apply-local db-apply-remote vectorize-init dev-worker dev-frontend frontend-build deploy-worker deploy-frontend deploy
+.PHONY: setup init push-secrets worker-init db-init db-migrate db-migrate-local db-migrate-list db-migrate-create vectorize-init dev-worker dev-frontend frontend-build deploy-worker deploy
 
 NVM_CMD=. ~/.nvm/nvm.sh && nvm use &&
 
@@ -19,9 +19,8 @@ init:
 	@echo "1. Run 'make db-init' to create your Cloudflare D1 database."
 	@echo "2. Run 'make vectorize-init' to create your Vectorize index."
 	@echo "3. Update 'worker/wrangler.jsonc' with the new IDs generated from steps 1 & 2."
-	@echo "4. Update 'frontend/.env' with your desired API URL and frontend configuration."
-	@echo "5. Export your secrets to your terminal (or use .envrc), then run 'make push-secrets'."
-	@echo "6. Run 'make db-apply-remote' to build the DB tables."
+	@echo "4. Export your secrets to your terminal (or use .envrc), then run 'make push-secrets'."
+	@echo "5. Run 'make db-migrate' to apply database migrations."
 	@echo "--------------------------------------------------------"
 
 push-secrets:
@@ -33,6 +32,9 @@ push-secrets:
 	bash -c '$(NVM_CMD) cd worker && echo "$$GMAIL_CLIENT_SECRET" | npx wrangler secret put GMAIL_CLIENT_SECRET'
 	bash -c '$(NVM_CMD) cd worker && echo "$$GMAIL_REFRESH_TOKEN" | npx wrangler secret put GMAIL_REFRESH_TOKEN'
 	bash -c '$(NVM_CMD) cd worker && echo "$$AUTHORIZED_NOSTR_PUBKEY" | npx wrangler secret put AUTHORIZED_NOSTR_PUBKEY'
+	@if [ -n "$$INGESTION_SECRET" ]; then \
+		bash -c '$(NVM_CMD) cd worker && echo "$$INGESTION_SECRET" | npx wrangler secret put INGESTION_SECRET'; \
+	fi
 	@echo "Secrets pushed successfully!"
 
 worker-init:
@@ -43,19 +45,28 @@ db-init:
 	@echo "Creating D1 database..."
 	bash -c '$(NVM_CMD) cd worker && npx wrangler d1 create news-db'
 
-db-apply-local:
-	@echo "Applying schema to local D1 database..."
-	bash -c '$(NVM_CMD) cd worker && npx wrangler d1 execute news-db --local --file=../schema.sql'
+db-migrate:
+	@echo "Applying pending migrations to remote D1 database..."
+	bash -c '$(NVM_CMD) cd worker && npx wrangler d1 migrations apply news-db --remote'
 
-db-apply-remote:
-	@echo "Applying schema to remote D1 database..."
-	bash -c '$(NVM_CMD) cd worker && npx wrangler d1 execute news-db --remote --file=../schema.sql'
+db-migrate-local:
+	@echo "Applying pending migrations to local D1 database..."
+	bash -c '$(NVM_CMD) cd worker && npx wrangler d1 migrations apply news-db --local'
+
+db-migrate-list:
+	@echo "Listing remote D1 migrations status..."
+	bash -c '$(NVM_CMD) cd worker && npx wrangler d1 migrations list news-db --remote'
+
+db-migrate-create:
+	@echo "Creating a new migration..."
+	@read -p "Enter migration name: " name; \
+	bash -c '$(NVM_CMD) cd worker && npx wrangler d1 migrations create news-db $$name'
 
 vectorize-init:
 	@echo "Creating Vectorize index..."
 	bash -c '$(NVM_CMD) cd worker && npx wrangler vectorize create news-index --dimensions=768 --metric=cosine'
 
-dev-worker:
+dev-worker: frontend-build
 	@echo "Starting Worker in development mode..."
 	bash -c '$(NVM_CMD) cd worker && npx wrangler dev --remote'
 
@@ -64,16 +75,21 @@ dev-frontend:
 	bash -c '$(NVM_CMD) cd frontend && npx vite'
 
 frontend-build:
-	@echo "Building Frontend for production..."
+	@echo "Building Frontend for production into worker/public..."
 	bash -c '$(NVM_CMD) cd frontend && npx vite build'
 
-deploy-worker:
-	@echo "Deploying Worker to Cloudflare..."
+deploy-worker: frontend-build
+	@echo "Deploying Unified SSR Worker to Cloudflare..."
 	bash -c '$(NVM_CMD) cd worker && npx wrangler deploy'
 
-deploy-frontend: frontend-build
-	@echo "Deploying Frontend to Cloudflare Pages..."
-	bash -c '$(NVM_CMD) cd frontend && npx wrangler pages deploy dist --project-name news-frontend'
+deploy: deploy-worker
+	@echo "Successfully deployed Unified SSR Worker to Cloudflare!"
 
-deploy: deploy-worker deploy-frontend
-	@echo "Successfully deployed both Backend and Frontend!"
+ingest:
+	@echo "Triggering manual news ingestion..."
+	@if [ -n "$$INGESTION_SECRET" ]; then \
+		curl -s -H "Authorization: Bearer $$INGESTION_SECRET" "https://news.emre.xyz/api/admin/ingest" | jq .; \
+	else \
+		curl -s "http://localhost:8787/api/admin/ingest" | jq . || curl -s "https://news.emre.xyz/api/admin/ingest" | jq .; \
+	fi
+

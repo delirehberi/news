@@ -1,0 +1,6 @@
+-- Migration number: 0002 	 2026-07-02T00:00:00.000Z
+CREATE TABLE IF NOT EXISTS user_preferences (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
