@@ -4,8 +4,27 @@ import { verifyEvent } from 'nostr-tools'
 import { FeedView } from './views/FeedView'
 import { ArticleDetailView } from './views/ArticleDetailView'
 import { Layout } from './views/Layout'
+import { DebugView, DiagnosticReport, DiagnosticItem, VectorMatchDetail } from './views/DebugView'
 import { generateRssFeed } from './views/rss'
-import { ArticleModel } from './views/helpers'
+import { ArticleModel, getOriginalPostUrl } from './views/helpers'
+import {
+  parseSources,
+  cosineSimilarity,
+  parseEmbedding,
+  calculateImportanceScore,
+  computeExpiresAt,
+  toSqliteDateTime,
+  rankHot,
+  groupDigest,
+  CLUSTER_SIMILARITY_THRESHOLD,
+  CLUSTER_LOOKBACK_HOURS,
+  CLUSTER_MAX_CANDIDATES,
+  rescoreWithSignals,
+  serializeEmbedding,
+  DIGEST_DAYS,
+  DEFAULT_DIGEST_TIME_ZONE,
+  FEED_LIMIT
+} from './scoring'
 
 type Bindings = {
   news_db: D1Database;
@@ -19,6 +38,7 @@ type Bindings = {
   GMAIL_CLIENT_SECRET: string;
   GMAIL_REFRESH_TOKEN: string;
   GMAIL_SEARCH_QUERY?: string;
+  DIGEST_TIMEZONE?: string;
   INGESTION_SECRET?: string;
   FRONTEND_URL?: string;
   USE_EMRE_THEME?: string;
@@ -29,6 +49,9 @@ type Bindings = {
   ENABLE_GMAIL?: string;
   ASSETS?: Fetcher;
 }
+
+// D1 caps bound parameters per statement at 100.
+const D1_MAX_BOUND_PARAMS = 90;
 
 const app = new Hono<{ Bindings: Bindings }>()
 
@@ -45,45 +68,81 @@ app.use('*', async (c, next) => {
   return corsMiddleware(c, next);
 });
 
-// SSR Home Feed Route
-app.get('/', async (c) => {
-  const sort = c.req.query('sort') || 'hot';
-  const source = c.req.query('source') || 'all';
+// Explicit column list: never ship stored embeddings to views or API consumers.
+const ARTICLE_COLUMNS = 'id, title, url, source, created_at, is_liked, image_url, summary, follower_likes, sources, source_count, importance_score, cluster_id, seen_count, last_seen_at, expires_at';
+// Rows predating per-article retention fall back to the previous fixed 2-day window.
+const LIVE_ARTICLE_CONDITION = "coalesce(expires_at, datetime(created_at, '+2 days')) >= datetime('now')";
+const RSS_LIMIT = 50;
 
-  const orderByClause = sort === 'latest'
-    ? 'ORDER BY created_at DESC'
-    : 'ORDER BY ((coalesce(importance_score, 1.0) + (coalesce(follower_likes, 0) * 2.0)) / ((((julianday(\'now\') - julianday(created_at)) * 24.0) + 2.0) * (((julianday(\'now\') - julianday(created_at)) * 24.0) + 2.0))) DESC, created_at DESC';
+type FeedSort = 'hot' | 'latest' | 'digest';
 
-  let query = `SELECT *, 
-      ((coalesce(importance_score, 1.0) + (coalesce(follower_likes, 0) * 2.0)) / ((((julianday('now') - julianday(created_at)) * 24.0) + 2.0) * (((julianday('now') - julianday(created_at)) * 24.0) + 2.0))) AS hot_score 
-     FROM articles 
-     WHERE created_at >= datetime('now', '-2 days')`;
+function parseFeedSort(value?: string): FeedSort {
+  return value === 'latest' || value === 'digest' ? value : 'hot';
+}
 
-  if (source && source !== 'all') {
-    query += ` AND (source = ? OR sources LIKE ?)`;
+function formatArticle(article: any): ArticleModel {
+  const sources = parseSources(article.sources, article.source);
+  return {
+    ...article,
+    sources,
+    source_count: article.source_count || sources.length || 1,
+    seen_count: article.seen_count || 1,
+    importance_score: article.importance_score || 1.0
+  };
+}
+
+function resolveDigestTimeZone(configured?: string): string {
+  if (!configured) return DEFAULT_DIGEST_TIME_ZONE;
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: configured });
+    return configured;
+  } catch (e) {
+    console.error(`Invalid DIGEST_TIMEZONE "${configured}", falling back to ${DEFAULT_DIGEST_TIME_ZONE}`, e);
+    return DEFAULT_DIGEST_TIME_ZONE;
+  }
+}
+
+async function loadLiveArticles(env: Bindings, sort: FeedSort, source: string): Promise<ArticleModel[]> {
+  const conditions = [LIVE_ARTICLE_CONDITION];
+  const params: string[] = [];
+  if (source !== 'all') {
+    conditions.push('(source = ? OR sources LIKE ?)');
+    params.push(source, `%"${source}"%`);
+  }
+  if (sort === 'digest') {
+    conditions.push(`created_at >= datetime('now', '-${DIGEST_DAYS} days')`);
   }
 
-  query += ` ${orderByClause} LIMIT 100`;
+  // Hot and digest are ranked in TS (D1 disallows SQL math functions such as power()); the live set
+  // is bounded by retention, so loading it whole is cheap. Latest stays a plain indexed SQL sort.
+  const tail = sort === 'latest'
+    ? `ORDER BY coalesce(last_seen_at, created_at) DESC LIMIT ${FEED_LIMIT}`
+    : '';
+  const query = `SELECT ${ARTICLE_COLUMNS} FROM articles WHERE ${conditions.join(' AND ')} ${tail}`;
+  const { results } = await env.news_db.prepare(query).bind(...params).all();
+  return (results || []).map(formatArticle);
+}
 
-  const stmt = source && source !== 'all'
-    ? c.env.news_db.prepare(query).bind(source, `%"${source}"%`)
-    : c.env.news_db.prepare(query);
+// SSR Home Feed Route
+app.get('/', async (c) => {
+  const sort = parseFeedSort(c.req.query('sort'));
+  const source = c.req.query('source') || 'all';
+  const now = new Date();
 
-  const { results } = await stmt.all();
+  const articles = await loadLiveArticles(c.env, sort, source);
   const latest: any = await c.env.news_db.prepare('SELECT MAX(created_at) as last_curated_at FROM articles').first();
 
-  const formattedArticles: ArticleModel[] = (results || []).map((article: any) => ({
-    ...article,
-    sources: parseSources(article.sources, article.source),
-    source_count: article.source_count || parseSources(article.sources, article.source).length || 1,
-    importance_score: article.importance_score || 1.0
-  }));
+  const digestGroups = sort === 'digest'
+    ? groupDigest(articles, now, resolveDigestTimeZone(c.env.DIGEST_TIMEZONE))
+    : undefined;
+  const feedArticles = sort === 'hot' ? rankHot(articles, now) : articles;
 
   const useEmreTheme = c.env.USE_EMRE_THEME !== 'false';
 
   return c.html(
     <FeedView
-      articles={formattedArticles}
+      articles={feedArticles}
+      digestGroups={digestGroups}
       sort={sort}
       sourceFilter={source}
       lastCuratedAt={latest?.last_curated_at || null}
@@ -95,7 +154,7 @@ app.get('/', async (c) => {
 // SSR Single Article Permalink Route
 app.get('/article/:id', async (c) => {
   const id = c.req.param('id');
-  const article: any = await c.env.news_db.prepare('SELECT * FROM articles WHERE id = ?').bind(id).first();
+  const article: any = await c.env.news_db.prepare(`SELECT ${ARTICLE_COLUMNS} FROM articles WHERE id = ?`).bind(id).first();
 
   const useEmreTheme = c.env.USE_EMRE_THEME !== 'false';
 
@@ -132,18 +191,13 @@ app.get('/article/:id', async (c) => {
 // RSS 2.0 XML Feed Route
 app.get('/rss.xml', async (c) => {
   const { results } = await c.env.news_db.prepare(
-    `SELECT * FROM articles 
-     WHERE created_at >= datetime('now', '-2 days') 
+    `SELECT ${ARTICLE_COLUMNS} FROM articles 
+     WHERE ${LIVE_ARTICLE_CONDITION} 
      ORDER BY created_at DESC 
-     LIMIT 50`
+     LIMIT ${RSS_LIMIT}`
   ).all();
 
-  const formattedArticles: ArticleModel[] = (results || []).map((article: any) => ({
-    ...article,
-    sources: parseSources(article.sources, article.source),
-    source_count: article.source_count || parseSources(article.sources, article.source).length || 1,
-    importance_score: article.importance_score || 1.0
-  }));
+  const formattedArticles: ArticleModel[] = (results || []).map(formatArticle);
 
   const siteUrl = c.env.FRONTEND_URL || 'https://news.emre.xyz';
   const rssXml = generateRssFeed(formattedArticles, siteUrl);
@@ -161,29 +215,13 @@ app.get('/rss', (c) => c.redirect('/rss.xml', 301));
 app.get('/feed', (c) => c.redirect('/rss.xml', 301));
 
 app.get('/api/articles', async (c) => {
-  const sort = c.req.query('sort') || 'hot';
-  
-  const orderByClause = sort === 'latest'
-    ? 'ORDER BY created_at DESC'
-    : 'ORDER BY ((coalesce(importance_score, 1.0) + (coalesce(follower_likes, 0) * 2.0)) / ((((julianday(\'now\') - julianday(created_at)) * 24.0) + 2.0) * (((julianday(\'now\') - julianday(created_at)) * 24.0) + 2.0))) DESC, created_at DESC';
+  const requestedSort = parseFeedSort(c.req.query('sort'));
+  // The JSON API keeps its flat contract: digest is an SSR-only view, so it falls back to hot here.
+  const sort: FeedSort = requestedSort === 'digest' ? 'hot' : requestedSort;
+  const articles = await loadLiveArticles(c.env, sort, 'all');
+  const formattedArticles = sort === 'hot' ? rankHot(articles, new Date()) : articles;
 
-  const { results } = await c.env.news_db.prepare(
-    `SELECT *, 
-      ((coalesce(importance_score, 1.0) + (coalesce(follower_likes, 0) * 2.0)) / ((((julianday('now') - julianday(created_at)) * 24.0) + 2.0) * (((julianday('now') - julianday(created_at)) * 24.0) + 2.0))) AS hot_score 
-     FROM articles 
-     WHERE created_at >= datetime('now', '-2 days') 
-     ${orderByClause} 
-     LIMIT 100`
-  ).all();
-  
   const latest: any = await c.env.news_db.prepare('SELECT MAX(created_at) as last_curated_at FROM articles').first();
-  
-  const formattedArticles = (results || []).map((article: any) => ({
-    ...article,
-    sources: parseSources(article.sources, article.source),
-    source_count: article.source_count || parseSources(article.sources, article.source).length || 1,
-    importance_score: article.importance_score || 1.0
-  }));
 
   c.header('Cache-Control', 'no-cache');
   return c.json({
@@ -437,37 +475,6 @@ function normalizeUrl(rawUrl: string): string {
   } catch {
     return rawUrl ? rawUrl.trim() : '';
   }
-}
-
-function parseSources(sourcesJson?: string | null, fallbackSource?: string): string[] {
-  if (sourcesJson) {
-    try {
-      const parsed = JSON.parse(sourcesJson);
-      if (Array.isArray(parsed) && parsed.length > 0) return parsed;
-    } catch {}
-  }
-  return fallbackSource ? [fallbackSource] : [];
-}
-
-function cosineSimilarity(vecA: number[], vecB: number[]): number {
-  if (!vecA || !vecB || vecA.length === 0 || vecA.length !== vecB.length) return 0;
-  let dotProduct = 0;
-  let normA = 0;
-  let normB = 0;
-  for (let i = 0; i < vecA.length; i++) {
-    dotProduct += vecA[i] * vecB[i];
-    normA += vecA[i] * vecA[i];
-    normB += vecB[i] * vecB[i];
-  }
-  if (normA === 0 || normB === 0) return 0;
-  return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
-}
-
-function calculateImportanceScore(sourceCount: number, affinityScore: number = 0): number {
-  // Base score 1.0. Each distinct source after the first increases importance by 1.5x
-  const sourceMultiplier = 1.0 + Math.max(0, sourceCount - 1) * 1.5;
-  const affinityBonus = Math.max(0, affinityScore) * 0.4;
-  return Number(((1.0 + affinityBonus) * sourceMultiplier).toFixed(2));
 }
 
 interface MatchEvaluation {
@@ -955,12 +962,144 @@ async function isAuthorizedForIngestion(c: any): Promise<boolean> {
   return false;
 }
 
+async function isAuthorizedAdmin(c: any): Promise<boolean> {
+  const url = new URL(c.req.url);
+  // 1. Allow localhost / 127.0.0.1 for local development
+  if (url.hostname === 'localhost' || url.hostname === '127.0.0.1') {
+    return true;
+  }
+
+  // 2. Secret Key auth via header or query param
+  const authHeader = c.req.header('Authorization');
+  const customKeyHeader = c.req.header('X-Ingestion-Key');
+  const queryKey = c.req.query('key');
+  const configuredSecret = c.env.INGESTION_SECRET;
+
+  if (configuredSecret && configuredSecret.length > 0) {
+    if (authHeader && authHeader.startsWith('Bearer ') && authHeader.slice(7).trim() === configuredSecret) {
+      return true;
+    }
+    if (customKeyHeader && customKeyHeader.trim() === configuredSecret) {
+      return true;
+    }
+    if (queryKey && queryKey.trim() === configuredSecret) {
+      return true;
+    }
+  }
+
+  // 3. Nostr Signature verification via header, cookie, or query param
+  let nostrRaw = c.req.header('X-Nostr-Event') || c.req.header('X-Nostr-Auth') || c.req.query('nostr_auth');
+  if (!nostrRaw) {
+    const cookieHeader = c.req.header('Cookie') || '';
+    const match = cookieHeader.match(/news_nostr_auth=([^;]+)/);
+    if (match && match[1]) {
+      try {
+        nostrRaw = decodeURIComponent(match[1]);
+      } catch {}
+    }
+  }
+
+  if (nostrRaw && c.env.AUTHORIZED_NOSTR_PUBKEY) {
+    try {
+      const event = typeof nostrRaw === 'string' && nostrRaw.startsWith('{')
+        ? JSON.parse(nostrRaw)
+        : JSON.parse(atob(nostrRaw));
+      if (verifyEvent(event) && event.pubkey === c.env.AUTHORIZED_NOSTR_PUBKEY) {
+        const now = Math.floor(Date.now() / 1000);
+        // Allow within 3600 seconds (1 hour) for admin sessions
+        if (Math.abs(now - event.created_at) < 3600) {
+          return true;
+        }
+      }
+    } catch (err) {
+      console.error('Nostr admin verification error', err);
+    }
+  }
+
+  return false;
+}
+
+// Diagnostic Debugger UI Route (Localhost & Nostr Verified Admin in Production)
+app.get('/debug', async (c) => {
+  const url = new URL(c.req.url);
+  const isLocal = url.hostname === 'localhost' || url.hostname === '127.0.0.1';
+  const isAuthorized = await isAuthorizedAdmin(c);
+  const source = c.req.query('source') || 'all';
+  const useEmreTheme = c.env.USE_EMRE_THEME !== 'false';
+
+  if (!isAuthorized) {
+    return c.html(
+      <DebugView
+        isAuthorized={false}
+        isLocal={isLocal}
+        authorizedPubkey={c.env.AUTHORIZED_NOSTR_PUBKEY}
+        currentSource={source}
+        useEmreTheme={useEmreTheme}
+      />
+    );
+  }
+
+  try {
+    const report = await runDebugPipeline(c.env, source);
+    report.is_local = isLocal;
+    report.is_admin_authenticated = isAuthorized;
+    report.admin_pubkey = c.env.AUTHORIZED_NOSTR_PUBKEY;
+
+    return c.html(
+      <DebugView
+        report={report}
+        isAuthorized={true}
+        isLocal={isLocal}
+        authorizedPubkey={c.env.AUTHORIZED_NOSTR_PUBKEY}
+        currentSource={source}
+        useEmreTheme={useEmreTheme}
+      />
+    );
+  } catch (err: any) {
+    return c.html(
+      <DebugView
+        error={err?.message || String(err)}
+        isAuthorized={true}
+        isLocal={isLocal}
+        authorizedPubkey={c.env.AUTHORIZED_NOSTR_PUBKEY}
+        currentSource={source}
+        useEmreTheme={useEmreTheme}
+      />
+    );
+  }
+});
+
+// Diagnostic Debugger JSON API Route
+app.get('/api/debug', async (c) => {
+  const url = new URL(c.req.url);
+  const isLocal = url.hostname === 'localhost' || url.hostname === '127.0.0.1';
+  const isAuthorized = await isAuthorizedAdmin(c);
+
+  if (!isAuthorized) {
+    return c.json({
+      error: 'Unauthorized',
+      message: 'Access restricted. Authenticate via Nostr (NIP-07), provide Authorization Bearer token, or connect via localhost.'
+    }, 401);
+  }
+
+  const source = c.req.query('source') || 'all';
+  try {
+    const report = await runDebugPipeline(c.env, source);
+    report.is_local = isLocal;
+    report.is_admin_authenticated = isAuthorized;
+    report.admin_pubkey = c.env.AUTHORIZED_NOSTR_PUBKEY;
+    return c.json(report);
+  } catch (err: any) {
+    return c.json({ error: 'Debug pipeline error', message: err?.message || String(err) }, 500);
+  }
+});
+
 const handleIngestEndpoint = async (c: any) => {
-  const isAuth = await isAuthorizedForIngestion(c);
+  const isAuth = await isAuthorizedAdmin(c);
   if (!isAuth) {
     return c.json({
       error: 'Unauthorized',
-      message: 'Access restricted. Provide Authorization Bearer header, ?key= query parameter, or signed Nostr authorization event.'
+      message: 'Access restricted. Provide Authorization Bearer header, ?key= query parameter, or Nostr admin authentication.'
     }, 401);
   }
 
@@ -996,7 +1135,15 @@ export default {
 
 async function handleIngestion(env: Bindings, targetSource?: string) {
   const stats: any = { raw: 0, filtered: 0, inserted: 0, errors: [] };
-  const rawArticles: { id: string, title: string, url: string, source: string, image_url?: string, summary?: string }[] = [];
+  const rawArticles: {
+    id: string;
+    title: string;
+    url: string;
+    source: string;
+    image_url?: string;
+    summary?: string;
+    details?: ScrapedDetails;
+  }[] = [];
 
   if (!targetSource || targetSource === 'hn') {
     // Fetch Hacker News
@@ -1080,6 +1227,7 @@ async function handleIngestion(env: Bindings, targetSource?: string) {
     sources: Set<string>;
     image_url?: string;
     summary?: string;
+    details?: ScrapedDetails;
   }>();
 
   for (const a of rawArticles) {
@@ -1096,6 +1244,12 @@ async function handleIngestion(env: Bindings, targetSource?: string) {
       if (!existing.image_url && a.image_url) {
         existing.image_url = a.image_url;
       }
+      if (!existing.summary && a.summary) {
+        existing.summary = a.summary;
+      }
+      if (!existing.details && a.details) {
+        existing.details = a.details;
+      }
     }
   }
 
@@ -1105,42 +1259,87 @@ async function handleIngestion(env: Bindings, targetSource?: string) {
     source_count: item.sources.size
   }));
 
-  // Cloudflare Workers have a 50 subrequest limit per invocation.
-  // If we run ALL sources (no targetSource), API calls use ~20 subrequests, so we cap scraping to 20.
-  // If we run a SINGLE source (via cron), API calls use ~5 subrequests, so we can safely scrape up to 40.
-  const limit = targetSource ? 40 : 20;
-  const limitedRawArticles = uniqueRawArticles.slice(0, limit);
+  const now = new Date();
+  const nowSql = toSqliteDateTime(now);
 
-  // PREVENT UNIQUE(url) constraints by mapping existing URLs to their existing IDs and merging sources!
-  if (limitedRawArticles.length > 0) {
-    const urls = limitedRawArticles.map(a => a.url);
+  // Split re-sightings (URL already stored) from brand-new URLs. Re-sightings only bump signals,
+  // skipping scrape/embed/judge/summarize, which also frees subrequest budget for new items.
+  const existingByUrl = new Map<string, ExistingArticleRow>();
+  for (let i = 0; i < uniqueRawArticles.length; i += D1_MAX_BOUND_PARAMS) {
+    const urls = uniqueRawArticles.slice(i, i + D1_MAX_BOUND_PARAMS).map(a => a.url);
     const placeholders = urls.map(() => '?').join(',');
     try {
-      const existing: any = await env.news_db.prepare(
-        `SELECT url, id, source, sources, source_count, importance_score, cluster_id FROM articles WHERE url IN (${placeholders})`
-      ).bind(...urls).all();
-      
-      const existingMap = new Map((existing.results || []).map((r: any) => [r.url, r]));
-      for (const article of limitedRawArticles) {
-        if (existingMap.has(article.url)) {
-          const dbRec: any = existingMap.get(article.url);
-          article.id = dbRec.id; // Use existing DB id to trigger ON CONFLICT(id) properly
-          const dbSources = parseSources(dbRec.sources, dbRec.source);
-          const mergedSources = Array.from(new Set([...dbSources, ...article.sources]));
-          article.sources = mergedSources;
-          article.source_count = mergedSources.length;
-          if (dbRec.cluster_id) {
-            article.cluster_id = dbRec.cluster_id;
-          }
-        }
+      const existing = await env.news_db.prepare(
+        `SELECT id, url, source, sources, source_count, seen_count, importance_score, expires_at FROM articles WHERE url IN (${placeholders})`
+      ).bind(...urls).all<ExistingArticleRow>();
+      for (const row of existing.results || []) {
+        existingByUrl.set(row.url, row);
       }
     } catch (e) {
       console.error('URL map check error', e);
     }
   }
 
-  // Scrape all contents concurrently and extract rich metadata
+  const resightUpdates: D1PreparedStatement[] = [];
+  const newRawArticles: typeof uniqueRawArticles = [];
+  for (const article of uniqueRawArticles) {
+    const dbRec = existingByUrl.get(article.url);
+    if (!dbRec) {
+      newRawArticles.push(article);
+      continue;
+    }
+    const dbSources = parseSources(dbRec.sources, dbRec.source);
+    const mergedSources = Array.from(new Set([...dbSources, ...article.sources]));
+    const previousSeen = dbRec.seen_count || 1;
+    const seenCount = previousSeen + 1;
+    const importanceScore = rescoreWithSignals(
+      dbRec.importance_score,
+      dbRec.source_count || dbSources.length || 1,
+      previousSeen,
+      mergedSources.length,
+      seenCount
+    );
+    resightUpdates.push(env.news_db.prepare(
+      'UPDATE articles SET sources = ?1, source_count = ?2, seen_count = ?3, importance_score = ?4, expires_at = ?5, last_seen_at = ?6 WHERE id = ?7'
+    ).bind(
+      JSON.stringify(mergedSources),
+      mergedSources.length,
+      seenCount,
+      importanceScore,
+      computeExpiresAt(mergedSources, importanceScore, now, dbRec.expires_at),
+      nowSql,
+      dbRec.id
+    ));
+  }
+
+  if (resightUpdates.length > 0) {
+    try {
+      await env.news_db.batch(resightUpdates);
+      stats.resighted = resightUpdates.length;
+    } catch (e: any) {
+      stats.errors.push('Re-sighting update error: ' + e.message);
+      console.error('Failed to update re-sighted articles', e);
+    }
+  }
+
+  // Cloudflare Workers have a 50 subrequest limit per invocation.
+  // If we run ALL sources (no targetSource), API calls use ~20 subrequests, so we cap scraping to 20.
+  // If we run a SINGLE source (via cron), API calls use ~5 subrequests, so we can safely scrape up to 40.
+  const limit = targetSource ? 40 : 20;
+  const limitedRawArticles = newRawArticles.slice(0, limit);
+  if (limitedRawArticles.length === 0) {
+    await cleanupExpiredArticles(env, stats);
+    return stats;
+  }
+
+  // Scrape all contents concurrently and extract rich metadata (bypasses scraping when details are already provided)
   const rawWithDetails = await Promise.all(limitedRawArticles.map(async a => {
+    if (a.details && a.details.fullText) {
+      return {
+        ...a,
+        details: a.details
+      };
+    }
     const details = await scrapeArticleDetails(a.url);
     return {
       ...a,
@@ -1215,14 +1414,43 @@ async function handleIngestion(env: Bindings, targetSource?: string) {
 
   // Stage 3: Semantic Cross-Source Topic Clustering via Cosine Similarity
   try {
-    let recentDbArticles: any[] = [];
+    // Inter-run clustering: compare new articles against stored embeddings of recently active articles.
+    // Cron ingests one source per run, so this is what links e.g. an HN and a Lobsters post on the same story.
+    let recentDbArticles: RecentClusterRow[] = [];
     try {
-      const recentRes: any = await env.news_db.prepare(
-        "SELECT id, title, url, source, sources, source_count, importance_score, cluster_id FROM articles WHERE created_at >= datetime('now', '-24 hours')"
-      ).all();
+      const recentRes = await env.news_db.prepare(
+        `SELECT id, url, source, sources, source_count, seen_count, importance_score, cluster_id, expires_at, embedding
+         FROM articles
+         WHERE embedding IS NOT NULL AND coalesce(last_seen_at, created_at) >= datetime('now', ?1)
+         ORDER BY coalesce(last_seen_at, created_at) DESC
+         LIMIT ?2`
+      ).bind(`-${CLUSTER_LOOKBACK_HOURS} hours`, CLUSTER_MAX_CANDIDATES).all<RecentClusterRow>();
       recentDbArticles = recentRes.results || [];
     } catch (dbErr) {
       console.error('Failed to fetch recent DB articles for clustering', dbErr);
+    }
+
+    const recentWithEmbeddings = recentDbArticles
+      .map(row => ({ row, embedding: parseEmbedding(row.embedding) }))
+      .filter((r): r is { row: RecentClusterRow; embedding: number[] } => r.embedding !== null);
+
+    const touchedDbRows = new Map<string, { row: RecentClusterRow; sources: Set<string>; clusterId: string }>();
+    for (const article of filteredArticles) {
+      if (!article.embedding) continue;
+      for (const { row, embedding } of recentWithEmbeddings) {
+        if (row.id === article.id || row.url === article.url) continue;
+        if (cosineSimilarity(article.embedding, embedding) < CLUSTER_SIMILARITY_THRESHOLD) continue;
+
+        const touched = touchedDbRows.get(row.id);
+        const clusterId = article.cluster_id || touched?.clusterId || row.cluster_id || `cluster-${row.id}`;
+        article.cluster_id = clusterId;
+
+        const dbSources = touched ? Array.from(touched.sources) : parseSources(row.sources, row.source);
+        const merged = new Set([...(article.sources || [article.source]), ...dbSources]);
+        article.sources = Array.from(merged);
+        article.source_count = merged.size;
+        touchedDbRows.set(row.id, { row, sources: merged, clusterId });
+      }
     }
 
     // Intra-batch clustering: compare pairs of filteredArticles
@@ -1232,7 +1460,7 @@ async function handleIngestion(env: Bindings, targetSource?: string) {
         const artB = filteredArticles[j];
         if (artA.embedding && artB.embedding) {
           const sim = cosineSimilarity(artA.embedding, artB.embedding);
-          if (sim >= 0.82) {
+          if (sim >= CLUSTER_SIMILARITY_THRESHOLD) {
             // Highly similar topic/event across articles
             const clusterId = artA.cluster_id || artB.cluster_id || `cluster-${artA.id}`;
             artA.cluster_id = clusterId;
@@ -1249,34 +1477,38 @@ async function handleIngestion(env: Bindings, targetSource?: string) {
       }
     }
 
-    // Inter-run clustering: compare batch articles against recent DB articles with same cluster
-    for (const article of filteredArticles) {
-      if (!article.cluster_id) continue;
-      for (const dbArt of recentDbArticles) {
-        if (dbArt.id === article.id || dbArt.url === article.url) continue;
-        
-        if (dbArt.cluster_id && dbArt.cluster_id === article.cluster_id) {
-          const dbSources = parseSources(dbArt.sources, dbArt.source);
-          const merged = Array.from(new Set([...(article.sources || [article.source]), ...dbSources]));
-          article.sources = merged;
-          article.source_count = merged.length;
-          
-          await env.news_db.prepare(
-            "UPDATE articles SET sources = ?1, source_count = ?2, importance_score = ?3 WHERE id = ?4"
-          ).bind(
-            JSON.stringify(merged),
-            merged.length,
-            calculateImportanceScore(merged.length),
-            dbArt.id
-          ).run();
-        }
-      }
+    // New coverage of a stored story means it is still active: boost, extend retention and refresh last_seen_at.
+    if (touchedDbRows.size > 0) {
+      const clusterUpdates = Array.from(touchedDbRows.values()).map(({ row, sources, clusterId }) => {
+        const mergedSources = Array.from(sources);
+        const seenCount = row.seen_count || 1;
+        const importanceScore = rescoreWithSignals(
+          row.importance_score,
+          row.source_count || parseSources(row.sources, row.source).length || 1,
+          seenCount,
+          mergedSources.length,
+          seenCount
+        );
+        return env.news_db.prepare(
+          'UPDATE articles SET sources = ?1, source_count = ?2, importance_score = ?3, cluster_id = ?4, expires_at = ?5, last_seen_at = ?6 WHERE id = ?7'
+        ).bind(
+          JSON.stringify(mergedSources),
+          mergedSources.length,
+          importanceScore,
+          clusterId,
+          computeExpiresAt(mergedSources, importanceScore, now, row.expires_at),
+          nowSql,
+          row.id
+        );
+      });
+      await env.news_db.batch(clusterUpdates);
+      stats.clustered = clusterUpdates.length;
     }
   } catch (clusterErr) {
     console.error('Topic clustering error', clusterErr);
   }
 
-  // Calculate final importance_score for all filtered articles
+  // Calculate final importance_score and retention for all filtered articles
   for (const article of filteredArticles) {
     const sourcesList = article.sources || [article.source];
     article.source_count = sourcesList.length;
@@ -1284,10 +1516,14 @@ async function handleIngestion(env: Bindings, targetSource?: string) {
       article.source_count,
       article.vectorEval?.affinityScore || 0
     );
+    article.expires_at = computeExpiresAt(sourcesList, article.importance_score, now);
   }
 
-  // Generate summaries for filtered articles using cached scrape data
+  // Generate summaries for filtered articles using cached scrape data (skip if already pre-summarized)
   for (const article of filteredArticles) {
+    if (article.summary && article.summary.trim().length > 0) {
+      continue;
+    }
     try {
       const content = article.details?.fullText || article.details?.content || '';
       if (content && content.length > 50) {
@@ -1306,15 +1542,21 @@ async function handleIngestion(env: Bindings, targetSource?: string) {
 
   // Insert into D1
   if (filteredArticles.length > 0) {
+    // ON CONFLICT(id) only fires on an id collision for a URL not matched above; treat it as a re-sighting.
+    // Timestamps share the 'YYYY-MM-DD HH:MM:SS' format, so string comparison orders them correctly.
     const stmt = env.news_db.prepare(`
-      INSERT INTO articles (id, title, url, source, sources, source_count, importance_score, cluster_id, image_url, summary) 
-      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+      INSERT INTO articles (id, title, url, source, sources, source_count, importance_score, cluster_id, image_url, summary, seen_count, last_seen_at, expires_at, embedding) 
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13)
       ON CONFLICT(id) DO UPDATE SET 
         sources = excluded.sources,
         source_count = excluded.source_count,
         importance_score = excluded.importance_score,
         cluster_id = excluded.cluster_id,
-        summary = coalesce(excluded.summary, articles.summary)
+        summary = coalesce(excluded.summary, articles.summary),
+        seen_count = coalesce(articles.seen_count, 1) + 1,
+        last_seen_at = excluded.last_seen_at,
+        expires_at = CASE WHEN articles.expires_at IS NULL OR excluded.expires_at > articles.expires_at THEN excluded.expires_at ELSE articles.expires_at END,
+        embedding = coalesce(excluded.embedding, articles.embedding)
     `);
     
     const batch = filteredArticles.map(a => stmt.bind(
@@ -1327,7 +1569,10 @@ async function handleIngestion(env: Bindings, targetSource?: string) {
       a.importance_score || 1.0,
       a.cluster_id || null,
       a.image_url || null,
-      a.summary || null
+      a.summary || null,
+      nowSql,
+      a.expires_at,
+      Array.isArray(a.embedding) ? serializeEmbedding(a.embedding) : null
     ));
     
     try {
@@ -1340,15 +1585,36 @@ async function handleIngestion(env: Bindings, targetSource?: string) {
     }
   }
 
-  // Cleanup old articles to keep DB small
+  await cleanupExpiredArticles(env, stats);
+  return stats;
+}
+
+interface ExistingArticleRow {
+  id: string;
+  url: string;
+  source: string;
+  sources: string | null;
+  source_count: number | null;
+  seen_count: number | null;
+  importance_score: number | null;
+  expires_at: string | null;
+}
+
+interface RecentClusterRow extends ExistingArticleRow {
+  cluster_id: string | null;
+  embedding: string | null;
+}
+
+// Expired articles are removed unless liked; liked articles are kept indefinitely.
+async function cleanupExpiredArticles(env: Bindings, stats: { errors: string[] }): Promise<void> {
   try {
-    await env.news_db.prepare("DELETE FROM articles WHERE created_at < datetime('now', '-2 days')").run();
+    await env.news_db.prepare(
+      "DELETE FROM articles WHERE coalesce(expires_at, datetime(created_at, '+2 days')) < datetime('now') AND coalesce(is_liked, 0) = 0"
+    ).run();
   } catch (e: any) {
     stats.errors.push('Cleanup error: ' + e.message);
     console.error('Failed to clean up old articles', e);
   }
-
-  return stats;
 }
 
 async function fetchRedditPosts(env: Bindings) {
@@ -1426,8 +1692,103 @@ function decodeBase64Utf8(base64: string) {
   return new TextDecoder().decode(bytes);
 }
 
-async function fetchGmailNewsletters(env: Bindings) {
-  const articles: { id: string, title: string, url: string, source: string, image_url?: string }[] = [];
+function decodeEmailEntities(text: string): string {
+  return text
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'")
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&bull;/g, '•')
+    .replace(/&mdash;/g, '—')
+    .replace(/&ndash;/g, '–')
+    .replace(/&hellip;/g, '...')
+    .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(Number(code)))
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, code) => String.fromCharCode(parseInt(code, 16)))
+    .trim();
+}
+
+function convertEmailToStructuredMarkdown(htmlContent: string, plainTextContent?: string): { markdown: string, issueWebUrl: string | null } {
+  let issueWebUrl: string | null = null;
+
+  // Try to find the web version link from HTML
+  const webLinkMatch = htmlContent.match(/<a[^>]+href=["']([^"']+)["'][^>]*>(?:[\s\S]*?(?:Tarayıcıda oku|Web Version|View in browser|View online|Read in browser|View this issue|Web version)[\s\S]*?)<\/a>/i)
+    || htmlContent.match(/<a[^>]+href=["']([^"']+)["'][^>]*>\s*(?:WEB VERSION|Tarayıcıda oku|View in browser)\s*<\/a>/i);
+
+  if (webLinkMatch && webLinkMatch[1]) {
+    issueWebUrl = decodeEmailEntities(webLinkMatch[1].trim());
+  }
+
+  // 1. Remove comments, styles, scripts, SVGs, head
+  let text = htmlContent
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/<style[\s\S]*?<\/style>/gi, '')
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<head[\s\S]*?<\/head>/gi, '')
+    .replace(/<svg[\s\S]*?<\/svg>/gi, '');
+
+  // 2. Headings
+  text = text.replace(/<h[1-6][^>]*>([\s\S]*?)<\/h[1-6]>/gi, '\n\n## $1\n\n');
+
+  // 3. Lists and paragraphs
+  text = text.replace(/<li[^>]*>([\s\S]*?)<\/li>/gi, '\n• $1\n');
+  text = text.replace(/<p[^>]*>([\s\S]*?)<\/p>/gi, '\n\n$1\n\n');
+  text = text.replace(/<tr[^>]*>([\s\S]*?)<\/tr>/gi, '\n$1\n');
+  text = text.replace(/<br\s*\/?>/gi, '\n');
+
+  // 4. Links: convert <a href="url">link text</a> -> [link text](url)
+  text = text.replace(/<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi, (match, href, linkBody) => {
+    const cleanLinkText = linkBody.replace(/<[^>]+>/g, '').trim();
+    if (!cleanLinkText || href.startsWith('mailto:') || href.startsWith('javascript:')) {
+      return cleanLinkText;
+    }
+    return `[${cleanLinkText}](${href})`;
+  });
+
+  // 5. Bold and emphasis
+  text = text.replace(/<(?:strong|b)[^>]*>([\s\S]*?)<\/(?:strong|b)>/gi, '**$1**');
+  text = text.replace(/<(?:em|i)[^>]*>([\s\S]*?)<\/(?:em|i)>/gi, '*$1*');
+
+  // 6. Strip remaining HTML tags
+  text = text.replace(/<[^>]+>/g, ' ');
+
+  // 7. Decode HTML entities
+  text = decodeEmailEntities(text);
+
+  // 8. Clean up whitespace
+  text = text
+    .split('\n')
+    .map(line => line.replace(/[ \t]+/g, ' ').trim())
+    .filter((line, idx, arr) => line.length > 0 || (idx > 0 && arr[idx - 1].length > 0))
+    .join('\n');
+
+  // Fallback to plain text if HTML was empty or too small
+  if (text.length < 50 && plainTextContent && plainTextContent.length > 50) {
+    text = plainTextContent;
+  }
+
+  return { markdown: text, issueWebUrl };
+}
+
+async function fetchGmailNewsletters(env: Bindings): Promise<{
+  id: string;
+  title: string;
+  url: string;
+  source: string;
+  image_url?: string;
+  summary?: string;
+  details?: ScrapedDetails;
+}[]> {
+  const articles: {
+    id: string;
+    title: string;
+    url: string;
+    source: string;
+    image_url?: string;
+    summary?: string;
+    details?: ScrapedDetails;
+  }[] = [];
   
   if (!env.GMAIL_CLIENT_ID || !env.GMAIL_CLIENT_SECRET || !env.GMAIL_REFRESH_TOKEN) {
     return articles;
@@ -1448,7 +1809,6 @@ async function fetchGmailNewsletters(env: Bindings) {
 
   // 2. Search for messages
   const query = encodeURIComponent((env.GMAIL_SEARCH_QUERY || "label:newsletter") + " newer_than:7d");
-  // Fetch messages from the last day to limit processing
   const searchRes = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${query}&maxResults=5`, {
     headers: { "Authorization": `Bearer ${accessToken}` }
   });
@@ -1457,7 +1817,23 @@ async function fetchGmailNewsletters(env: Bindings) {
     return articles;
   }
   const searchData: any = await searchRes.json();
-  const messages = searchData.messages || [];
+  const listedMessages: Array<{ id: string }> = searchData.messages || [];
+
+  // The search window spans days, so the same emails are listed every cycle. Skip already-decomposed
+  // messages: re-running the LLM is wasteful and its varying titles would create duplicate articles.
+  let messages = listedMessages;
+  if (listedMessages.length > 0) {
+    try {
+      const placeholders = listedMessages.map(() => '?').join(',');
+      const processed = await env.news_db.prepare(
+        `SELECT message_id FROM processed_emails WHERE message_id IN (${placeholders})`
+      ).bind(...listedMessages.map(m => m.id)).all<{ message_id: string }>();
+      const processedIds = new Set((processed.results || []).map(r => r.message_id));
+      messages = listedMessages.filter(m => !processedIds.has(m.id));
+    } catch (e) {
+      console.error('Failed to load processed email ids; processing all listed messages', e);
+    }
+  }
 
   for (const msg of messages) {
     const msgRes = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=full`, {
@@ -1465,119 +1841,152 @@ async function fetchGmailNewsletters(env: Bindings) {
     });
     if (!msgRes.ok) continue;
     const msgData: any = await msgRes.json();
+
+    // Extract Subject & From headers
+    let emailSubject = "";
+    let emailFrom = "";
+    const headers = msgData.payload?.headers || [];
+    for (const h of headers) {
+      if (h.name?.toLowerCase() === 'subject') emailSubject = h.value;
+      if (h.name?.toLowerCase() === 'from') emailFrom = h.value;
+    }
     
-    // Extract body content
-    let bodyData = "";
-    let isHtml = false;
+    // Extract HTML and Plain text parts
+    let rawHtml = "";
+    let rawPlain = "";
     
-    function extractBody(part: any): { data: string, isHtml: boolean } | null {
-      if (part.mimeType === "text/html" && part.body && part.body.data) return { data: part.body.data, isHtml: true };
-      if (part.mimeType === "text/plain" && part.body && part.body.data) return { data: part.body.data, isHtml: false };
-      if (part.parts) {
-        let plainFallback = null;
-        for (const subPart of part.parts) {
-          const res = extractBody(subPart);
-          if (res) {
-            if (res.isHtml) return res;
-            plainFallback = res;
-          }
-        }
-        return plainFallback;
+    function extractParts(part: any) {
+      if (part.mimeType === "text/html" && part.body && part.body.data) {
+        rawHtml = decodeBase64Utf8(part.body.data);
+      } else if (part.mimeType === "text/plain" && part.body && part.body.data) {
+        rawPlain = decodeBase64Utf8(part.body.data);
       }
-      return null;
+      if (part.parts) {
+        for (const subPart of part.parts) {
+          extractParts(subPart);
+        }
+      }
     }
 
     if (msgData.payload) {
-      const extracted = extractBody(msgData.payload);
-      if (extracted) {
-        bodyData = extracted.data;
-        isHtml = extracted.isHtml;
-      }
+      extractParts(msgData.payload);
     }
 
-    if (!bodyData) continue;
-    
-    // Base64url decode
-    const textContent = decodeBase64Utf8(bodyData);
-    
-    let textToAnalyze = "";
-    if (isHtml) {
-      const linksMap: { href: string, text: string }[] = [];
-      let currentLink: any = null;
-      
-      const rewriter = new HTMLRewriter().on('a', {
-        element(el) {
-          const href = el.getAttribute('href');
-          if (href && href.startsWith('http')) {
-            currentLink = { href, text: '' };
-            linksMap.push(currentLink);
-          } else {
-            currentLink = null;
-          }
-        },
-        text(textChunk) {
-          if (currentLink) {
-            currentLink.text += textChunk.text;
-          }
-        }
-      });
-      
-      await rewriter.transform(new Response(textContent)).text();
-      
-      const validLinks = linksMap
-        .map(l => ({ href: l.href, text: l.text.replace(/\s+/g, ' ').trim() }))
-        .filter(l => l.text.length > 2 && !l.href.toLowerCase().includes('unsubscribe') && !l.href.includes('twitter.com') && !l.href.includes('facebook.com') && !l.href.includes('instagram.com') && !l.href.includes('linkedin.com'));
-        
-      const linkStrings = validLinks.map(l => `- [${l.text}](${l.href})`);
-      textToAnalyze = linkStrings.slice(0, 150).join('\n');
-    } else {
-      textToAnalyze = textContent.substring(0, 4000);
-    }
+    if (!rawHtml && !rawPlain) continue;
 
-    // 3. Extract Links using AI
+    // Convert into clean structured markdown
+    const { markdown, issueWebUrl } = convertEmailToStructuredMarkdown(rawHtml, rawPlain);
+    if (!markdown || markdown.trim().length < 50) continue;
+
+    // Slice structured text to fit comfortably in LLM context
+    const textToAnalyze = markdown.substring(0, 14000);
+    const fallbackIssueUrl = issueWebUrl || `https://news.emre.xyz/newsletter/${msg.id}`;
+
+    // 3. Decompose multi-topic newsletter using AI
     try {
+      const systemPrompt = `You are an expert news and technical digest curator.
+Your task is to analyze the provided markdown content of an email newsletter ("${emailSubject}" from ${emailFrom}) and extract ALL discrete news stories, articles, tool releases, and technical developments into a structured JSON array.
+
+Extraction Rules:
+1. Extract every distinct story or tool mentioned in the newsletter.
+2. For each item provide:
+   - "title": A clear, meaningful headline (e.g., "mastodon-post: Web Component to display Mastodon posts", "OpenAI introduces ChatGPT Workspace & Pages", "T24 internet sitesine erişim engeli getirildi").
+   - "summary": A complete, concise 1-3 sentence summary capturing the key facts/context from the text.
+   - "category": The section/topic heading (e.g., "Technology", "CSS & HTML Tools", "Markets & Economy", "World News").
+   - "url": The direct external link associated with this specific item if present. If no specific external link is present for this story, use "${fallbackIssueUrl}".
+   - "is_sponsored": true IF this item is an advertisement, sponsored promotion, classified ad, affiliate pitch, or partner placement (e.g. "SPONSORED", "AD", "Bugünkü Destekçimiz", "Advertisement", "Commercial Apps & Classifieds"). Otherwise false.
+3. Exclude newsletter housekeeping (e.g. "Tarayıcıda oku", "Web Version", greetings, unsubscribe links, feedback requests, social media follow buttons, daily music playlist).
+
+Return ONLY a valid JSON array of objects. Do not include markdown code block formatting or extra commentary.
+Format:
+[
+  {
+    "title": "Story Title",
+    "summary": "1-3 sentence description.",
+    "category": "Technology",
+    "url": "https://...",
+    "is_sponsored": false
+  }
+]`;
+
       const aiResponse: any = await env.AI.run('@cf/meta/llama-3.3-70b-instruct-fp8-fast', {
         messages: [
-          { role: 'system', content: 'You are an assistant that curates news. You are given a list of markdown links (or raw text) extracted from a newsletter. Filter out unsubscribe links, social media profiles, navigation links, and sponsor links. Return ALL valid news articles found in the list. Do not summarize or limit the count. Return ONLY a raw JSON array of objects with "title" and "url" properties representing the actual news articles/content. Do not include markdown formatting or any other text.' },
+          { role: 'system', content: systemPrompt },
           { role: 'user', content: textToAnalyze }
         ],
-        max_tokens: 2048
+        max_tokens: 2500
       });
 
-      let responseText = aiResponse.response;
-      // Clean up markdown if the AI mistakenly included it
-      if (responseText.startsWith('\`\`\`json')) {
-        responseText = responseText.replace(/^\`\`\`json\n?/, '').replace(/\n?\`\`\`$/, '');
-      } else if (responseText.startsWith('\`\`\`')) {
-        responseText = responseText.replace(/^\`\`\`\n?/, '').replace(/\n?\`\`\`$/, '');
+      let responseText = aiResponse.response || '';
+      if (responseText.startsWith('```json')) {
+        responseText = responseText.replace(/^```json\n?/, '').replace(/\n?```$/, '');
+      } else if (responseText.startsWith('```')) {
+        responseText = responseText.replace(/^```\n?/, '').replace(/\n?```$/, '');
       }
 
-      let extractedLinks = [];
+      let extractedStories: any[] = [];
       try {
-        extractedLinks = JSON.parse(responseText);
-      } catch(e) {
-        // Fallback: If JSON is malformed, use regex to extract titles and URLs safely.
-        const regex = /"title"\s*:\s*"([^"]+)"\s*,\s*"url"\s*:\s*"([^"]+)"/g;
-        let match;
-        while ((match = regex.exec(responseText)) !== null) {
-          extractedLinks.push({ title: match[1], url: match[2] });
+        extractedStories = JSON.parse(responseText.trim());
+      } catch (parseErr) {
+        // Fallback regex parser for story objects
+        const storyRegex = /{\s*"title"\s*:\s*"([^"]+)"[\s\S]*?"summary"\s*:\s*"([^"]+)"[\s\S]*?"url"\s*:\s*"([^"]+)"(?:[\s\S]*?"is_sponsored"\s*:\s*(true|false))?[\s\S]*?}/g;
+        let m;
+        while ((m = storyRegex.exec(responseText)) !== null) {
+          if (m[4] !== 'true') {
+            extractedStories.push({
+              title: m[1],
+              summary: m[2],
+              url: m[3],
+              is_sponsored: false
+            });
+          }
         }
       }
-      
-      for (const link of extractedLinks) {
-        if (link.url && link.title) {
-           const hashBuffer = await crypto.subtle.digest('SHA-1', new TextEncoder().encode(link.url));
-           const hashHex = Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('').substring(0, 16);
-           articles.push({
-             id: `newsletter-${msg.id}-${hashHex}`,
-             title: link.title,
-             url: link.url,
-             source: 'newsletter'
-           });
+
+      if (Array.isArray(extractedStories)) {
+        for (const story of extractedStories) {
+          if (story.is_sponsored) continue;
+          const title = (story.title || '').trim();
+          const summary = (story.summary || '').trim();
+          if (!title || title.length < 3 || !summary || summary.length < 10) continue;
+
+          let targetUrl = (story.url || '').trim();
+          if (!targetUrl.startsWith('http')) {
+            const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').substring(0, 30);
+            targetUrl = `${fallbackIssueUrl}#${slug}`;
+          }
+
+          const hashBuffer = await crypto.subtle.digest('SHA-1', new TextEncoder().encode(targetUrl + title));
+          const hashHex = Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('').substring(0, 16);
+
+          articles.push({
+            id: `newsletter-${msg.id}-${hashHex}`,
+            title,
+            url: targetUrl,
+            source: 'newsletter',
+            summary,
+            details: {
+              description: summary,
+              headings: title,
+              content: summary,
+              fullText: `${title}${story.category ? ` (${story.category})` : ''}. ${summary}`
+            }
+          });
         }
       }
-    } catch (e) {
-      console.error('AI link extraction error for msg', msg.id, e);
+
+      // Marked only after a successful decomposition so failed or unparseable responses are retried next cycle.
+      if (Array.isArray(extractedStories) && extractedStories.length > 0) {
+        try {
+          await env.news_db.prepare(
+            'INSERT INTO processed_emails (message_id) VALUES (?1) ON CONFLICT(message_id) DO NOTHING'
+          ).bind(msg.id).run();
+        } catch (markErr) {
+          console.error('Failed to mark email as processed', msg.id, markErr);
+        }
+      }
+    } catch (aiErr) {
+      console.error('AI newsletter decomposition error for msg', msg.id, aiErr);
     }
   }
 
@@ -1649,4 +2058,436 @@ async function fetchStackerNews(): Promise<{ id: string, title: string, url: str
 
   return articles;
 }
+
+async function runDebugPipeline(env: Bindings, targetSource: string = 'all'): Promise<DiagnosticReport> {
+  const startTime = performance.now();
+  const errors: string[] = [];
+  const rawArticles: {
+    id: string;
+    title: string;
+    url: string;
+    source: string;
+    image_url?: string;
+    summary?: string;
+    details?: ScrapedDetails;
+  }[] = [];
+
+  const sourceKey = targetSource === 'all' ? undefined : targetSource;
+
+  if (!sourceKey || sourceKey === 'hn') {
+    try {
+      const hnRes = await fetch('https://hacker-news.firebaseio.com/v0/topstories.json');
+      if (hnRes.ok) {
+        const topIds: number[] = await hnRes.json();
+        const top10 = topIds.slice(0, 10);
+        for (const id of top10) {
+          const itemRes = await fetch(`https://hacker-news.firebaseio.com/v0/item/${id}.json`);
+          if (itemRes.ok) {
+            const item: any = await itemRes.json();
+            if (item.url) {
+              rawArticles.push({
+                id: `hn-${item.id}`,
+                title: item.title,
+                url: item.url,
+                source: 'hackernews'
+              });
+            }
+          }
+        }
+      }
+    } catch (e: any) {
+      errors.push('HN fetch error: ' + (e.message || String(e)));
+    }
+  }
+
+  if (!sourceKey || sourceKey === 'lobsters') {
+    try {
+      const lobstersRes = await fetch('https://lobste.rs/hottest.json');
+      if (lobstersRes.ok) {
+        const lobsters: any[] = await lobstersRes.json();
+        const top10 = lobsters.slice(0, 10);
+        for (const item of top10) {
+          if (item.url) {
+            rawArticles.push({
+              id: `lobsters-${item.short_id}`,
+              title: item.title,
+              url: item.url,
+              source: 'lobsters'
+            });
+          }
+        }
+      }
+    } catch (e: any) {
+      errors.push('Lobsters fetch error: ' + (e.message || String(e)));
+    }
+  }
+
+  if (!sourceKey || sourceKey === 'stacker') {
+    try {
+      const stackerArticles = await fetchStackerNews();
+      rawArticles.push(...stackerArticles.slice(0, 10));
+    } catch (e: any) {
+      errors.push('Stacker News error: ' + (e.message || String(e)));
+    }
+  }
+
+  if (!sourceKey || sourceKey === 'reddit') {
+    try {
+      const redditArticles = await fetchRedditPosts(env);
+      rawArticles.push(...redditArticles.slice(0, 10));
+    } catch (e: any) {
+      errors.push('Reddit error: ' + (e.message || String(e)));
+    }
+  }
+
+  if (!sourceKey || sourceKey === 'gmail') {
+    try {
+      const newsletterArticles = await fetchGmailNewsletters(env);
+      rawArticles.push(...newsletterArticles);
+    } catch (e: any) {
+      errors.push('Gmail newsletter error: ' + (e.message || String(e)));
+    }
+  }
+
+  const totalRaw = rawArticles.length;
+
+  // Deduplicate and aggregate rawArticles by normalized URL
+  const urlMap = new Map<string, {
+    id: string;
+    title: string;
+    url: string;
+    source: string;
+    sources: Set<string>;
+    image_url?: string;
+    summary?: string;
+    details?: ScrapedDetails;
+  }>();
+
+  for (const a of rawArticles) {
+    const normUrl = normalizeUrl(a.url);
+    a.url = normUrl;
+    if (!urlMap.has(normUrl)) {
+      urlMap.set(normUrl, {
+        ...a,
+        sources: new Set([a.source])
+      });
+    } else {
+      const existing = urlMap.get(normUrl)!;
+      existing.sources.add(a.source);
+      if (!existing.image_url && a.image_url) existing.image_url = a.image_url;
+      if (!existing.summary && a.summary) existing.summary = a.summary;
+      if (!existing.details && a.details) existing.details = a.details;
+    }
+  }
+
+  const uniqueRawArticles = Array.from(urlMap.values()).map(item => ({
+    ...item,
+    sources: Array.from(item.sources),
+    source_count: item.sources.size
+  }));
+
+  const totalUnique = uniqueRawArticles.length;
+  // Limit to 20 for interactive performance in debug
+  const limitedArticles = uniqueRawArticles.slice(0, 20);
+
+  // Scrape article details
+  const scrapedArticles = await Promise.all(limitedArticles.map(async (a) => {
+    if (a.details && a.details.fullText) {
+      return { ...a, details: a.details };
+    }
+    const details = await scrapeArticleDetails(a.url);
+    return { ...a, details };
+  }));
+
+  const tasteProfile = await getUserTasteProfile(env);
+  const items: DiagnosticItem[] = [];
+
+  try {
+    const textsToEmbed = scrapedArticles.map(a => buildEmbeddingText({
+      title: a.title,
+      source: a.source,
+      description: a.details?.description,
+      content: a.details?.content
+    }));
+
+    const embedRes: any = await env.AI.run('@cf/baai/bge-base-en-v1.5', { text: textsToEmbed });
+    const embeddings = embedRes.data || [];
+
+    const candidatePoolForLLM: Array<{
+      index: number;
+      id: string;
+      title: string;
+      url: string;
+      source: string;
+      details?: ScrapedDetails;
+      vectorEval?: MatchEvaluation;
+    }> = [];
+
+    // Query Vectorize for each candidate and build detailed evaluation trace
+    for (let i = 0; i < scrapedArticles.length; i++) {
+      const art = scrapedArticles[i];
+      const embedding = embeddings[i];
+
+      let vectorEval: MatchEvaluation = {
+        affinityScore: 0.5,
+        topPositiveScore: 0,
+        topNegativeScore: 0,
+        positiveCount: 0,
+        negativeCount: 0,
+        recommendation: 'uncertain'
+      };
+      const topPositiveMatches: VectorMatchDetail[] = [];
+      const topNegativeMatches: VectorMatchDetail[] = [];
+
+      try {
+        if (embedding && env.VECTORIZE) {
+          const queryRes = await env.VECTORIZE.query(embedding, { topK: 6, returnMetadata: 'all' });
+          const matches = queryRes.matches || [];
+          vectorEval = evaluateVectorMatches(matches);
+
+          for (const m of matches) {
+            const isDislike = m.metadata?.type === 'dislike';
+            const matchDetail: VectorMatchDetail = {
+              id: m.id,
+              score: m.score,
+              type: isDislike ? 'dislike' : (m.metadata?.type === 'like' ? 'like' : 'upvote'),
+              title: m.metadata?.title || m.id,
+              source: m.metadata?.source,
+              url: m.metadata?.url
+            };
+            if (isDislike) {
+              topNegativeMatches.push(matchDetail);
+            } else {
+              topPositiveMatches.push(matchDetail);
+            }
+          }
+        }
+      } catch (vecErr: any) {
+        errors.push(`Vectorize query error for "${art.title}": ${vecErr.message || String(vecErr)}`);
+      }
+
+      topPositiveMatches.sort((a, b) => b.score - a.score);
+      topNegativeMatches.sort((a, b) => b.score - a.score);
+
+      const importanceScore = calculateImportanceScore(art.source_count, vectorEval.affinityScore);
+      const sourceMultiplier = 1.0 + Math.max(0, art.source_count - 1) * 1.5;
+
+      const diagItem: DiagnosticItem = {
+        id: art.id,
+        title: art.title,
+        url: art.url,
+        source: art.source,
+        sources: art.sources,
+        source_count: art.source_count,
+        original_post_url: getOriginalPostUrl(art.id),
+        status: 'REJECTED',
+        primary_reason: '',
+        details: art.details,
+        vector_eval: {
+          ...vectorEval,
+          top_positive_matches: topPositiveMatches,
+          top_negative_matches: topNegativeMatches
+        },
+        llm_eval: {
+          was_sent_to_llm: false
+        },
+        scores: {
+          importance_score: importanceScore,
+          affinity_score: vectorEval.affinityScore,
+          top_positive_score: vectorEval.topPositiveScore,
+          top_negative_score: vectorEval.topNegativeScore,
+          source_multiplier: sourceMultiplier
+        }
+      };
+
+      if (vectorEval.recommendation === 'reject') {
+        diagItem.status = 'REJECTED';
+        diagItem.rejection_stage = 'vector';
+        diagItem.primary_reason = vectorEval.topNegativeScore >= 0.78
+          ? `Vector hard rejection: strong similarity (${(vectorEval.topNegativeScore * 100).toFixed(0)}%) to disliked article`
+          : `Vector rejection: net negative affinity score (${vectorEval.affinityScore.toFixed(2)})`;
+      } else if (vectorEval.recommendation === 'accept') {
+        diagItem.status = 'ACCEPTED';
+        diagItem.primary_reason = `Decisive vector affinity match (${(vectorEval.topPositiveScore * 100).toFixed(0)}% similarity to upvoted content)`;
+      } else {
+        // Uncertain / cold-start candidate -> evaluate via LLM Judge
+        candidatePoolForLLM.push({
+          index: i,
+          id: art.id,
+          title: art.title,
+          url: art.url,
+          source: art.source,
+          details: art.details,
+          vectorEval
+        });
+      }
+
+      items.push(diagItem);
+    }
+
+    // Stage 2: Batch evaluate candidate pool with LLM Curation Judge
+    if (candidatePoolForLLM.length > 0) {
+      const approvedIds = await curateArticlesWithLLM(env, candidatePoolForLLM, tasteProfile);
+
+      for (const cand of candidatePoolForLLM) {
+        const diagItem = items[cand.index];
+        const isApproved = approvedIds.has(cand.id);
+
+        diagItem.llm_eval = {
+          was_sent_to_llm: true,
+          llm_accepted: isApproved
+        };
+
+        if (isApproved) {
+          diagItem.status = 'ACCEPTED';
+          diagItem.primary_reason = diagItem.source_count > 1
+            ? `Approved by LLM Judge + Multi-source boost (${diagItem.source_count} sources)`
+            : 'Approved by LLM Curation Judge (aligned with technical taste profile)';
+        } else {
+          diagItem.status = 'REJECTED';
+          diagItem.rejection_stage = 'llm';
+          diagItem.primary_reason = 'Rejected by LLM Judge (did not meet depth or engineering taste criteria)';
+        }
+      }
+    }
+    // Stage 3: Resolve titles and URLs for all vector matches across all items
+    const allMatchesToResolve: VectorMatchDetail[] = [];
+    for (const item of items) {
+      if (item.vector_eval?.top_positive_matches) {
+        allMatchesToResolve.push(...item.vector_eval.top_positive_matches);
+      }
+      if (item.vector_eval?.top_negative_matches) {
+        allMatchesToResolve.push(...item.vector_eval.top_negative_matches);
+      }
+    }
+    await resolveVectorMatchTitles(env, allMatchesToResolve);
+
+  } catch (pipeErr: any) {
+    errors.push('Recommendation pipeline error: ' + (pipeErr.message || String(pipeErr)));
+    console.error('Recommendation pipeline error', pipeErr);
+  }
+
+  let totalAccepted = 0;
+  let totalRejected = 0;
+  for (const it of items) {
+    if (it.status === 'ACCEPTED') totalAccepted++;
+    else totalRejected++;
+  }
+
+  const durationMs = Math.round(performance.now() - startTime);
+
+  return {
+    timestamp: new Date().toISOString(),
+    source: targetSource,
+    is_local: false,
+    is_admin_authenticated: true,
+    taste_profile: tasteProfile,
+    stats: {
+      total_raw: totalRaw,
+      total_unique: totalUnique,
+      total_scraped: scrapedArticles.length,
+      total_accepted: totalAccepted,
+      total_rejected: totalRejected,
+      duration_ms: durationMs,
+      errors
+    },
+    items
+  };
+}
+
+function extractArticleIdFromVectorId(vectorId: string): { dbId: string; sourceHint?: string; externalId?: string; originalUrl?: string } {
+  let dbId = vectorId.replace(/^(liked|disliked)-/, '');
+  let originalUrl: string | undefined;
+  let externalId: string | undefined;
+  let sourceHint: string | undefined;
+
+  if (vectorId.startsWith('reddit-upvote-') || dbId.startsWith('reddit-')) {
+    sourceHint = 'Reddit';
+    externalId = vectorId.replace(/^reddit-upvote-/, '').replace(/^reddit-/, '');
+    originalUrl = `https://redd.it/${externalId}`;
+    dbId = `reddit-${externalId}`;
+  } else if (vectorId.startsWith('hn-upvote-') || dbId.startsWith('hn-')) {
+    sourceHint = 'Hacker News';
+    externalId = vectorId.replace(/^hn-upvote-/, '').replace(/^hn-/, '');
+    originalUrl = `https://news.ycombinator.com/item?id=${externalId}`;
+    dbId = `hn-${externalId}`;
+  } else if (vectorId.startsWith('lobsters-upvote-') || dbId.startsWith('lobsters-')) {
+    sourceHint = 'Lobsters';
+    externalId = vectorId.replace(/^lobsters-upvote-/, '').replace(/^lobsters-/, '');
+    originalUrl = `https://lobste.rs/s/${externalId}`;
+    dbId = `lobsters-${externalId}`;
+  } else if (vectorId.startsWith('stacker-')) {
+    sourceHint = 'Stacker News';
+    externalId = vectorId.replace(/^stacker-/, '');
+    originalUrl = `https://stacker.news/items/${externalId}`;
+    dbId = `stacker-${externalId}`;
+  }
+
+  return { dbId, sourceHint, externalId, originalUrl };
+}
+
+async function resolveVectorMatchTitles(env: Bindings, matches: VectorMatchDetail[]): Promise<void> {
+  if (!matches || matches.length === 0) return;
+
+  const candidateDbIds = new Set<string>();
+  const matchMap = new Map<string, VectorMatchDetail[]>();
+
+  for (const m of matches) {
+    const { dbId } = extractArticleIdFromVectorId(m.id);
+    candidateDbIds.add(m.id);
+    if (dbId) candidateDbIds.add(dbId);
+
+    const list1 = matchMap.get(m.id) || [];
+    list1.push(m);
+    matchMap.set(m.id, list1);
+
+    if (dbId && dbId !== m.id) {
+      const list2 = matchMap.get(dbId) || [];
+      list2.push(m);
+      matchMap.set(dbId, list2);
+    }
+  }
+
+  if (candidateDbIds.size > 0) {
+    const ids = Array.from(candidateDbIds);
+    const placeholders = ids.map(() => '?').join(',');
+    try {
+      const dbResults: any = await env.news_db.prepare(
+        `SELECT id, title, url, source FROM articles WHERE id IN (${placeholders})`
+      ).bind(...ids).all();
+
+      for (const row of (dbResults.results || [])) {
+        const matchingItems = matchMap.get(row.id);
+        if (matchingItems) {
+          for (const item of matchingItems) {
+            if (row.title) item.title = row.title;
+            if (row.url && !item.url) item.url = row.url;
+            if (row.source && !item.source) item.source = row.source;
+          }
+        }
+      }
+    } catch (e) {
+      console.error('Failed to resolve match titles from DB', e);
+    }
+  }
+
+  // Fallback for remaining items
+  for (const m of matches) {
+    const { sourceHint, externalId, originalUrl } = extractArticleIdFromVectorId(m.id);
+    if (originalUrl && !m.url) {
+      m.url = originalUrl;
+    }
+    if (!m.title || m.title === m.id || m.title.startsWith('liked-') || m.title.startsWith('disliked-') || m.title.startsWith('reddit-upvote-') || m.title.startsWith('hn-upvote-')) {
+      if (externalId && sourceHint) {
+        m.title = `${sourceHint} Post #${externalId}`;
+      } else {
+        m.title = m.id;
+      }
+    }
+    if (!m.source && sourceHint) {
+      m.source = sourceHint.toLowerCase().replace(/\s+/g, '');
+    }
+  }
+}
+
 

@@ -305,10 +305,70 @@ function attachCardListeners(card) {
   }
 }
 
+const LAST_VISIT_STORAGE_KEY = 'lastVisitAt';
+
+// D1 timestamps are UTC 'YYYY-MM-DD HH:MM:SS' without a zone marker.
+function parseUtcTimestamp(value) {
+  if (!value) return NaN;
+  const iso = value.includes('T') ? value : value.replace(' ', 'T');
+  return Date.parse(/[zZ]$/.test(iso) ? iso : `${iso}Z`);
+}
+
+function readLastVisit() {
+  try {
+    const stored = Number(localStorage.getItem(LAST_VISIT_STORAGE_KEY));
+    return Number.isFinite(stored) && stored > 0 ? stored : null;
+  } catch (e) {
+    console.warn('Cannot read last visit time; NEW badges disabled', e);
+    return null;
+  }
+}
+
+function writeLastVisit(timestamp) {
+  try {
+    localStorage.setItem(LAST_VISIT_STORAGE_KEY, String(timestamp));
+  } catch (e) {
+    console.warn('Cannot persist last visit time', e);
+  }
+}
+
+// Marks cards that arrived since the previous visit. The baseline is only advanced when the page is
+// hidden or left, so a refresh during the same visit keeps the badges.
+function markNewSinceLastVisit(cards) {
+  const lastVisit = readLastVisit();
+  const visitStartedAt = Date.now();
+
+  if (lastVisit !== null) {
+    let newCount = 0;
+    cards.forEach((card) => {
+      const createdAt = parseUtcTimestamp(card.dataset.createdAt);
+      if (Number.isFinite(createdAt) && createdAt > lastVisit) {
+        card.classList.add('is-new');
+        const badge = card.querySelector('.new-badge');
+        if (badge) badge.hidden = false;
+        newCount++;
+      }
+    });
+
+    const counter = document.getElementById('new-since-visit');
+    if (counter && newCount > 0) {
+      counter.textContent = `${newCount} new since your last visit`;
+      counter.hidden = false;
+    }
+  }
+
+  const persist = () => writeLastVisit(visitStartedAt);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') persist();
+  });
+  window.addEventListener('pagehide', persist);
+}
+
 // Hydrate all server-rendered cards
 function hydrate() {
   const cards = document.querySelectorAll('.news-item, .news-card');
   cards.forEach(attachCardListeners);
+  markNewSinceLastVisit(document.querySelectorAll('.news-item'));
 }
 
 if (document.readyState === 'loading') {

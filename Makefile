@@ -1,4 +1,4 @@
-.PHONY: setup init push-secrets worker-init db-init db-migrate db-migrate-local db-migrate-list db-migrate-create vectorize-init dev-worker dev-frontend frontend-build deploy-worker deploy
+.PHONY: test typecheck types setup init push-secrets worker-init db-init db-migrate db-migrate-local db-migrate-list db-migrate-create vectorize-init dev-worker dev-frontend frontend-build deploy-worker deploy
 
 NVM_CMD=. ~/.nvm/nvm.sh && nvm use &&
 
@@ -93,3 +93,14 @@ ingest:
 		curl -s "http://localhost:8787/api/admin/ingest" | jq . || curl -s "https://news.emre.xyz/api/admin/ingest" | jq .; \
 	fi
 
+types:
+	@echo "Regenerating Worker binding types from wrangler.jsonc..."
+	bash -c '$(NVM_CMD) cd worker && npx wrangler types'
+
+typecheck:
+	@echo "Type-checking the Worker..."
+	bash -c '$(NVM_CMD) cd worker && npx tsc --noEmit'
+
+test:
+	@echo "Running Worker unit tests..."
+	bash -c '$(NVM_CMD) cd worker && npx vitest run'

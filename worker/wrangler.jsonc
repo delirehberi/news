@@ -42,7 +42,7 @@
 		"ENABLE_REDDIT": "true",
 		"ENABLE_LOBSTERS": "true",
 		"ENABLE_STACKER": "true",
-		"ENABLE_GMAIL": "false",
+		"ENABLE_GMAIL": "true",
 		"GMAIL_SEARCH_QUERY": "label:newsletter"
 	}
 }

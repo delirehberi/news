@@ -2,9 +2,11 @@ import type { FC } from 'hono/jsx'
 import { Layout } from './Layout'
 import { ArticleCard } from './ArticleCard'
 import { ArticleModel, timeSince } from './helpers'
+import type { DigestGroup } from '../scoring'
 
 interface FeedViewProps {
   articles: ArticleModel[];
+  digestGroups?: DigestGroup<ArticleModel>[];
   sort: string;
   sourceFilter?: string;
   lastCuratedAt?: string | null;
@@ -13,18 +15,22 @@ interface FeedViewProps {
 
 export const FeedView: FC<FeedViewProps> = ({
   articles,
+  digestGroups,
   sort,
   sourceFilter = 'all',
   lastCuratedAt,
   useEmreTheme = true
 }) => {
-  const isHot = sort !== 'latest';
+  const isDigest = sort === 'digest';
+  const isHot = sort !== 'latest' && !isDigest;
+  const activeSort = isDigest ? 'digest' : isHot ? 'hot' : 'latest';
   const sources = [
     { id: 'all', label: 'All Sources' },
     { id: 'hackernews', label: 'HN' },
     { id: 'lobsters', label: 'Lobsters' },
     { id: 'reddit', label: 'Reddit' },
-    { id: 'stackernews', label: 'Stacker' }
+    { id: 'stackernews', label: 'Stacker' },
+    { id: 'newsletter', label: 'Newsletters' }
   ];
 
   return (
@@ -64,10 +70,18 @@ export const FeedView: FC<FeedViewProps> = ({
             <a
               id="tab-latest"
               href={sourceFilter !== 'all' ? `/?sort=latest&source=${sourceFilter}` : '/?sort=latest'}
-              class={`tab-pill ${!isHot ? 'is-active' : ''}`}
+              class={`tab-pill ${activeSort === 'latest' ? 'is-active' : ''}`}
             >
               <span>⏱️</span>
               <span>Latest</span>
+            </a>
+            <a
+              id="tab-digest"
+              href={sourceFilter !== 'all' ? `/?sort=digest&source=${sourceFilter}` : '/?sort=digest'}
+              class={`tab-pill ${isDigest ? 'is-active' : ''}`}
+            >
+              <span>📰</span>
+              <span>Digest</span>
             </a>
           </div>
 
@@ -76,6 +90,7 @@ export const FeedView: FC<FeedViewProps> = ({
               Updated {timeSince(lastCuratedAt)}
             </span>
           )}
+          <span id="new-since-visit" class="news-new-count" hidden></span>
         </div>
 
         {/* Source Filter Pills */}
@@ -85,8 +100,8 @@ export const FeedView: FC<FeedViewProps> = ({
             {sources.map((src) => {
               const isActive = (sourceFilter === src.id) || (sourceFilter === 'all' && src.id === 'all');
               const href = src.id === 'all'
-                ? `/?sort=${isHot ? 'hot' : 'latest'}`
-                : `/?sort=${isHot ? 'hot' : 'latest'}&source=${src.id}`;
+                ? `/?sort=${activeSort}`
+                : `/?sort=${activeSort}&source=${src.id}`;
 
               return (
                 <a
@@ -114,7 +129,23 @@ export const FeedView: FC<FeedViewProps> = ({
 
         {/* Feed container */}
         <div id="feed" class="flex flex-col gap-1.5">
-          {articles.length === 0 ? (
+          {isDigest && digestGroups ? (
+            digestGroups.map((group) => (
+              <section class="digest-day" aria-labelledby={`digest-${group.dayKey}`}>
+                <h2 id={`digest-${group.dayKey}`} class="digest-day-heading">
+                  {group.label}
+                  <span class="digest-day-count">{group.articles.length}</span>
+                </h2>
+                {group.articles.length === 0 ? (
+                  <p class="digest-day-empty">Nothing important was kept for this day.</p>
+                ) : (
+                  group.articles.map((article, idx) => (
+                    <ArticleCard article={article} index={idx} />
+                  ))
+                )}
+              </section>
+            ))
+          ) : articles.length === 0 ? (
             <div class="text-center text-[var(--color-ink-faint)] py-16 border border-[var(--color-border-subtle)] rounded-lg text-sm bg-[var(--color-surface)]">
               No curated articles found for this filter. Check back soon.
             </div>

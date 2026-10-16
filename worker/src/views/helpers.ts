@@ -13,6 +13,9 @@ export interface ArticleModel {
   summary?: string | null;
   follower_likes?: number;
   hot_score?: number;
+  seen_count?: number;
+  last_seen_at?: string | null;
+  expires_at?: string | null;
 }
 
 export function formatTimestamp(isoString?: string | null): string {

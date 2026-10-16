@@ -15,9 +15,10 @@ export const ArticleCard: FC<ArticleCardProps> = ({ article, index, initialOpen 
   const discussLink = getOriginalPostUrl(article.id);
   const domain = getDomain(article.url);
   const isFirst = index === 0;
+  const seenCount = article.seen_count || 1;
 
   return (
-    <article class="news-item" data-id={article.id}>
+    <article class="news-item" data-id={article.id} data-created-at={article.created_at || ''}>
       {/* 1. HackerNews-like Compact Title Row */}
       <div class="news-row">
         {/* Left: Source badge + Title + Domain */}
@@ -38,6 +39,15 @@ export const ArticleCard: FC<ArticleCardProps> = ({ article, index, initialOpen 
                 <span>{sources.length}</span>
               </span>
             )}
+            {seenCount > 1 && (
+              <span
+                class="seen-count-badge"
+                title={`Seen in ${seenCount} separate fetches`}
+              >
+                seen ×{seenCount}
+              </span>
+            )}
+            <span class="new-badge" hidden>NEW</span>
           </div>
 
           {/* Title Link */}
