@@ -806,7 +806,7 @@ app.get('/bootstrap-hn-history', async (c) => {
     return c.text('HN profile is private. Please go to HackerNews Settings and set "showupvoted" to yes, then try again.', 403);
   }
 
-  const items = [];
+  const items: Array<{ id: string | null; url?: string | null; title?: string }> = [];
   const rewriter = new HTMLRewriter().on('.athing', {
     element(el) {
       items.push({ id: el.getAttribute('id') });
@@ -2251,9 +2251,9 @@ async function runDebugPipeline(env: Bindings, targetSource: string = 'all'): Pr
               id: m.id,
               score: m.score,
               type: isDislike ? 'dislike' : (m.metadata?.type === 'like' ? 'like' : 'upvote'),
-              title: m.metadata?.title || m.id,
-              source: m.metadata?.source,
-              url: m.metadata?.url
+              title: typeof m.metadata?.title === 'string' && m.metadata.title ? m.metadata.title : m.id,
+              source: typeof m.metadata?.source === 'string' ? m.metadata.source : undefined,
+              url: typeof m.metadata?.url === 'string' ? m.metadata.url : undefined
             };
             if (isDislike) {
               topNegativeMatches.push(matchDetail);
