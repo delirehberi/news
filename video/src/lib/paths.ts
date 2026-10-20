@@ -114,6 +114,18 @@ export async function writeJsonAtomic(filePath: string, data: unknown): Promise<
 }
 
 /**
+ * Reads a UTF-8 text file from `filePath` with contextual error reporting.
+ */
+export async function readText(filePath: string): Promise<string> {
+  try {
+    return await fs.readFile(filePath, 'utf8');
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(`Failed to read text file at ${filePath}: ${message}`, { cause: err });
+  }
+}
+
+/**
  * Reads and parses a JSON file from `filePath` with contextual error reporting.
  */
 export async function readJson<T>(filePath: string): Promise<T> {

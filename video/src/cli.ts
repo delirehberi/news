@@ -2,9 +2,12 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { validateEnv, type VideoEnv } from './config/env.ts';
+import { assertEditionApproved, runApproveCommand } from './commands/approve.ts';
+import { runScriptCommand } from './commands/script.ts';
 import { runSelectCommand } from './commands/select.ts';
 import { runTranslateCommand } from './commands/translate.ts';
 import { isValidIsoWeek, previousIsoWeek } from './lib/paths.ts';
+import { createWorkerClient, type WorkerClient } from './lib/workerClient.ts';
 
 export const CLI_COMMANDS = [
   'select',
@@ -130,6 +133,29 @@ function unimplementedCommandHandler(command: CliCommand): CommandHandler {
   };
 }
 
+export const PRODUCTION_GATED_COMMANDS = ['voice', 'render', 'upload'] as const;
+export type ProductionGatedCommand = (typeof PRODUCTION_GATED_COMMANDS)[number];
+
+export function isProductionGatedCommand(
+  command: CliCommand
+): command is ProductionGatedCommand {
+  return (PRODUCTION_GATED_COMMANDS as readonly string[]).includes(command);
+}
+
+function gatedProductionCommandHandler(
+  step: ProductionGatedCommand,
+  innerHandler: CommandHandler
+): CommandHandler {
+  return async (ctx) => {
+    const workerClient = createWorkerClient({
+      baseUrl: ctx.env.NEWS_API_BASE_URL,
+      ingestionSecret: ctx.env.INGESTION_SECRET,
+    });
+    await assertEditionApproved(workerClient, ctx.week, step, ctx.signal);
+    await innerHandler(ctx);
+  };
+}
+
 export const defaultCommandHandlers: Record<CliCommand, CommandHandler> = {
   select: async (ctx) => {
     await runSelectCommand(ctx);
@@ -137,11 +163,15 @@ export const defaultCommandHandlers: Record<CliCommand, CommandHandler> = {
   translate: async (ctx) => {
     await runTranslateCommand(ctx);
   },
-  script: unimplementedCommandHandler('script'),
-  approve: unimplementedCommandHandler('approve'),
-  voice: unimplementedCommandHandler('voice'),
-  render: unimplementedCommandHandler('render'),
-  upload: unimplementedCommandHandler('upload'),
+  script: async (ctx) => {
+    await runScriptCommand(ctx);
+  },
+  approve: async (ctx) => {
+    await runApproveCommand(ctx);
+  },
+  voice: gatedProductionCommandHandler('voice', unimplementedCommandHandler('voice')),
+  render: gatedProductionCommandHandler('render', unimplementedCommandHandler('render')),
+  upload: gatedProductionCommandHandler('upload', unimplementedCommandHandler('upload')),
   auth: unimplementedCommandHandler('auth'),
 };
 
@@ -152,6 +182,7 @@ export interface RunCliOptions {
   dotEnvPath?: string;
   now?: Date;
   handlers?: Partial<Record<CliCommand, CommandHandler>>;
+  workerClient?: WorkerClient;
   stdout?: (msg: string) => void;
 }
 
@@ -170,6 +201,15 @@ export async function runCli(options: RunCliOptions): Promise<void> {
   const dotEnvPath =
     options.dotEnvPath ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '.env');
   const env = validateEnv(options.rawEnv ?? process.env, dotEnvPath);
+
+  if (isProductionGatedCommand(parsed.command) && options.workerClient) {
+    await assertEditionApproved(
+      options.workerClient,
+      parsed.week,
+      parsed.command,
+      options.signal
+    );
+  }
 
   const handler =
     options.handlers?.[parsed.command] ?? defaultCommandHandlers[parsed.command];
