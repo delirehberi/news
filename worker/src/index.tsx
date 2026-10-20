@@ -39,6 +39,23 @@ import {
   WeeklyItem,
   WeeklyEditionRow
 } from './weekly'
+import {
+  GMAIL_MAX_LIST_RESULTS,
+  GMAIL_MAX_MESSAGES_PER_RUN,
+  NEWSLETTER_MARKDOWN_MAX_CHARS,
+  NEWSLETTER_DECOMPOSE_MAX_TOKENS,
+  MAX_REDIRECT_RESOLVES_PER_RUN,
+  CURATION_BATCH_SIZE,
+  unwrapTrackingUrl,
+  normalizeUrl,
+  isOpaqueRedirectUrl,
+  resolveRedirectUrl,
+  extractEmailBodies,
+  convertEmailToStructuredMarkdown,
+  buildStoryFallbackUrl,
+  parseDecomposedStories,
+  parseCuratedIds
+} from './newsletter'
 
 
 type Bindings = {
@@ -588,33 +605,6 @@ function buildEmbeddingText(article: { title: string; source?: string; descripti
   return parts.join('\n\n');
 }
 
-function normalizeUrl(rawUrl: string): string {
-  try {
-    const parsed = new URL(rawUrl);
-    const paramsToKeep: [string, string][] = [];
-    const trackingParams = new Set([
-      'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
-      'ref', 'ref_src', 'fbclid', 'gclid', 'twclid', 'igshid', 'mc_cid', 'mc_eid', '_ga'
-    ]);
-    parsed.searchParams.forEach((val, key) => {
-      if (!trackingParams.has(key.toLowerCase()) && !key.toLowerCase().startsWith('utm_')) {
-        paramsToKeep.push([key, val]);
-      }
-    });
-    parsed.search = '';
-    for (const [k, v] of paramsToKeep) {
-      parsed.searchParams.append(k, v);
-    }
-    parsed.hash = '';
-    if (parsed.pathname.length > 1 && parsed.pathname.endsWith('/')) {
-      parsed.pathname = parsed.pathname.slice(0, -1);
-    }
-    return parsed.toString();
-  } catch {
-    return rawUrl ? rawUrl.trim() : '';
-  }
-}
-
 interface MatchEvaluation {
   affinityScore: number;
   topPositiveScore: number;
@@ -730,13 +720,53 @@ async function updateUserTasteProfile(env: Bindings): Promise<void> {
     });
 
     if (aiRes && aiRes.response) {
-      const tasteSummary = aiRes.response.trim();
+      const tasteSummary = typeof aiRes.response === 'string' ? aiRes.response.trim() : JSON.stringify(aiRes.response);
       await env.news_db.prepare(
         "INSERT INTO user_preferences (key, value, updated_at) VALUES ('taste_profile', ?1, datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at"
       ).bind(tasteSummary).run();
     }
   } catch (e) {
     console.error('Error updating user taste profile', e);
+  }
+}
+
+async function resolveOpaqueRedirectsForArticles(
+  articles: Array<{ url: string }>
+): Promise<void> {
+  const redirectCache = new Map<string, string>();
+  const urlsToResolve: string[] = [];
+
+  for (const article of articles) {
+    const unwrapped = unwrapTrackingUrl(article.url);
+    article.url = unwrapped;
+    if (isOpaqueRedirectUrl(unwrapped) && !redirectCache.has(unwrapped)) {
+      redirectCache.set(unwrapped, unwrapped);
+      if (urlsToResolve.length < MAX_REDIRECT_RESOLVES_PER_RUN) {
+        urlsToResolve.push(unwrapped);
+      }
+    }
+  }
+
+  if (urlsToResolve.length > 0) {
+    await Promise.all(
+      urlsToResolve.map(async (rawUrl) => {
+        try {
+          const resolved = await resolveRedirectUrl(rawUrl);
+          if (resolved) {
+            redirectCache.set(rawUrl, resolved);
+          }
+        } catch (err) {
+          console.error('Failed to resolve redirect URL', rawUrl, err);
+        }
+      })
+    );
+
+    for (const article of articles) {
+      const cached = redirectCache.get(article.url);
+      if (cached) {
+        article.url = cached;
+      }
+    }
   }
 }
 
@@ -748,66 +778,49 @@ async function curateArticlesWithLLM(
   const selectedIds = new Set<string>();
   if (candidates.length === 0) return selectedIds;
 
-  const candidatePayload = candidates.map((c, index) => ({
-    id: c.id,
-    index,
-    title: c.title,
-    source: c.source,
-    description: c.details?.description || c.details?.headings || ''
-  }));
-
-  const systemPrompt = `You are an expert news curation editor for a senior software engineer and hacker.
+  const systemPrompt = `You are an expert news curation editor for a senior software engineer, hacker, and well-informed reader.
 Filter the following candidate articles based on the user's taste profile and quality standards.
 
 User Taste Profile:
 ${tasteProfile}
 
 Curation Guidelines:
-- ACCEPT: In-depth engineering postmortems, architecture breakdowns, systems & compiler internals, novel AI agent techniques, open source tools, security/vulnerability research, database systems, rigorous performance analysis.
-- REJECT: Superficial AI hype, listicles ("Top 10 tools"), beginner-level tutorials, corporate marketing/PR announcements, paywalled teasers, crypto/trading spam, generic non-technical lifestyle posts.
+- ACCEPT (Technical & Engineering): In-depth engineering postmortems, architecture breakdowns, systems & compiler internals, novel AI agent techniques, open source tools, security/vulnerability research, database systems, hardware engineering, rigorous performance analysis.
+- ACCEPT (Subscribed Newsletters - source: "newsletter"): In addition to technical stories, ALSO accept high-signal general, Turkish, world, macroeconomic/market, policy, science, and culture/art news stories from subscribed digest newsletters (such as major geopolitical developments, economic/market reports, significant legal or public-interest events in Turkey and globally, and notable scientific or cultural news).
+- REJECT: Superficial hype, generic listicles ("Top 10 tools"), beginner-level tutorials, corporate marketing/PR announcements, sponsored promotions, webinar/event invitations, paywalled teasers, crypto/trading spam, routine administrative notices, and low-value filler.
 
 Return ONLY a valid JSON object with the array of selected article ids.
 Format:
 {"selected_ids": ["id-1", "id-2"]}`;
 
-  try {
-    const aiRes: any = await env.AI.run('@cf/meta/llama-3.3-70b-instruct-fp8-fast', {
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: JSON.stringify(candidatePayload) }
-      ],
-      max_tokens: 1024
-    });
-
-    let text = aiRes.response || '';
-    if (text.startsWith('```json')) {
-      text = text.replace(/^```json\n?/, '').replace(/\n?```$/, '');
-    } else if (text.startsWith('```')) {
-      text = text.replace(/^```\n?/, '').replace(/\n?```$/, '');
-    }
+  for (let offset = 0; offset < candidates.length; offset += CURATION_BATCH_SIZE) {
+    const batch = candidates.slice(offset, offset + CURATION_BATCH_SIZE);
+    const candidatePayload = batch.map((c, index) => ({
+      id: c.id,
+      index,
+      title: c.title,
+      source: c.source,
+      description: c.details?.description || c.details?.headings || ''
+    }));
 
     try {
-      const parsed = JSON.parse(text);
-      if (Array.isArray(parsed.selected_ids)) {
-        for (const id of parsed.selected_ids) {
-          selectedIds.add(id);
-        }
-      } else if (Array.isArray(parsed.selected_indices)) {
-        for (const idx of parsed.selected_indices) {
-          if (candidates[idx]) selectedIds.add(candidates[idx].id);
-        }
+      const aiRes: any = await env.AI.run('@cf/meta/llama-3.3-70b-instruct-fp8-fast', {
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: JSON.stringify(candidatePayload) }
+        ],
+        max_tokens: 1024
+      });
+
+      const batchIds = parseCuratedIds(aiRes?.response, batch);
+      for (const id of batchIds) {
+        selectedIds.add(id);
       }
-    } catch (parseErr) {
-      const regex = /"(hn-[^"]+|lobsters-[^"]+|reddit-[^"]+|newsletter-[^"]+|stacker-[^"]+)"/g;
-      let match;
-      while ((match = regex.exec(text)) !== null) {
-        selectedIds.add(match[1]);
+    } catch (e) {
+      console.error('LLM Curation failed for batch, falling back to batch candidates', e);
+      for (const c of batch) {
+        selectedIds.add(c.id);
       }
-    }
-  } catch (e) {
-    console.error('LLM Curation failed, falling back to all candidates', e);
-    for (const c of candidates) {
-      selectedIds.add(c.id);
     }
   }
 
@@ -1648,6 +1661,11 @@ async function handleIngestion(env: Bindings, targetSource?: string) {
   stats.raw = rawArticles.length;
   if (rawArticles.length === 0) return stats;
 
+  // Unwrap inline tracking URLs and resolve opaque redirect links (e.g. link.apos.to, links.tldrnewsletter.com,
+  // beehiiv, substack) before URL normalization and D1 deduplication so newsletter links matching articles
+  // already fetched from HN, Lobsters, Stacker News, or Reddit are recognized as the same URL.
+  await resolveOpaqueRedirectsForArticles(rawArticles);
+
   // Deduplicate and aggregate rawArticles by normalized URL before slicing
   const urlMap = new Map<string, {
     id: string;
@@ -1755,8 +1773,12 @@ async function handleIngestion(env: Bindings, targetSource?: string) {
   // Cloudflare Workers have a 50 subrequest limit per invocation.
   // If we run ALL sources (no targetSource), API calls use ~20 subrequests, so we cap scraping to 20.
   // If we run a SINGLE source (via cron), API calls use ~5 subrequests, so we can safely scrape up to 40.
-  const limit = targetSource ? 40 : 20;
-  const limitedRawArticles = newRawArticles.slice(0, limit);
+  // Pre-extracted articles (e.g. newsletter items that already carry details.fullText and summary)
+  // do not perform HTTP scrape subrequests, so only cap items that require scrapeArticleDetails().
+  const scrapeLimit = targetSource ? 40 : 20;
+  const preExtractedArticles = newRawArticles.filter(a => a.details && a.details.fullText);
+  const articlesNeedingScrape = newRawArticles.filter(a => !a.details || !a.details.fullText).slice(0, scrapeLimit);
+  const limitedRawArticles = [...articlesNeedingScrape, ...preExtractedArticles];
   if (limitedRawArticles.length === 0) {
     await cleanupExpiredArticles(env, stats);
     return stats;
@@ -2113,94 +2135,6 @@ async function fetchRedditPosts(env: Bindings) {
   return articles;
 }
 
-function decodeBase64Utf8(base64: string) {
-  const binaryString = atob(base64.replace(/-/g, '+').replace(/_/g, '/'));
-  const bytes = new Uint8Array(binaryString.length);
-  for (let i = 0; i < binaryString.length; i++) {
-    bytes[i] = binaryString.charCodeAt(i);
-  }
-  return new TextDecoder().decode(bytes);
-}
-
-function decodeEmailEntities(text: string): string {
-  return text
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;|&apos;/g, "'")
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&bull;/g, '•')
-    .replace(/&mdash;/g, '—')
-    .replace(/&ndash;/g, '–')
-    .replace(/&hellip;/g, '...')
-    .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(Number(code)))
-    .replace(/&#x([0-9a-fA-F]+);/g, (_, code) => String.fromCharCode(parseInt(code, 16)))
-    .trim();
-}
-
-function convertEmailToStructuredMarkdown(htmlContent: string, plainTextContent?: string): { markdown: string, issueWebUrl: string | null } {
-  let issueWebUrl: string | null = null;
-
-  // Try to find the web version link from HTML
-  const webLinkMatch = htmlContent.match(/<a[^>]+href=["']([^"']+)["'][^>]*>(?:[\s\S]*?(?:Tarayıcıda oku|Web Version|View in browser|View online|Read in browser|View this issue|Web version)[\s\S]*?)<\/a>/i)
-    || htmlContent.match(/<a[^>]+href=["']([^"']+)["'][^>]*>\s*(?:WEB VERSION|Tarayıcıda oku|View in browser)\s*<\/a>/i);
-
-  if (webLinkMatch && webLinkMatch[1]) {
-    issueWebUrl = decodeEmailEntities(webLinkMatch[1].trim());
-  }
-
-  // 1. Remove comments, styles, scripts, SVGs, head
-  let text = htmlContent
-    .replace(/<!--[\s\S]*?-->/g, '')
-    .replace(/<style[\s\S]*?<\/style>/gi, '')
-    .replace(/<script[\s\S]*?<\/script>/gi, '')
-    .replace(/<head[\s\S]*?<\/head>/gi, '')
-    .replace(/<svg[\s\S]*?<\/svg>/gi, '');
-
-  // 2. Headings
-  text = text.replace(/<h[1-6][^>]*>([\s\S]*?)<\/h[1-6]>/gi, '\n\n## $1\n\n');
-
-  // 3. Lists and paragraphs
-  text = text.replace(/<li[^>]*>([\s\S]*?)<\/li>/gi, '\n• $1\n');
-  text = text.replace(/<p[^>]*>([\s\S]*?)<\/p>/gi, '\n\n$1\n\n');
-  text = text.replace(/<tr[^>]*>([\s\S]*?)<\/tr>/gi, '\n$1\n');
-  text = text.replace(/<br\s*\/?>/gi, '\n');
-
-  // 4. Links: convert <a href="url">link text</a> -> [link text](url)
-  text = text.replace(/<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi, (match, href, linkBody) => {
-    const cleanLinkText = linkBody.replace(/<[^>]+>/g, '').trim();
-    if (!cleanLinkText || href.startsWith('mailto:') || href.startsWith('javascript:')) {
-      return cleanLinkText;
-    }
-    return `[${cleanLinkText}](${href})`;
-  });
-
-  // 5. Bold and emphasis
-  text = text.replace(/<(?:strong|b)[^>]*>([\s\S]*?)<\/(?:strong|b)>/gi, '**$1**');
-  text = text.replace(/<(?:em|i)[^>]*>([\s\S]*?)<\/(?:em|i)>/gi, '*$1*');
-
-  // 6. Strip remaining HTML tags
-  text = text.replace(/<[^>]+>/g, ' ');
-
-  // 7. Decode HTML entities
-  text = decodeEmailEntities(text);
-
-  // 8. Clean up whitespace
-  text = text
-    .split('\n')
-    .map(line => line.replace(/[ \t]+/g, ' ').trim())
-    .filter((line, idx, arr) => line.length > 0 || (idx > 0 && arr[idx - 1].length > 0))
-    .join('\n');
-
-  // Fallback to plain text if HTML was empty or too small
-  if (text.length < 50 && plainTextContent && plainTextContent.length > 50) {
-    text = plainTextContent;
-  }
-
-  return { markdown: text, issueWebUrl };
-}
-
 async function fetchGmailNewsletters(env: Bindings): Promise<{
   id: string;
   title: string;
@@ -2237,9 +2171,11 @@ async function fetchGmailNewsletters(env: Bindings): Promise<{
   const tokenData: any = await tokenRes.json();
   const accessToken = tokenData.access_token;
 
-  // 2. Search for messages
+  // 2. Search for inbox newsletter messages across the 7-day window.
+  // List up to GMAIL_MAX_LIST_RESULTS (50) first, then filter out processed_emails in D1 so
+  // unprocessed newsletters are never hidden behind the newest 5 already-processed emails.
   const query = encodeURIComponent((env.GMAIL_SEARCH_QUERY || "label:newsletter") + " newer_than:7d");
-  const searchRes = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${query}&maxResults=5`, {
+  const searchRes = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${query}&maxResults=${GMAIL_MAX_LIST_RESULTS}`, {
     headers: { "Authorization": `Bearer ${accessToken}` }
   });
   if (!searchRes.ok) {
@@ -2249,21 +2185,27 @@ async function fetchGmailNewsletters(env: Bindings): Promise<{
   const searchData: any = await searchRes.json();
   const listedMessages: Array<{ id: string }> = searchData.messages || [];
 
-  // The search window spans days, so the same emails are listed every cycle. Skip already-decomposed
-  // messages: re-running the LLM is wasteful and its varying titles would create duplicate articles.
   let messages = listedMessages;
   if (listedMessages.length > 0) {
     try {
-      const placeholders = listedMessages.map(() => '?').join(',');
-      const processed = await env.news_db.prepare(
-        `SELECT message_id FROM processed_emails WHERE message_id IN (${placeholders})`
-      ).bind(...listedMessages.map(m => m.id)).all<{ message_id: string }>();
-      const processedIds = new Set((processed.results || []).map(r => r.message_id));
+      const processedIds = new Set<string>();
+      for (let i = 0; i < listedMessages.length; i += D1_MAX_BOUND_PARAMS) {
+        const chunk = listedMessages.slice(i, i + D1_MAX_BOUND_PARAMS);
+        const placeholders = chunk.map(() => '?').join(',');
+        const processed = await env.news_db.prepare(
+          `SELECT message_id FROM processed_emails WHERE message_id IN (${placeholders})`
+        ).bind(...chunk.map(m => m.id)).all<{ message_id: string }>();
+        for (const row of processed.results || []) {
+          processedIds.add(row.message_id);
+        }
+      }
       messages = listedMessages.filter(m => !processedIds.has(m.id));
     } catch (e) {
-      console.error('Failed to load processed email ids; processing all listed messages', e);
+      console.error('Failed to load processed email ids; processing listed messages', e);
     }
   }
+
+  messages = messages.slice(0, GMAIL_MAX_MESSAGES_PER_RUN);
 
   for (const msg of messages) {
     const msgRes = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=full`, {
@@ -2280,52 +2222,36 @@ async function fetchGmailNewsletters(env: Bindings): Promise<{
       if (h.name?.toLowerCase() === 'subject') emailSubject = h.value;
       if (h.name?.toLowerCase() === 'from') emailFrom = h.value;
     }
-    
-    // Extract HTML and Plain text parts
-    let rawHtml = "";
-    let rawPlain = "";
-    
-    function extractParts(part: any) {
-      if (part.mimeType === "text/html" && part.body && part.body.data) {
-        rawHtml = decodeBase64Utf8(part.body.data);
-      } else if (part.mimeType === "text/plain" && part.body && part.body.data) {
-        rawPlain = decodeBase64Utf8(part.body.data);
-      }
-      if (part.parts) {
-        for (const subPart of part.parts) {
-          extractParts(subPart);
-        }
-      }
-    }
 
-    if (msgData.payload) {
-      extractParts(msgData.payload);
-    }
-
+    const { html: rawHtml, plain: rawPlain } = extractEmailBodies(msgData.payload);
     if (!rawHtml && !rawPlain) continue;
 
-    // Convert into clean structured markdown
+    // Convert into clean structured markdown (strips preheader invisible spacers & unwraps inline tracking links)
     const { markdown, issueWebUrl } = convertEmailToStructuredMarkdown(rawHtml, rawPlain);
     if (!markdown || markdown.trim().length < 50) continue;
 
-    // Slice structured text to fit comfortably in LLM context
-    const textToAnalyze = markdown.substring(0, 14000);
-    const fallbackIssueUrl = issueWebUrl || `https://news.emre.xyz/newsletter/${msg.id}`;
+    let resolvedIssueWebUrl = issueWebUrl;
+    if (resolvedIssueWebUrl && isOpaqueRedirectUrl(resolvedIssueWebUrl)) {
+      resolvedIssueWebUrl = await resolveRedirectUrl(resolvedIssueWebUrl);
+    }
+
+    const textToAnalyze = markdown.substring(0, NEWSLETTER_MARKDOWN_MAX_CHARS);
+    const fallbackIssueUrl = resolvedIssueWebUrl || `https://news.emre.xyz/newsletter/${msg.id}`;
 
     // 3. Decompose multi-topic newsletter using AI
     try {
       const systemPrompt = `You are an expert news and technical digest curator.
-Your task is to analyze the provided markdown content of an email newsletter ("${emailSubject}" from ${emailFrom}) and extract ALL discrete news stories, articles, tool releases, and technical developments into a structured JSON array.
+Your task is to analyze the provided markdown content of an email newsletter ("${emailSubject}" from ${emailFrom}) and extract ALL discrete news stories, articles, tool releases, and developments into a structured JSON array.
 
 Extraction Rules:
-1. Extract every distinct story or tool mentioned in the newsletter.
+1. Extract every distinct story, news item, or tool mentioned in the newsletter.
 2. For each item provide:
-   - "title": A clear, meaningful headline (e.g., "mastodon-post: Web Component to display Mastodon posts", "OpenAI introduces ChatGPT Workspace & Pages", "T24 internet sitesine erişim engeli getirildi").
-   - "summary": A complete, concise 1-3 sentence summary capturing the key facts/context from the text.
+   - "title": A clear, meaningful headline in the original language of the newsletter (e.g., "mastodon-post: Web Component to display Mastodon posts", "OpenAI introduces ChatGPT Workspace & Pages", "T24 internet sitesine erişim engeli getirildi").
+   - "summary": A complete, concise 1-3 sentence summary in the original language capturing the key facts/context from the text.
    - "category": The section/topic heading (e.g., "Technology", "CSS & HTML Tools", "Markets & Economy", "World News").
-   - "url": The direct external link associated with this specific item if present. If no specific external link is present for this story, use "${fallbackIssueUrl}".
-   - "is_sponsored": true IF this item is an advertisement, sponsored promotion, classified ad, affiliate pitch, or partner placement (e.g. "SPONSORED", "AD", "Bugünkü Destekçimiz", "Advertisement", "Commercial Apps & Classifieds"). Otherwise false.
-3. Exclude newsletter housekeeping (e.g. "Tarayıcıda oku", "Web Version", greetings, unsubscribe links, feedback requests, social media follow buttons, daily music playlist).
+   - "url": The direct external link associated with this specific item if present in the text. If no specific external link is present for this story, set "url" to "".
+   - "is_sponsored": true IF this item is an advertisement, sponsored promotion, classified ad, affiliate pitch, or partner placement (e.g. "SPONSORED", "AD", "Bugünkü Destekçimiz", "ile birlikte", "Advertisement", "Commercial Apps & Classifieds"). Otherwise false.
+3. Exclude newsletter housekeeping (e.g. "Tarayıcıda oku", "Web Version", greetings, table-of-contents bullet teasers that are repeated in full below, unsubscribe links, feedback requests, social media follow buttons, daily music playlist).
 
 Return ONLY a valid JSON array of objects. Do not include markdown code block formatting or extra commentary.
 Format:
@@ -2344,69 +2270,49 @@ Format:
           { role: 'system', content: systemPrompt },
           { role: 'user', content: textToAnalyze }
         ],
-        max_tokens: 2500
+        max_tokens: NEWSLETTER_DECOMPOSE_MAX_TOKENS
       });
 
-      let responseText = aiResponse.response || '';
-      if (responseText.startsWith('```json')) {
-        responseText = responseText.replace(/^```json\n?/, '').replace(/\n?```$/, '');
-      } else if (responseText.startsWith('```')) {
-        responseText = responseText.replace(/^```\n?/, '').replace(/\n?```$/, '');
-      }
+      const extractedStories = parseDecomposedStories(aiResponse?.response);
 
-      let extractedStories: any[] = [];
-      try {
-        extractedStories = JSON.parse(responseText.trim());
-      } catch (parseErr) {
-        // Fallback regex parser for story objects
-        const storyRegex = /{\s*"title"\s*:\s*"([^"]+)"[\s\S]*?"summary"\s*:\s*"([^"]+)"[\s\S]*?"url"\s*:\s*"([^"]+)"(?:[\s\S]*?"is_sponsored"\s*:\s*(true|false))?[\s\S]*?}/g;
-        let m;
-        while ((m = storyRegex.exec(responseText)) !== null) {
-          if (m[4] !== 'true') {
-            extractedStories.push({
-              title: m[1],
-              summary: m[2],
-              url: m[3],
-              is_sponsored: false
-            });
+      for (let idx = 0; idx < extractedStories.length; idx++) {
+        const story = extractedStories[idx];
+        if (story.is_sponsored) continue;
+        const title = (story.title || '').trim();
+        const summary = (story.summary || '').trim();
+        if (!title || title.length < 3 || !summary || summary.length < 10) continue;
+
+        const rawStoryUrl = unwrapTrackingUrl((story.url || '').trim());
+        const isFallbackOrMissing =
+          !rawStoryUrl.startsWith('http') ||
+          rawStoryUrl === fallbackIssueUrl ||
+          (issueWebUrl !== null && rawStoryUrl === issueWebUrl) ||
+          (resolvedIssueWebUrl !== null && rawStoryUrl === resolvedIssueWebUrl);
+
+        const targetUrl = isFallbackOrMissing
+          ? buildStoryFallbackUrl(fallbackIssueUrl, title, idx)
+          : rawStoryUrl;
+
+        const hashBuffer = await crypto.subtle.digest('SHA-1', new TextEncoder().encode(targetUrl + title));
+        const hashHex = Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('').substring(0, 16);
+
+        articles.push({
+          id: `newsletter-${msg.id}-${hashHex}`,
+          title,
+          url: targetUrl,
+          source: 'newsletter',
+          summary,
+          details: {
+            description: summary,
+            headings: title,
+            content: summary,
+            fullText: `${title}${story.category ? ` (${story.category})` : ''}. ${summary}`
           }
-        }
-      }
-
-      if (Array.isArray(extractedStories)) {
-        for (const story of extractedStories) {
-          if (story.is_sponsored) continue;
-          const title = (story.title || '').trim();
-          const summary = (story.summary || '').trim();
-          if (!title || title.length < 3 || !summary || summary.length < 10) continue;
-
-          let targetUrl = (story.url || '').trim();
-          if (!targetUrl.startsWith('http')) {
-            const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').substring(0, 30);
-            targetUrl = `${fallbackIssueUrl}#${slug}`;
-          }
-
-          const hashBuffer = await crypto.subtle.digest('SHA-1', new TextEncoder().encode(targetUrl + title));
-          const hashHex = Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('').substring(0, 16);
-
-          articles.push({
-            id: `newsletter-${msg.id}-${hashHex}`,
-            title,
-            url: targetUrl,
-            source: 'newsletter',
-            summary,
-            details: {
-              description: summary,
-              headings: title,
-              content: summary,
-              fullText: `${title}${story.category ? ` (${story.category})` : ''}. ${summary}`
-            }
-          });
-        }
+        });
       }
 
       // Marked only after a successful decomposition so failed or unparseable responses are retried next cycle.
-      if (Array.isArray(extractedStories) && extractedStories.length > 0) {
+      if (extractedStories.length > 0) {
         try {
           await env.news_db.prepare(
             'INSERT INTO processed_emails (message_id) VALUES (?1) ON CONFLICT(message_id) DO NOTHING'
@@ -2580,6 +2486,8 @@ async function runDebugPipeline(env: Bindings, targetSource: string = 'all'): Pr
   }
 
   const totalRaw = rawArticles.length;
+
+  await resolveOpaqueRedirectsForArticles(rawArticles);
 
   // Deduplicate and aggregate rawArticles by normalized URL
   const urlMap = new Map<string, {
