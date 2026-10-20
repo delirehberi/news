@@ -79,6 +79,14 @@ export const AiEnvSchema = VideoEnvSchema.extend({
 
 export type AiEnv = z.infer<typeof AiEnvSchema>;
 
+export const ElevenLabsEnvSchema = VideoEnvSchema.extend({
+  ELEVENLABS_API_KEY: NonEmptyString,
+  ELEVENLABS_VOICE_ID: NonEmptyString,
+  ELEVENLABS_MODEL_ID: NonEmptyString,
+});
+
+export type ElevenLabsEnv = z.infer<typeof ElevenLabsEnvSchema>;
+
 export const FullVideoEnvSchema = VideoEnvSchema.extend({
   AI_GATEWAY_BASE_URL: UrlString,
   AI_GATEWAY_API_KEY: NonEmptyString,
@@ -187,6 +195,20 @@ export function requireAiEnv(env: VideoEnv): AiEnv {
   if (!parsed.success) {
     throw new Error(
       `Missing or invalid AI Gateway environment configuration:\n${formatZodIssues(parsed.error.issues)}`
+    );
+  }
+  return parsed.data;
+}
+
+/**
+ * Validates that the ElevenLabs environment variables (`ELEVENLABS_API_KEY`,
+ * `ELEVENLABS_VOICE_ID`, `ELEVENLABS_MODEL_ID`) are present on a validated `VideoEnv`.
+ */
+export function requireElevenLabsEnv(env: VideoEnv): ElevenLabsEnv {
+  const parsed = ElevenLabsEnvSchema.safeParse(env);
+  if (!parsed.success) {
+    throw new Error(
+      `Missing or invalid ElevenLabs environment configuration:\n${formatZodIssues(parsed.error.issues)}`
     );
   }
   return parsed.data;

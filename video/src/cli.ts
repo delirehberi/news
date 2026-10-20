@@ -6,6 +6,7 @@ import { assertEditionApproved, runApproveCommand } from './commands/approve.ts'
 import { runScriptCommand } from './commands/script.ts';
 import { runSelectCommand } from './commands/select.ts';
 import { runTranslateCommand } from './commands/translate.ts';
+import { runVoiceCommand } from './commands/voice.ts';
 import { isValidIsoWeek, previousIsoWeek } from './lib/paths.ts';
 import { createWorkerClient, type WorkerClient } from './lib/workerClient.ts';
 
@@ -24,6 +25,7 @@ export type CliCommand = (typeof CLI_COMMANDS)[number];
 
 export interface ParsedCliArgs {
   help: boolean;
+  mock?: boolean;
   command?: CliCommand;
   week: string;
 }
@@ -32,6 +34,7 @@ export interface CommandContext {
   week: string;
   env: VideoEnv;
   signal: AbortSignal;
+  mock?: boolean;
 }
 
 export type CommandHandler = (ctx: CommandContext) => Promise<void>;
@@ -56,12 +59,13 @@ export function formatHelpText(): string {
     '',
     'Options:',
     '  --week <YYYY-Www>  Target ISO week (defaults to previous ISO week in UTC)',
+    '  --mock             Use deterministic mock synthesis in voice command',
     '  -h, --help         Show this help message',
   ].join('\n');
 }
 
 /**
- * Parses CLI arguments (`<command>`, `--week <YYYY-Www>`, `--help` / `-h`).
+ * Parses CLI arguments (`<command>`, `--week <YYYY-Www>`, `--mock`, `--help` / `-h`).
  * Defaults `week` to `previousIsoWeek(now)`.
  */
 export function parseCliArgs(
@@ -69,6 +73,7 @@ export function parseCliArgs(
   now: Date = new Date()
 ): ParsedCliArgs {
   let help = false;
+  let mock = false;
   let command: CliCommand | undefined;
   let week: string | undefined;
 
@@ -76,6 +81,11 @@ export function parseCliArgs(
     const arg = argv[i];
     if (arg === '--help' || arg === '-h') {
       help = true;
+      continue;
+    }
+
+    if (arg === '--mock') {
+      mock = true;
       continue;
     }
 
@@ -120,6 +130,7 @@ export function parseCliArgs(
 
   return {
     help,
+    ...(mock ? { mock: true } : {}),
     command,
     week: resolvedWeek,
   };
@@ -169,7 +180,9 @@ export const defaultCommandHandlers: Record<CliCommand, CommandHandler> = {
   approve: async (ctx) => {
     await runApproveCommand(ctx);
   },
-  voice: gatedProductionCommandHandler('voice', unimplementedCommandHandler('voice')),
+  voice: async (ctx) => {
+    await runVoiceCommand(ctx);
+  },
   render: gatedProductionCommandHandler('render', unimplementedCommandHandler('render')),
   upload: gatedProductionCommandHandler('upload', unimplementedCommandHandler('upload')),
   auth: unimplementedCommandHandler('auth'),
@@ -218,6 +231,7 @@ export async function runCli(options: RunCliOptions): Promise<void> {
     week: parsed.week,
     env,
     signal: options.signal,
+    ...(parsed.mock ? { mock: true } : {}),
   });
 }
 

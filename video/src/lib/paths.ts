@@ -106,6 +106,48 @@ export async function writeTextAtomic(filePath: string, content: string): Promis
 }
 
 /**
+ * Atomically writes binary bytes to `filePath` by writing to a sibling temporary file
+ * and renaming it into place. Creates parent directories if needed.
+ */
+export async function writeBytesAtomic(
+  filePath: string,
+  data: Uint8Array
+): Promise<void> {
+  const dir = path.dirname(filePath);
+  await fs.mkdir(dir, { recursive: true });
+
+  const suffix = crypto.randomBytes(6).toString('hex');
+  const tempPath = path.join(dir, `.${path.basename(filePath)}.${process.pid}.${suffix}.tmp`);
+
+  try {
+    await fs.writeFile(tempPath, data);
+    await fs.rename(tempPath, filePath);
+  } catch (err) {
+    try {
+      await fs.unlink(tempPath);
+    } catch {
+      // Ignore cleanup failure if temp file was never created
+    }
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(`Failed to atomically write binary file ${filePath}: ${message}`, {
+      cause: err,
+    });
+  }
+}
+
+/**
+ * Checks whether a regular file exists at `filePath`.
+ */
+export async function fileExists(filePath: string): Promise<boolean> {
+  try {
+    const stat = await fs.stat(filePath);
+    return stat.isFile();
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Atomically serializes `data` as pretty-printed JSON (with trailing newline) to `filePath`.
  */
 export async function writeJsonAtomic(filePath: string, data: unknown): Promise<void> {
