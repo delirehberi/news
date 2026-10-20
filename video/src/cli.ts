@@ -3,6 +3,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { validateEnv, type VideoEnv } from './config/env.ts';
 import { assertEditionApproved, runApproveCommand } from './commands/approve.ts';
+import { runRenderCommand } from './commands/render.ts';
 import { runScriptCommand } from './commands/script.ts';
 import { runSelectCommand } from './commands/select.ts';
 import { runTranslateCommand } from './commands/translate.ts';
@@ -183,7 +184,9 @@ export const defaultCommandHandlers: Record<CliCommand, CommandHandler> = {
   voice: async (ctx) => {
     await runVoiceCommand(ctx);
   },
-  render: gatedProductionCommandHandler('render', unimplementedCommandHandler('render')),
+  render: async (ctx) => {
+    await runRenderCommand(ctx);
+  },
   upload: gatedProductionCommandHandler('upload', unimplementedCommandHandler('upload')),
   auth: unimplementedCommandHandler('auth'),
 };
