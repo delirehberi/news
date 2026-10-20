@@ -71,6 +71,14 @@ export const VideoEnvSchema = z.object({
 
 export type VideoEnv = z.infer<typeof VideoEnvSchema>;
 
+export const AiEnvSchema = VideoEnvSchema.extend({
+  AI_GATEWAY_BASE_URL: UrlString,
+  AI_GATEWAY_API_KEY: NonEmptyString,
+  AI_MODEL: NonEmptyString,
+});
+
+export type AiEnv = z.infer<typeof AiEnvSchema>;
+
 export const FullVideoEnvSchema = VideoEnvSchema.extend({
   AI_GATEWAY_BASE_URL: UrlString,
   AI_GATEWAY_API_KEY: NonEmptyString,
@@ -165,6 +173,20 @@ export function validateEnv(
   if (!parsed.success) {
     throw new Error(
       `Invalid environment configuration:\n${formatZodIssues(parsed.error.issues)}`
+    );
+  }
+  return parsed.data;
+}
+
+/**
+ * Validates that the AI Gateway environment variables (`AI_GATEWAY_BASE_URL`,
+ * `AI_GATEWAY_API_KEY`, `AI_MODEL`) are present on a validated `VideoEnv`.
+ */
+export function requireAiEnv(env: VideoEnv): AiEnv {
+  const parsed = AiEnvSchema.safeParse(env);
+  if (!parsed.success) {
+    throw new Error(
+      `Missing or invalid AI Gateway environment configuration:\n${formatZodIssues(parsed.error.issues)}`
     );
   }
   return parsed.data;

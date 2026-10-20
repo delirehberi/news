@@ -3,6 +3,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { validateEnv, type VideoEnv } from './config/env.ts';
 import { runSelectCommand } from './commands/select.ts';
+import { runTranslateCommand } from './commands/translate.ts';
 import { isValidIsoWeek, previousIsoWeek } from './lib/paths.ts';
 
 export const CLI_COMMANDS = [
@@ -133,7 +134,9 @@ export const defaultCommandHandlers: Record<CliCommand, CommandHandler> = {
   select: async (ctx) => {
     await runSelectCommand(ctx);
   },
-  translate: unimplementedCommandHandler('translate'),
+  translate: async (ctx) => {
+    await runTranslateCommand(ctx);
+  },
   script: unimplementedCommandHandler('script'),
   approve: unimplementedCommandHandler('approve'),
   voice: unimplementedCommandHandler('voice'),
