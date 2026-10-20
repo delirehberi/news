@@ -18,6 +18,9 @@ describe('isValidIsoWeek', () => {
     expect(isValidIsoWeek('2026-42')).toBe(false);
     expect(isValidIsoWeek('2026-w42')).toBe(false);
     expect(isValidIsoWeek('2026-W4')).toBe(false);
+    expect(isValidIsoWeek('2026-W00')).toBe(false);
+    expect(isValidIsoWeek('2026-W54')).toBe(false);
+    expect(isValidIsoWeek('2026-W99')).toBe(false);
     expect(isValidIsoWeek('2026-W123')).toBe(false);
     expect(isValidIsoWeek('2026/W42')).toBe(false);
     expect(isValidIsoWeek('')).toBe(false);
@@ -169,6 +172,39 @@ describe('isValidWeeklyEditionPayload', () => {
             image_url: 123, // invalid image_url type
           },
         ],
+      })
+    ).toBe(false);
+
+    expect(
+      isValidWeeklyEditionPayload({
+        items: [
+          {
+            url: 'javascript:alert(1)',
+            title_tr: 'Test',
+            summary_tr: 'Test',
+            source: 'HN',
+          },
+        ],
+      })
+    ).toBe(false);
+
+    expect(
+      isValidWeeklyEditionPayload({
+        items: [
+          {
+            url: 'https://test.com',
+            title_tr: 'Test',
+            summary_tr: 'Test',
+            source: 'HN',
+            image_url: 'javascript:alert(1)',
+          },
+        ],
+      })
+    ).toBe(false);
+
+    expect(
+      isValidWeeklyEditionPayload({
+        youtube_video_id: 'bad/id? onload=alert(1)',
       })
     ).toBe(false);
   });
@@ -809,8 +845,56 @@ describe('Public Turkish Weekly SSR Pages', () => {
       const html = await res.text();
       expect(html).toContain('Bülten Bulunamadı');
     });
+
+    it('returns 404 for out-of-range week numbers like W00 and W54', async () => {
+      const resW00 = await app.request('https://news.emre.xyz/weekly/2026-W00', {}, env);
+      expect(resW00.status).toBe(404);
+
+      const resW54 = await app.request('https://news.emre.xyz/weekly/2026-W54', {}, env);
+      expect(resW54.status).toBe(404);
+    });
+  });
+
+  describe('Security Audit: Admin & Bootstrap Route Guards', () => {
+    const guardedRoutes: Array<{ method: string; path: string }> = [
+      { method: 'GET', path: '/api/debug' },
+      { method: 'GET', path: '/api/admin/ingest' },
+      { method: 'POST', path: '/api/admin/ingest' },
+      { method: 'GET', path: '/test-ingestion' },
+      { method: 'POST', path: '/test-ingestion' },
+      { method: 'GET', path: '/api/admin/weekly/2026-W42/candidates' },
+      { method: 'GET', path: '/api/admin/weekly/2026-W42' },
+      { method: 'PUT', path: '/api/admin/weekly/2026-W42' },
+      { method: 'POST', path: '/api/admin/weekly/snapshot' },
+      { method: 'GET', path: '/bootstrap-reddit-history' },
+      { method: 'GET', path: '/bootstrap-lobsters-history?token=abc' },
+      { method: 'GET', path: '/bootstrap-hn-history?id=testuser' },
+      { method: 'POST', path: '/bootstrap-hn-json' },
+    ];
+
+    it('guards every admin and bootstrap route with 401 when unauthenticated', async () => {
+      for (const route of guardedRoutes) {
+        const res = await app.request(
+          `https://news.emre.xyz${route.path}`,
+          {
+            method: route.method,
+            headers:
+              route.method === 'POST' || route.method === 'PUT'
+                ? { 'Content-Type': 'application/json' }
+                : undefined,
+            body:
+              route.method === 'POST' || route.method === 'PUT'
+                ? JSON.stringify({})
+                : undefined,
+          },
+          { ...env, INGESTION_SECRET: 'test-secret' }
+        );
+        expect(res.status, `Expected 401 for ${route.method} ${route.path}`).toBe(401);
+      }
+    });
   });
 });
+
 
 
 

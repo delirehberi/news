@@ -13,7 +13,7 @@ import {
   type VideoTimeline,
   type WeeklyVideoProps,
 } from '../domain/timeline.ts';
-import { fileExists, getWeekPaths, readJson } from '../lib/paths.ts';
+import { fileExists, getWeekPaths, isValidIsoWeek, readJson } from '../lib/paths.ts';
 import {
   createWorkerClient,
   type WeeklyEdition,
@@ -52,7 +52,7 @@ const StoredAudioSegmentSchema = z.object({
 type StoredAudioSegment = z.infer<typeof StoredAudioSegmentSchema>;
 
 const StoredTranslationSchema = z.object({
-  week: z.string().min(1),
+  week: z.string().refine(isValidIsoWeek, 'Invalid ISO week format'),
   title_tr: z.string().min(1),
   intro_tr: z.string().min(1),
   items: z

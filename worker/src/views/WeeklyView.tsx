@@ -101,7 +101,7 @@ export const WeeklyView: FC<WeeklyViewProps> = ({
               <div class="relative w-full aspect-video">
                 <iframe
                   class="absolute inset-0 w-full h-full"
-                  src={`https://www.youtube-nocookie.com/embed/${edition.youtube_video_id}`}
+                  src={`https://www.youtube-nocookie.com/embed/${encodeURIComponent(edition.youtube_video_id)}`}
                   title={`${edition.title_tr || 'Haftalık Video Özeti'} - YouTube`}
                   allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
                   allowfullscreen

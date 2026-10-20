@@ -829,6 +829,9 @@ Format:
 
 
 app.get('/bootstrap-reddit-history', async (c) => {
+  if (!(await isAuthorizedAdmin(c))) {
+    return c.json({ error: 'Unauthorized', message: 'Admin authentication required.' }, 401);
+  }
   const env = c.env;
   if (!env.REDDIT_CLIENT_ID || !env.REDDIT_CLIENT_SECRET || !env.REDDIT_REFRESH_TOKEN) {
     return c.text('Missing Reddit credentials', 500);
@@ -900,6 +903,9 @@ app.get('/bootstrap-reddit-history', async (c) => {
 });
 
 app.get('/bootstrap-lobsters-history', async (c) => {
+  if (!(await isAuthorizedAdmin(c))) {
+    return c.json({ error: 'Unauthorized', message: 'Admin authentication required.' }, 401);
+  }
   const env = c.env;
   const token = c.req.query('token');
   if (!token) return c.text('Please provide ?token=...', 400);
@@ -944,6 +950,9 @@ app.get('/bootstrap-lobsters-history', async (c) => {
 });
 
 app.get('/bootstrap-hn-history', async (c) => {
+  if (!(await isAuthorizedAdmin(c))) {
+    return c.json({ error: 'Unauthorized', message: 'Admin authentication required.' }, 401);
+  }
   const env = c.env;
   const username = c.req.query('id');
   if (!username) return c.text('Please provide ?id=YOUR_HN_USERNAME', 400);
@@ -1016,6 +1025,9 @@ app.get('/bootstrap-hn-history', async (c) => {
 });
 
 app.post('/bootstrap-hn-json', async (c) => {
+  if (!(await isAuthorizedAdmin(c))) {
+    return c.json({ error: 'Unauthorized', message: 'Admin authentication required.' }, 401);
+  }
   const env = c.env;
   const items = await c.req.json();
   
