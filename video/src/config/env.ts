@@ -87,6 +87,22 @@ export const ElevenLabsEnvSchema = VideoEnvSchema.extend({
 
 export type ElevenLabsEnv = z.infer<typeof ElevenLabsEnvSchema>;
 
+export const YouTubeAuthEnvSchema = VideoEnvSchema.extend({
+  YOUTUBE_CLIENT_ID: NonEmptyString,
+  YOUTUBE_CLIENT_SECRET: NonEmptyString,
+});
+
+export type YouTubeAuthEnv = z.infer<typeof YouTubeAuthEnvSchema>;
+
+export const YouTubeUploadEnvSchema = VideoEnvSchema.extend({
+  YOUTUBE_CLIENT_ID: NonEmptyString,
+  YOUTUBE_CLIENT_SECRET: NonEmptyString,
+  YOUTUBE_REFRESH_TOKEN: NonEmptyString,
+  YOUTUBE_PRIVACY: YouTubePrivacySchema,
+});
+
+export type YouTubeUploadEnv = z.infer<typeof YouTubeUploadEnvSchema>;
+
 export const FullVideoEnvSchema = VideoEnvSchema.extend({
   AI_GATEWAY_BASE_URL: UrlString,
   AI_GATEWAY_API_KEY: NonEmptyString,
@@ -209,6 +225,35 @@ export function requireElevenLabsEnv(env: VideoEnv): ElevenLabsEnv {
   if (!parsed.success) {
     throw new Error(
       `Missing or invalid ElevenLabs environment configuration:\n${formatZodIssues(parsed.error.issues)}`
+    );
+  }
+  return parsed.data;
+}
+
+/**
+ * Validates that the YouTube OAuth client credentials (`YOUTUBE_CLIENT_ID`,
+ * `YOUTUBE_CLIENT_SECRET`) are present on a validated `VideoEnv`.
+ */
+export function requireYouTubeAuthEnv(env: VideoEnv): YouTubeAuthEnv {
+  const parsed = YouTubeAuthEnvSchema.safeParse(env);
+  if (!parsed.success) {
+    throw new Error(
+      `Missing or invalid YouTube OAuth environment configuration:\n${formatZodIssues(parsed.error.issues)}`
+    );
+  }
+  return parsed.data;
+}
+
+/**
+ * Validates that the YouTube upload credentials (`YOUTUBE_CLIENT_ID`,
+ * `YOUTUBE_CLIENT_SECRET`, `YOUTUBE_REFRESH_TOKEN`, `YOUTUBE_PRIVACY`)
+ * are present on a validated `VideoEnv`.
+ */
+export function requireYouTubeUploadEnv(env: VideoEnv): YouTubeUploadEnv {
+  const parsed = YouTubeUploadEnvSchema.safeParse(env);
+  if (!parsed.success) {
+    throw new Error(
+      `Missing or invalid YouTube upload environment configuration:\n${formatZodIssues(parsed.error.issues)}`
     );
   }
   return parsed.data;

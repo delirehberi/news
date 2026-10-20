@@ -3,13 +3,15 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { validateEnv, type VideoEnv } from './config/env.ts';
 import { assertEditionApproved, runApproveCommand } from './commands/approve.ts';
+import { runAuthCommand } from './commands/auth.ts';
 import { runRenderCommand } from './commands/render.ts';
 import { runScriptCommand } from './commands/script.ts';
 import { runSelectCommand } from './commands/select.ts';
 import { runTranslateCommand } from './commands/translate.ts';
+import { runUploadCommand } from './commands/upload.ts';
 import { runVoiceCommand } from './commands/voice.ts';
 import { isValidIsoWeek, previousIsoWeek } from './lib/paths.ts';
-import { createWorkerClient, type WorkerClient } from './lib/workerClient.ts';
+import type { WorkerClient } from './lib/workerClient.ts';
 
 export const CLI_COMMANDS = [
   'select',
@@ -137,14 +139,6 @@ export function parseCliArgs(
   };
 }
 
-function unimplementedCommandHandler(command: CliCommand): CommandHandler {
-  return async ({ week }) => {
-    throw new Error(
-      `Command "${command}" (target week ${week}) is not implemented yet.`
-    );
-  };
-}
-
 export const PRODUCTION_GATED_COMMANDS = ['voice', 'render', 'upload'] as const;
 export type ProductionGatedCommand = (typeof PRODUCTION_GATED_COMMANDS)[number];
 
@@ -152,20 +146,6 @@ export function isProductionGatedCommand(
   command: CliCommand
 ): command is ProductionGatedCommand {
   return (PRODUCTION_GATED_COMMANDS as readonly string[]).includes(command);
-}
-
-function gatedProductionCommandHandler(
-  step: ProductionGatedCommand,
-  innerHandler: CommandHandler
-): CommandHandler {
-  return async (ctx) => {
-    const workerClient = createWorkerClient({
-      baseUrl: ctx.env.NEWS_API_BASE_URL,
-      ingestionSecret: ctx.env.INGESTION_SECRET,
-    });
-    await assertEditionApproved(workerClient, ctx.week, step, ctx.signal);
-    await innerHandler(ctx);
-  };
 }
 
 export const defaultCommandHandlers: Record<CliCommand, CommandHandler> = {
@@ -187,8 +167,12 @@ export const defaultCommandHandlers: Record<CliCommand, CommandHandler> = {
   render: async (ctx) => {
     await runRenderCommand(ctx);
   },
-  upload: gatedProductionCommandHandler('upload', unimplementedCommandHandler('upload')),
-  auth: unimplementedCommandHandler('auth'),
+  upload: async (ctx) => {
+    await runUploadCommand(ctx);
+  },
+  auth: async (ctx) => {
+    await runAuthCommand(ctx);
+  },
 };
 
 export interface RunCliOptions {
