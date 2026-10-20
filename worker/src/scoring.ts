@@ -217,3 +217,49 @@ export function groupDigest<T extends RankableArticle>(
   }
   return groups;
 }
+
+export const SNAPSHOT_LIMIT = 30;
+export const SNAPSHOT_HOUR_UTC = 3;
+
+export interface SnapshotCandidate extends RankableArticle {
+  url: string;
+  is_liked?: number | boolean | null;
+}
+
+/**
+ * Returns the ISO 8601 week string for a given date in UTC (e.g. '2026-W42').
+ * Correctly assigns dates at year boundaries to their ISO week.
+ */
+export function isoWeek(date: Date): string {
+  const d = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+  const dayNum = d.getUTCDay() || 7;
+  d.setUTCDate(d.getUTCDate() + 4 - dayNum);
+  const year = d.getUTCFullYear();
+  const yearStart = new Date(Date.UTC(year, 0, 1));
+  const weekNo = Math.ceil((((d.getTime() - yearStart.getTime()) / MS_PER_DAY) + 1) / 7);
+  return `${year}-W${String(weekNo).padStart(2, '0')}`;
+}
+
+/**
+ * Selects the top `limit` live articles by hot ranking, plus every liked article.
+ * Deduplicates articles by URL, preserving the first occurrence (highest rank).
+ */
+export function pickSnapshotCandidates<T extends SnapshotCandidate>(
+  articles: T[],
+  now: Date,
+  limit: number = SNAPSHOT_LIMIT
+): T[] {
+  const hot = rankHot(articles, now, limit);
+  const liked = articles.filter(a => Boolean(a.is_liked));
+  const seenUrls = new Set<string>();
+  const candidates: T[] = [];
+
+  for (const article of [...hot, ...liked]) {
+    if (!article.url || seenUrls.has(article.url)) continue;
+    seenUrls.add(article.url);
+    candidates.push(article);
+  }
+
+  return candidates;
+}
+

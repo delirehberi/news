@@ -4,6 +4,8 @@ import { verifyEvent } from 'nostr-tools'
 import { FeedView } from './views/FeedView'
 import { ArticleDetailView } from './views/ArticleDetailView'
 import { Layout } from './views/Layout'
+import { WeeklyView } from './views/WeeklyView'
+import { WeeklyListView } from './views/WeeklyListView'
 import { DebugView, DiagnosticReport, DiagnosticItem, VectorMatchDetail } from './views/DebugView'
 import { generateRssFeed } from './views/rss'
 import { ArticleModel, getOriginalPostUrl } from './views/helpers'
@@ -23,8 +25,21 @@ import {
   serializeEmbedding,
   DIGEST_DAYS,
   DEFAULT_DIGEST_TIME_ZONE,
-  FEED_LIMIT
+  FEED_LIMIT,
+  isoWeek,
+  pickSnapshotCandidates,
+  SNAPSHOT_LIMIT,
+  SNAPSHOT_HOUR_UTC
 } from './scoring'
+import {
+  isValidIsoWeek,
+  canTransitionStatus,
+  isValidWeeklyEditionPayload,
+  WeeklyStatus,
+  WeeklyItem,
+  WeeklyEditionRow
+} from './weekly'
+
 
 type Bindings = {
   news_db: D1Database;
@@ -53,7 +68,7 @@ type Bindings = {
 // D1 caps bound parameters per statement at 100.
 const D1_MAX_BOUND_PARAMS = 90;
 
-const app = new Hono<{ Bindings: Bindings }>()
+export const app = new Hono<{ Bindings: Bindings }>()
 
 app.use('*', async (c, next) => {
   const corsMiddleware = cors({
@@ -183,6 +198,129 @@ app.get('/article/:id', async (c) => {
   return c.html(
     <ArticleDetailView
       article={formattedArticle}
+      useEmreTheme={useEmreTheme}
+    />
+  );
+});
+
+// SSR Weekly Editions Archive Route
+app.get('/weekly', async (c) => {
+  const useEmreTheme = c.env.USE_EMRE_THEME !== 'false';
+
+  const { results } = await c.env.news_db
+    .prepare(`
+      SELECT week, status, title_tr, intro_tr, items_json, youtube_video_id, published_at, updated_at
+      FROM weekly_editions
+      WHERE status IN ('approved', 'published')
+      ORDER BY week DESC
+    `)
+    .all<WeeklyEditionRow>();
+
+  const editions = (results || []).map((row) => {
+    let itemCount = 0;
+    try {
+      const items = JSON.parse(row.items_json || '[]');
+      itemCount = Array.isArray(items) ? items.length : 0;
+    } catch {
+      itemCount = 0;
+    }
+
+    return {
+      week: row.week,
+      status: row.status,
+      title_tr: row.title_tr,
+      intro_tr: row.intro_tr,
+      item_count: itemCount,
+      youtube_video_id: row.youtube_video_id,
+      published_at: row.published_at,
+      updated_at: row.updated_at
+    };
+  });
+
+  return c.html(
+    <WeeklyListView
+      editions={editions}
+      useEmreTheme={useEmreTheme}
+    />
+  );
+});
+
+// SSR Single Weekly Edition Route
+app.get('/weekly/:week', async (c) => {
+  const week = c.req.param('week');
+  const useEmreTheme = c.env.USE_EMRE_THEME !== 'false';
+
+  if (!isValidIsoWeek(week)) {
+    return c.html(
+      <Layout title="Bülten Bulunamadı - AI Curated News" lang="tr" useEmreTheme={useEmreTheme}>
+        <main class="news-container py-16 text-center">
+          <h1 class="text-2xl font-bold text-[var(--color-ink)] mb-4">Bülten Bulunamadı</h1>
+          <p class="text-[var(--color-ink-muted)] mb-8">
+            Geçersiz bülten haftası formatı veya aradığınız bülten henüz yayınlanmadı.
+          </p>
+          <a
+            href="/weekly"
+            class="px-4 py-2 rounded-lg bg-[var(--color-surface-elevated)] border border-[var(--color-border)] text-[var(--color-ink)] text-sm font-medium hover:bg-[var(--color-surface-hover)] transition-colors"
+          >
+            &larr; Tüm Haftalık Bültenler
+          </a>
+        </main>
+      </Layout>,
+      404
+    );
+  }
+
+  const row = await c.env.news_db
+    .prepare(`
+      SELECT week, status, title_tr, intro_tr, items_json, youtube_video_id, published_at, updated_at
+      FROM weekly_editions
+      WHERE week = ? AND status IN ('approved', 'published')
+    `)
+    .bind(week)
+    .first<WeeklyEditionRow>();
+
+  if (!row) {
+    return c.html(
+      <Layout title="Bülten Bulunamadı - AI Curated News" lang="tr" useEmreTheme={useEmreTheme}>
+        <main class="news-container py-16 text-center">
+          <h1 class="text-2xl font-bold text-[var(--color-ink)] mb-4">Bülten Bulunamadı</h1>
+          <p class="text-[var(--color-ink-muted)] mb-8">
+            Aradığınız haftalık bülten henüz onaylanıp yayınlanmadı veya mevcut değil.
+          </p>
+          <a
+            href="/weekly"
+            class="px-4 py-2 rounded-lg bg-[var(--color-surface-elevated)] border border-[var(--color-border)] text-[var(--color-ink)] text-sm font-medium hover:bg-[var(--color-surface-hover)] transition-colors"
+          >
+            &larr; Tüm Haftalık Bültenler
+          </a>
+        </main>
+      </Layout>,
+      404
+    );
+  }
+
+  let items: WeeklyItem[] = [];
+  try {
+    const parsed = JSON.parse(row.items_json || '[]');
+    if (Array.isArray(parsed)) {
+      items = parsed;
+    }
+  } catch {
+    items = [];
+  }
+
+  return c.html(
+    <WeeklyView
+      edition={{
+        week: row.week,
+        status: row.status,
+        title_tr: row.title_tr,
+        intro_tr: row.intro_tr,
+        items,
+        youtube_video_id: row.youtube_video_id,
+        published_at: row.published_at,
+        updated_at: row.updated_at
+      }}
       useEmreTheme={useEmreTheme}
     />
   );
@@ -1113,9 +1251,302 @@ app.post('/api/admin/ingest', handleIngestEndpoint);
 app.get('/test-ingestion', handleIngestEndpoint);
 app.post('/test-ingestion', handleIngestEndpoint);
 
+// Weekly Video Pipeline Admin API Routes
+app.get('/api/admin/weekly/:week/candidates', async (c) => {
+  const isAuth = await isAuthorizedAdmin(c);
+  if (!isAuth) {
+    return c.json({ error: 'Unauthorized', message: 'Admin authentication required.' }, 401);
+  }
+
+  const week = c.req.param('week');
+  if (!isValidIsoWeek(week)) {
+    return c.json({ error: 'Bad Request', message: 'Invalid week format. Expected YYYY-Www (e.g. 2026-W42).' }, 400);
+  }
+
+  const { results } = await c.env.news_db
+    .prepare('SELECT * FROM weekly_candidates WHERE week = ? ORDER BY is_liked DESC, follower_likes DESC, importance_score DESC, captured_at DESC')
+    .bind(week)
+    .all();
+
+  return c.json(results || []);
+});
+
+app.get('/api/admin/weekly/:week', async (c) => {
+  const isAuth = await isAuthorizedAdmin(c);
+  if (!isAuth) {
+    return c.json({ error: 'Unauthorized', message: 'Admin authentication required.' }, 401);
+  }
+
+  const week = c.req.param('week');
+  if (!isValidIsoWeek(week)) {
+    return c.json({ error: 'Bad Request', message: 'Invalid week format. Expected YYYY-Www (e.g. 2026-W42).' }, 400);
+  }
+
+  const row: any = await c.env.news_db
+    .prepare('SELECT * FROM weekly_editions WHERE week = ?')
+    .bind(week)
+    .first();
+
+  if (!row) {
+    return c.json({ error: 'Not Found', message: `Weekly edition for week ${week} not found.` }, 404);
+  }
+
+  let items = [];
+  try {
+    items = JSON.parse(row.items_json || '[]');
+  } catch {}
+
+  let script = null;
+  if (row.script_json) {
+    try {
+      script = JSON.parse(row.script_json);
+    } catch {
+      script = row.script_json;
+    }
+  }
+
+  return c.json({
+    week: row.week,
+    status: row.status,
+    title_tr: row.title_tr,
+    intro_tr: row.intro_tr,
+    items,
+    script,
+    youtube_video_id: row.youtube_video_id,
+    published_at: row.published_at,
+    updated_at: row.updated_at,
+  });
+});
+
+app.put('/api/admin/weekly/:week', async (c) => {
+  const isAuth = await isAuthorizedAdmin(c);
+  if (!isAuth) {
+    return c.json({ error: 'Unauthorized', message: 'Admin authentication required.' }, 401);
+  }
+
+  const week = c.req.param('week');
+  if (!isValidIsoWeek(week)) {
+    return c.json({ error: 'Bad Request', message: 'Invalid week format. Expected YYYY-Www (e.g. 2026-W42).' }, 400);
+  }
+
+  let body: unknown;
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: 'Bad Request', message: 'Invalid JSON body.' }, 400);
+  }
+
+  if (!isValidWeeklyEditionPayload(body)) {
+    return c.json({ error: 'Bad Request', message: 'Invalid weekly edition payload.' }, 400);
+  }
+
+  const existing: any = await c.env.news_db
+    .prepare('SELECT * FROM weekly_editions WHERE week = ?')
+    .bind(week)
+    .first();
+
+  const nextStatus: WeeklyStatus = body.status ?? (existing?.status || 'draft');
+
+  if (existing && body.status) {
+    if (!canTransitionStatus(existing.status, body.status)) {
+      return c.json({
+        error: 'Conflict',
+        message: `Cannot transition status backwards from '${existing.status}' to '${body.status}'.`,
+      }, 409);
+    }
+  }
+
+  let publishedAt = existing?.published_at ?? null;
+  if (nextStatus === 'published' && !publishedAt) {
+    publishedAt = new Date().toISOString();
+  }
+
+  if (existing) {
+    const titleTr = body.title_tr !== undefined ? body.title_tr : existing.title_tr;
+    const introTr = body.intro_tr !== undefined ? body.intro_tr : existing.intro_tr;
+    const itemsJson = body.items !== undefined ? JSON.stringify(body.items) : existing.items_json;
+    const scriptJson = body.script !== undefined
+      ? (typeof body.script === 'string' ? body.script : JSON.stringify(body.script))
+      : existing.script_json;
+    const youtubeVideoId = body.youtube_video_id !== undefined ? body.youtube_video_id : existing.youtube_video_id;
+
+    await c.env.news_db
+      .prepare(`
+        UPDATE weekly_editions SET
+          status = ?,
+          title_tr = ?,
+          intro_tr = ?,
+          items_json = ?,
+          script_json = ?,
+          youtube_video_id = ?,
+          published_at = ?,
+          updated_at = CURRENT_TIMESTAMP
+        WHERE week = ?
+      `)
+      .bind(nextStatus, titleTr, introTr, itemsJson, scriptJson, youtubeVideoId, publishedAt, week)
+      .run();
+  } else {
+    const titleTr = body.title_tr ?? null;
+    const introTr = body.intro_tr ?? null;
+    const itemsJson = JSON.stringify(body.items || []);
+    const scriptJson = body.script !== undefined
+      ? (typeof body.script === 'string' ? body.script : JSON.stringify(body.script))
+      : null;
+    const youtubeVideoId = body.youtube_video_id ?? null;
+
+    await c.env.news_db
+      .prepare(`
+        INSERT INTO weekly_editions (
+          week,
+          status,
+          title_tr,
+          intro_tr,
+          items_json,
+          script_json,
+          youtube_video_id,
+          published_at,
+          updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+      `)
+      .bind(week, nextStatus, titleTr, introTr, itemsJson, scriptJson, youtubeVideoId, publishedAt)
+      .run();
+  }
+
+  const updated: any = await c.env.news_db
+    .prepare('SELECT * FROM weekly_editions WHERE week = ?')
+    .bind(week)
+    .first();
+
+  if (!updated) {
+    return c.json({ error: 'Internal Server Error', message: 'Failed to retrieve saved edition.' }, 500);
+  }
+
+  let items = [];
+  try {
+    items = JSON.parse(updated.items_json || '[]');
+  } catch {}
+
+  let script = null;
+  if (updated.script_json) {
+    try {
+      script = JSON.parse(updated.script_json);
+    } catch {
+      script = updated.script_json;
+    }
+  }
+
+  return c.json({
+    week: updated.week,
+    status: updated.status,
+    title_tr: updated.title_tr,
+    intro_tr: updated.intro_tr,
+    items,
+    script,
+    youtube_video_id: updated.youtube_video_id,
+    published_at: updated.published_at,
+    updated_at: updated.updated_at,
+  });
+});
+
+app.post('/api/admin/weekly/snapshot', async (c) => {
+  const isAuth = await isAuthorizedAdmin(c);
+  if (!isAuth) {
+    return c.json({ error: 'Unauthorized', message: 'Admin authentication required.' }, 401);
+  }
+
+  try {
+    const result = await snapshotWeeklyCandidates(c.env, new Date());
+    return c.json({ success: true, ...result });
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : 'Unknown snapshot failure';
+    console.error('Weekly candidate snapshot failed:', error);
+    return c.json({ error: 'Internal Server Error', message }, 500);
+  }
+});
+
+export async function snapshotWeeklyCandidates(
+  env: Bindings,
+  now: Date = new Date()
+): Promise<{ week: string; candidateCount: number; snapshotAt: string }> {
+  const week = isoWeek(now);
+  const liveArticles = await loadLiveArticles(env, 'hot', 'all');
+  const candidates = pickSnapshotCandidates(liveArticles, now, SNAPSHOT_LIMIT);
+
+  if (candidates.length === 0) {
+    return {
+      week,
+      candidateCount: 0,
+      snapshotAt: new Date().toISOString()
+    };
+  }
+
+  const upsertSql = `
+    INSERT INTO weekly_candidates (
+      week,
+      url,
+      article_id,
+      title,
+      source,
+      summary,
+      image_url,
+      is_liked,
+      follower_likes,
+      importance_score,
+      source_count,
+      seen_count,
+      cluster_id,
+      captured_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    ON CONFLICT(week, url) DO UPDATE SET
+      is_liked = MAX(weekly_candidates.is_liked, excluded.is_liked),
+      follower_likes = MAX(weekly_candidates.follower_likes, excluded.follower_likes),
+      importance_score = MAX(weekly_candidates.importance_score, excluded.importance_score),
+      source_count = MAX(weekly_candidates.source_count, excluded.source_count),
+      seen_count = MAX(weekly_candidates.seen_count, excluded.seen_count),
+      captured_at = CURRENT_TIMESTAMP
+  `;
+
+  const statements = candidates.map((article) => {
+    return env.news_db.prepare(upsertSql).bind(
+      week,
+      article.url,
+      article.id || null,
+      article.title || 'Untitled',
+      article.source || null,
+      article.summary || null,
+      article.image_url || null,
+      article.is_liked ? 1 : 0,
+      article.follower_likes ?? 0,
+      article.importance_score ?? 1.0,
+      article.source_count ?? 1,
+      article.seen_count ?? 1,
+      article.cluster_id || null
+    );
+  });
+
+  const CHUNK_SIZE = 50;
+  for (let i = 0; i < statements.length; i += CHUNK_SIZE) {
+    const chunk = statements.slice(i, i + CHUNK_SIZE);
+    await env.news_db.batch(chunk);
+  }
+
+  return {
+    week,
+    candidateCount: candidates.length,
+    snapshotAt: new Date().toISOString()
+  };
+}
+
 export default {
   fetch: app.fetch,
   async scheduled(event: ScheduledEvent, env: Bindings, ctx: ExecutionContext) {
+    const scheduledDate = new Date(event.scheduledTime);
+    const hour = scheduledDate.getUTCHours();
+
+    if (hour === SNAPSHOT_HOUR_UTC) {
+      ctx.waitUntil(snapshotWeeklyCandidates(env, scheduledDate));
+    }
+
     const sources = [];
     if (env.ENABLE_HN !== 'false') sources.push('hn');
     if (env.ENABLE_LOBSTERS !== 'false') sources.push('lobsters');
@@ -1126,7 +1557,6 @@ export default {
     if (sources.length === 0) return;
 
     // Run exactly one source per hour to bypass the 50 subrequest limit without using multiple cron triggers
-    const hour = new Date(event.scheduledTime).getUTCHours();
     const cycle = hour % sources.length;
     
     ctx.waitUntil(handleIngestion(env, sources[cycle]));

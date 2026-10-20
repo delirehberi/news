@@ -12,6 +12,8 @@ import {
   hotScore,
   rankHot,
   groupDigest,
+  isoWeek,
+  pickSnapshotCandidates,
   HOT_PROMOTION_THRESHOLD,
   RETENTION_DAYS
 } from './scoring'
@@ -209,3 +211,108 @@ describe('groupDigest', () => {
     expect(groups[0].articles.map(a => a.id)).toEqual(['a4', 'a3']);
   });
 });
+
+describe('isoWeek', () => {
+  it('correctly formats normal weeks in the middle of the year', () => {
+    expect(isoWeek(new Date('2026-10-15T12:00:00Z'))).toBe('2026-W42');
+  });
+
+  it('handles Mondays and Sundays correctly', () => {
+    // 2026-10-18 is Sunday (still W42)
+    expect(isoWeek(new Date('2026-10-18T23:59:59Z'))).toBe('2026-W42');
+    // 2026-10-19 is Monday (start of W43)
+    expect(isoWeek(new Date('2026-10-19T00:00:00Z'))).toBe('2026-W43');
+  });
+
+  it('handles year boundaries where end of year belongs to next year week 1', () => {
+    // 2024-12-31 is Tuesday; nearest Thursday is 2025-01-02 -> 2025-W01
+    expect(isoWeek(new Date('2024-12-31T12:00:00Z'))).toBe('2025-W01');
+    expect(isoWeek(new Date('2025-01-01T00:00:00Z'))).toBe('2025-W01');
+  });
+
+  it('handles year boundaries where beginning of year belongs to previous year week 53', () => {
+    // 2021-01-01 is Friday; nearest Thursday is 2020-12-31 -> 2020-W53
+    expect(isoWeek(new Date('2021-01-01T12:00:00Z'))).toBe('2020-W53');
+    expect(isoWeek(new Date('2021-01-03T23:59:59Z'))).toBe('2020-W53');
+    // 2021-01-04 is Monday -> 2021-W01
+    expect(isoWeek(new Date('2021-01-04T00:00:00Z'))).toBe('2021-W01');
+  });
+
+  it('handles 53-week years at the end of the year', () => {
+    // 2026-12-31 is Thursday -> 2026-W53
+    expect(isoWeek(new Date('2026-12-31T23:59:59Z'))).toBe('2026-W53');
+    // 2027-01-01 is Friday -> 2026-W53
+    expect(isoWeek(new Date('2027-01-01T00:00:00Z'))).toBe('2026-W53');
+    // 2027-01-03 is Sunday -> 2026-W53
+    expect(isoWeek(new Date('2027-01-03T23:59:59Z'))).toBe('2026-W53');
+    // 2027-01-04 is Monday -> 2027-W01
+    expect(isoWeek(new Date('2027-01-04T00:00:00Z'))).toBe('2027-W01');
+  });
+});
+
+describe('pickSnapshotCandidates', () => {
+  it('respects the limit when all articles are unliked', () => {
+    const articles = Array.from({ length: 10 }, (_, i) => ({
+      id: `art-${i}`,
+      url: `https://example.com/article-${i}`,
+      importance_score: 1.0,
+      created_at: NOW.toISOString(),
+      is_liked: 0
+    }));
+
+    const candidates = pickSnapshotCandidates(articles, NOW, 5);
+    expect(candidates).toHaveLength(5);
+  });
+
+  it('always includes liked articles even if ranked outside the top limit', () => {
+    const unliked = Array.from({ length: 10 }, (_, i) => ({
+      id: `top-${i}`,
+      url: `https://example.com/top-${i}`,
+      importance_score: 10 - i, // high scores
+      created_at: NOW.toISOString(),
+      is_liked: 0
+    }));
+
+    const likedArticle = {
+      id: 'liked-old',
+      url: 'https://example.com/liked-story',
+      importance_score: 0.1, // low score
+      created_at: '2026-10-10 00:00:00', // old
+      is_liked: 1
+    };
+
+    const candidates = pickSnapshotCandidates([...unliked, likedArticle], NOW, 5);
+    // Top 5 unliked plus the 1 liked article = 6 candidates
+    expect(candidates).toHaveLength(6);
+    expect(candidates.some(c => c.url === likedArticle.url)).toBe(true);
+  });
+
+  it('removes duplicate URLs, keeping the highest ranked occurrence', () => {
+    const article1 = {
+      id: 'art-1',
+      url: 'https://example.com/shared-url',
+      importance_score: 5.0,
+      created_at: NOW.toISOString(),
+      is_liked: 0
+    };
+    const duplicateArticle = {
+      id: 'art-dup',
+      url: 'https://example.com/shared-url',
+      importance_score: 1.0,
+      created_at: NOW.toISOString(),
+      is_liked: 1
+    };
+    const otherArticle = {
+      id: 'art-2',
+      url: 'https://example.com/other-url',
+      importance_score: 3.0,
+      created_at: NOW.toISOString(),
+      is_liked: 0
+    };
+
+    const candidates = pickSnapshotCandidates([article1, duplicateArticle, otherArticle], NOW, 10);
+    expect(candidates).toHaveLength(2);
+    expect(candidates[0].id).toBe('art-1');
+  });
+});
+

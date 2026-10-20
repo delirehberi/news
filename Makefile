@@ -1,4 +1,4 @@
-.PHONY: test typecheck types setup init push-secrets worker-init db-init db-migrate db-migrate-local db-migrate-list db-migrate-create vectorize-init dev-worker dev-frontend frontend-build deploy-worker deploy
+.PHONY: test typecheck types setup init push-secrets worker-init db-init db-migrate db-migrate-local db-migrate-list db-migrate-create vectorize-init dev-worker dev-frontend frontend-build deploy-worker deploy video-init video-test video-typecheck video-draft video-approve video-produce video-auth
 
 NVM_CMD=. ~/.nvm/nvm.sh && nvm use &&
 
@@ -104,3 +104,38 @@ typecheck:
 test:
 	@echo "Running Worker unit tests..."
 	bash -c '$(NVM_CMD) cd worker && npx vitest run'
+
+video-init:
+	@echo "Installing Weekly Video CLI dependencies..."
+	bash -c '$(NVM_CMD) cd video && npm install'
+	@if [ ! -f video/.env ]; then cp video/.env.example video/.env; echo "Created video/.env from template"; fi
+	@chmod +x video/src/cli.ts video/cli.ts
+
+video-typecheck:
+	@echo "Type-checking Weekly Video CLI..."
+	bash -c '$(NVM_CMD) cd video && npx tsc --noEmit'
+
+video-test:
+	@echo "Running Weekly Video CLI unit tests..."
+	bash -c '$(NVM_CMD) cd video && npx vitest run'
+
+video-draft:
+	@echo "Running weekly video draft pipeline (select -> translate -> script)..."
+	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts select $(if $(WEEK),--week $(WEEK),)'
+	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts translate $(if $(WEEK),--week $(WEEK),)'
+	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts script $(if $(WEEK),--week $(WEEK),)'
+
+video-approve:
+	@echo "Approving weekly video script and publishing Turkish web edition..."
+	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts approve $(if $(WEEK),--week $(WEEK),)'
+
+video-produce:
+	@echo "Running weekly video production pipeline (voice -> render -> upload)..."
+	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts voice $(if $(WEEK),--week $(WEEK),)'
+	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts render $(if $(WEEK),--week $(WEEK),)'
+	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts upload $(if $(WEEK),--week $(WEEK),)'
+
+video-auth:
+	@echo "Running YouTube OAuth2 PKCE loopback flow..."
+	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts auth'
+

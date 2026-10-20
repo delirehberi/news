@@ -35,3 +35,9 @@ worker/.wrangler/
 
 # Temporary scripts
 scratch/
+
+# Weekly Video CLI
+video/out/
+video/.env
+video/node_modules/
+

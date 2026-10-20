@@ -7,6 +7,7 @@ interface LayoutProps {
   canonicalUrl?: string;
   ogImage?: string;
   useEmreTheme?: boolean;
+  lang?: string;
 }
 
 export const Layout: FC<PropsWithChildren<LayoutProps>> = ({
@@ -15,12 +16,13 @@ export const Layout: FC<PropsWithChildren<LayoutProps>> = ({
   canonicalUrl = 'https://news.emre.xyz',
   ogImage = 'https://news.emre.xyz/assets/hero.png',
   useEmreTheme = true,
+  lang = 'en',
   children
 }) => {
   return (
     <>
       {raw('<!DOCTYPE html>\n')}
-      <html lang="en">
+      <html lang={lang}>
       <head>
         <meta charset="UTF-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -68,6 +70,7 @@ export const Layout: FC<PropsWithChildren<LayoutProps>> = ({
                 </a>
                 <nav class="flex items-center gap-4">
                   <a href="/" class="text-sm text-[var(--color-ink-muted)] hover:text-[var(--color-ink)] transition-colors">Feed</a>
+                  <a href="/weekly" class="text-sm text-[var(--color-ink-muted)] hover:text-[var(--color-ink)] transition-colors">Haftalık</a>
                   <a href="/rss.xml" class="text-sm text-[var(--color-ink-muted)] hover:text-[var(--color-ink)] transition-colors flex items-center gap-1.5">
                     <svg class="w-3.5 h-3.5 text-amber-500" fill="currentColor" viewBox="0 0 24 24"><path d="M6.18 15.64a2.18 2.18 0 1 1-2.18 2.18 2.18 2.18 0 0 1 2.18-2.18M4 4.44A15.56 15.56 0 0 1 19.56 20h-3.11A12.45 12.45 0 0 0 4 7.55Zm0 6.22A9.34 9.34 0 0 1 13.34 20h-3.11A6.23 6.23 0 0 0 4 13.77Z"/></svg>
                     <span>RSS</span>
