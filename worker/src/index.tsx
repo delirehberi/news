@@ -11,15 +11,19 @@ import { generateRssFeed } from './views/rss'
 import { ArticleModel, getOriginalPostUrl } from './views/helpers'
 import {
   parseSources,
-  cosineSimilarity,
   parseEmbedding,
   calculateImportanceScore,
   computeExpiresAt,
   toSqliteDateTime,
   rankHot,
   groupDigest,
-  CLUSTER_SIMILARITY_THRESHOLD,
   CLUSTER_LOOKBACK_HOURS,
+  DUPLICATE_MAX_PAIRS_PER_RUN,
+  findDuplicateCandidates,
+  collapseClusters,
+  collapseForFeed,
+  resolveClusterView,
+  EmbeddedArticle,
   CLUSTER_MAX_CANDIDATES,
   rescoreWithSignals,
   serializeEmbedding,
@@ -56,6 +60,15 @@ import {
   parseDecomposedStories,
   parseCuratedIds
 } from './newsletter'
+import {
+  confirmDuplicatesWithLLM,
+  buildClusterPlan,
+  PlanMember,
+  JudgeArticle,
+  TextCompletion,
+  DUPLICATE_JUDGE_MODEL,
+  DUPLICATE_JUDGE_MAX_TOKENS
+} from './dedup'
 
 
 type Bindings = {
@@ -165,9 +178,9 @@ app.get('/', async (c) => {
   const latest: any = await c.env.news_db.prepare('SELECT MAX(created_at) as last_curated_at FROM articles').first();
 
   const digestGroups = sort === 'digest'
-    ? groupDigest(articles, now, resolveDigestTimeZone(c.env.DIGEST_TIMEZONE))
+    ? groupDigest(collapseClusters(articles), now, resolveDigestTimeZone(c.env.DIGEST_TIMEZONE))
     : undefined;
-  const feedArticles = sort === 'hot' ? rankHot(articles, now) : articles;
+  const feedArticles = collapseForFeed(articles, sort === 'hot', now);
 
   const useEmreTheme = c.env.USE_EMRE_THEME !== 'false';
 
@@ -212,9 +225,28 @@ app.get('/article/:id', async (c) => {
     importance_score: article.importance_score || 1.0
   };
 
+  let siblings: ArticleModel[] = [];
+  if (formattedArticle.cluster_id) {
+    try {
+      const { results } = await c.env.news_db.prepare(
+        `SELECT ${ARTICLE_COLUMNS} FROM articles WHERE cluster_id = ? AND ${LIVE_ARTICLE_CONDITION}`
+      ).bind(formattedArticle.cluster_id).all();
+      siblings = (results || []).map(formatArticle);
+    } catch (e) {
+      // Related coverage is an enhancement: the article itself still renders without it.
+      console.error(`Failed to load cluster ${formattedArticle.cluster_id} for article ${id}`, e);
+    }
+  }
+
+  // 302, not 301: re-clustering can change membership, and browsers cache 301s permanently.
+  const view = resolveClusterView(formattedArticle, siblings);
+  if (view.kind === 'redirect') {
+    return c.redirect(`/article/${encodeURIComponent(view.primaryId)}`, 302);
+  }
+
   return c.html(
     <ArticleDetailView
-      article={formattedArticle}
+      article={view.article}
       useEmreTheme={useEmreTheme}
     />
   );
@@ -352,7 +384,7 @@ app.get('/rss.xml', async (c) => {
      LIMIT ${RSS_LIMIT}`
   ).all();
 
-  const formattedArticles: ArticleModel[] = (results || []).map(formatArticle);
+  const formattedArticles: ArticleModel[] = collapseClusters((results || []).map(formatArticle));
 
   const siteUrl = c.env.FRONTEND_URL || 'https://news.emre.xyz';
   const rssXml = generateRssFeed(formattedArticles, siteUrl);
@@ -374,7 +406,7 @@ app.get('/api/articles', async (c) => {
   // The JSON API keeps its flat contract: digest is an SSR-only view, so it falls back to hot here.
   const sort: FeedSort = requestedSort === 'digest' ? 'hot' : requestedSort;
   const articles = await loadLiveArticles(c.env, sort, 'all');
-  const formattedArticles = sort === 'hot' ? rankHot(articles, new Date()) : articles;
+  const formattedArticles = collapseForFeed(articles, sort === 'hot', new Date());
 
   const latest: any = await c.env.news_db.prepare('SELECT MAX(created_at) as last_curated_at FROM articles').first();
 
@@ -1473,6 +1505,134 @@ app.put('/api/admin/weekly/:week', async (c) => {
   });
 });
 
+// Re-clustering judges every live candidate pair at once, so it gets a larger (but bounded) AI budget than ingestion.
+const RECLUSTER_MAX_PAIRS = 600;
+const D1_STATEMENTS_PER_BATCH = 50;
+
+interface ReclusterResult {
+  dryRun: boolean;
+  liveRows: number;
+  candidates: number;
+  judged: number;
+  confirmed: number;
+  rowsUpdated: number;
+  staleClustersCleared: number;
+  clusters: Array<{ clusterId: string; members: Array<{ id: string; title: string; url: string }> }>;
+}
+
+/**
+ * Rebuilds clusters for live articles from stored embeddings: every live row is reset to its own
+ * source with no cluster, then confirmed duplicates are merged again. Expired rows only lose their
+ * stale cluster_id so they can never collide with a new cluster. Retention is never shortened.
+ */
+async function reclusterLiveArticles(env: Bindings, dryRun: boolean, now: Date, signal?: AbortSignal): Promise<ReclusterResult> {
+  const { results } = await env.news_db.prepare(
+    `SELECT ${RECENT_CLUSTER_COLUMNS} FROM articles WHERE ${LIVE_ARTICLE_CONDITION}`
+  ).all<RecentClusterRow>();
+  const rows = results || [];
+
+  const embedded: EmbeddedArticle[] = rows
+    .map(row => ({ id: row.id, url: row.url, embedding: parseEmbedding(row.embedding) }))
+    .filter((r): r is EmbeddedArticle => r.embedding !== null);
+  const allCandidates = findDuplicateCandidates(embedded, embedded);
+  const candidates = allCandidates.slice(0, RECLUSTER_MAX_PAIRS);
+
+  const judgeArticles = new Map<string, JudgeArticle>(
+    rows.map(row => [row.id, { id: row.id, title: row.title, url: row.url, summary: row.summary }])
+  );
+  const confirmed = await confirmDuplicatesWithLLM(completeWithWorkersAi(env), candidates, judgeArticles, signal);
+
+  const members: PlanMember[] = rows.map(row => ({
+    id: row.id,
+    cluster_id: null,
+    created_at: row.created_at,
+    source: row.source,
+    sources: [row.source]
+  }));
+  const plan = buildClusterPlan(members, confirmed);
+
+  const updates: D1PreparedStatement[] = [];
+  for (const row of rows) {
+    const entry = plan.get(row.id);
+    const sources = entry?.sources ?? [row.source];
+    const clusterId = entry?.clusterId ?? null;
+    const storedSources = parseSources(row.sources, row.source);
+    const unchanged = clusterId === row.cluster_id
+      && JSON.stringify([...storedSources].sort()) === JSON.stringify([...sources].sort());
+    if (unchanged) continue;
+
+    const seenCount = row.seen_count || 1;
+    const importanceScore = rescoreWithSignals(
+      row.importance_score,
+      row.source_count || storedSources.length || 1,
+      seenCount,
+      sources.length,
+      seenCount
+    );
+    updates.push(env.news_db.prepare(
+      'UPDATE articles SET sources = ?1, source_count = ?2, importance_score = ?3, cluster_id = ?4, expires_at = ?5 WHERE id = ?6'
+    ).bind(
+      JSON.stringify(sources),
+      sources.length,
+      importanceScore,
+      clusterId,
+      computeExpiresAt(sources, importanceScore, now, row.expires_at),
+      row.id
+    ));
+  }
+
+  const titleById = new Map(rows.map(row => [row.id, row]));
+  const clusterMembers = new Map<string, Array<{ id: string; title: string; url: string }>>();
+  for (const [id, entry] of plan) {
+    const row = titleById.get(id);
+    if (!row) continue;
+    const list = clusterMembers.get(entry.clusterId) ?? [];
+    list.push({ id, title: row.title, url: row.url });
+    clusterMembers.set(entry.clusterId, list);
+  }
+
+  let staleClustersCleared = 0;
+  if (!dryRun) {
+    for (let i = 0; i < updates.length; i += D1_STATEMENTS_PER_BATCH) {
+      if (signal?.aborted) throw new Error(`Re-cluster aborted after ${i} of ${updates.length} row updates`);
+      await env.news_db.batch(updates.slice(i, i + D1_STATEMENTS_PER_BATCH));
+    }
+    const stale = await env.news_db.prepare(
+      `UPDATE articles SET cluster_id = NULL WHERE cluster_id IS NOT NULL AND NOT (${LIVE_ARTICLE_CONDITION})`
+    ).run();
+    staleClustersCleared = stale.meta.changes ?? 0;
+  }
+
+  return {
+    dryRun,
+    liveRows: rows.length,
+    candidates: allCandidates.length,
+    judged: candidates.length,
+    confirmed: confirmed.length,
+    rowsUpdated: dryRun ? 0 : updates.length,
+    staleClustersCleared,
+    clusters: Array.from(clusterMembers, ([clusterId, list]) => ({ clusterId, members: list }))
+      .sort((a, b) => b.members.length - a.members.length)
+  };
+}
+
+app.post('/api/admin/recluster', async (c) => {
+  const isAuth = await isAuthorizedAdmin(c);
+  if (!isAuth) {
+    return c.json({ error: 'Unauthorized', message: 'Admin authentication required.' }, 401);
+  }
+
+  const dryRun = c.req.query('dryRun') === '1';
+  try {
+    const result = await reclusterLiveArticles(c.env, dryRun, new Date(), c.req.raw.signal);
+    return c.json({ success: true, ...result });
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : 'Unknown re-cluster failure';
+    console.error(`Re-cluster failed (dryRun=${dryRun}):`, error);
+    return c.json({ error: 'Internal Server Error', message }, 500);
+  }
+});
+
 app.post('/api/admin/weekly/snapshot', async (c) => {
   const isAuth = await isAuthorizedAdmin(c);
   if (!isAuth) {
@@ -1876,14 +2036,14 @@ async function handleIngestion(env: Bindings, targetSource?: string) {
 
   stats.filtered = filteredArticles.length;
 
-  // Stage 3: Semantic Cross-Source Topic Clustering via Cosine Similarity
+  // Stage 3: Cross-source duplicate clustering. Cosine similarity nominates candidate pairs against recently
+  // active stored articles and within this batch; the LLM judge confirms that a pair covers the same event.
+  // Cron ingests one source per run, so the stored comparison is what links e.g. an HN and a Lobsters post.
   try {
-    // Inter-run clustering: compare new articles against stored embeddings of recently active articles.
-    // Cron ingests one source per run, so this is what links e.g. an HN and a Lobsters post on the same story.
     let recentDbArticles: RecentClusterRow[] = [];
     try {
       const recentRes = await env.news_db.prepare(
-        `SELECT id, url, source, sources, source_count, seen_count, importance_score, cluster_id, expires_at, embedding
+        `SELECT ${RECENT_CLUSTER_COLUMNS}
          FROM articles
          WHERE embedding IS NOT NULL AND coalesce(last_seen_at, created_at) >= datetime('now', ?1)
          ORDER BY coalesce(last_seen_at, created_at) DESC
@@ -1894,77 +2054,90 @@ async function handleIngestion(env: Bindings, targetSource?: string) {
       console.error('Failed to fetch recent DB articles for clustering', dbErr);
     }
 
-    const recentWithEmbeddings = recentDbArticles
-      .map(row => ({ row, embedding: parseEmbedding(row.embedding) }))
-      .filter((r): r is { row: RecentClusterRow; embedding: number[] } => r.embedding !== null);
+    // An id collision (handled by the ON CONFLICT upsert below) means the row is this article, not a duplicate.
+    const newIds = new Set<string>(filteredArticles.map(a => a.id));
+    const storedRows = recentDbArticles.filter(row => !newIds.has(row.id));
 
-    const touchedDbRows = new Map<string, { row: RecentClusterRow; sources: Set<string>; clusterId: string }>();
-    for (const article of filteredArticles) {
-      if (!article.embedding) continue;
-      for (const { row, embedding } of recentWithEmbeddings) {
-        if (row.id === article.id || row.url === article.url) continue;
-        if (cosineSimilarity(article.embedding, embedding) < CLUSTER_SIMILARITY_THRESHOLD) continue;
+    const newEmbedded: EmbeddedArticle[] = filteredArticles
+      .filter(a => Array.isArray(a.embedding))
+      .map(a => ({ id: a.id, url: a.url, embedding: a.embedding }));
+    const storedEmbedded: EmbeddedArticle[] = storedRows
+      .map(row => ({ id: row.id, url: row.url, embedding: parseEmbedding(row.embedding) }))
+      .filter((r): r is EmbeddedArticle => r.embedding !== null);
 
-        const touched = touchedDbRows.get(row.id);
-        const clusterId = article.cluster_id || touched?.clusterId || row.cluster_id || `cluster-${row.id}`;
-        article.cluster_id = clusterId;
+    const candidates = findDuplicateCandidates(newEmbedded, [...newEmbedded, ...storedEmbedded])
+      .slice(0, DUPLICATE_MAX_PAIRS_PER_RUN);
+    stats.duplicateCandidates = candidates.length;
 
-        const dbSources = touched ? Array.from(touched.sources) : parseSources(row.sources, row.source);
-        const merged = new Set([...(article.sources || [article.source]), ...dbSources]);
-        article.sources = Array.from(merged);
-        article.source_count = merged.size;
-        touchedDbRows.set(row.id, { row, sources: merged, clusterId });
-      }
+    const judgeArticles = new Map<string, JudgeArticle>();
+    for (const row of storedRows) {
+      judgeArticles.set(row.id, { id: row.id, title: row.title, url: row.url, summary: row.summary });
+    }
+    for (const a of filteredArticles) {
+      judgeArticles.set(a.id, { id: a.id, title: a.title, url: a.url, summary: a.details?.description || a.summary });
     }
 
-    // Intra-batch clustering: compare pairs of filteredArticles
-    for (let i = 0; i < filteredArticles.length; i++) {
-      for (let j = i + 1; j < filteredArticles.length; j++) {
-        const artA = filteredArticles[i];
-        const artB = filteredArticles[j];
-        if (artA.embedding && artB.embedding) {
-          const sim = cosineSimilarity(artA.embedding, artB.embedding);
-          if (sim >= CLUSTER_SIMILARITY_THRESHOLD) {
-            // Highly similar topic/event across articles
-            const clusterId = artA.cluster_id || artB.cluster_id || `cluster-${artA.id}`;
-            artA.cluster_id = clusterId;
-            artB.cluster_id = clusterId;
+    const confirmed = candidates.length > 0
+      ? await confirmDuplicatesWithLLM(completeWithWorkersAi(env), candidates, judgeArticles)
+      : [];
+    stats.duplicatesConfirmed = confirmed.length;
 
-            // Merge sources across the cluster
-            const combinedSources = Array.from(new Set([...(artA.sources || [artA.source]), ...(artB.sources || [artB.source])]));
-            artA.sources = combinedSources;
-            artB.sources = combinedSources;
-            artA.source_count = combinedSources.length;
-            artB.source_count = combinedSources.length;
-          }
-        }
-      }
+    const members: PlanMember[] = [
+      ...storedRows.map(row => ({
+        id: row.id,
+        cluster_id: row.cluster_id,
+        created_at: row.created_at,
+        source: row.source,
+        sources: parseSources(row.sources, row.source)
+      })),
+      ...filteredArticles.map(a => ({
+        id: a.id,
+        cluster_id: null,
+        created_at: nowSql,
+        source: a.source,
+        sources: a.sources || [a.source]
+      }))
+    ];
+    const plan = buildClusterPlan(members, confirmed);
+
+    for (const article of filteredArticles) {
+      const entry = plan.get(article.id);
+      if (!entry) continue;
+      article.cluster_id = entry.clusterId;
+      article.sources = entry.sources;
+      article.source_count = entry.sources.length;
     }
 
     // New coverage of a stored story means it is still active: boost, extend retention and refresh last_seen_at.
-    if (touchedDbRows.size > 0) {
-      const clusterUpdates = Array.from(touchedDbRows.values()).map(({ row, sources, clusterId }) => {
-        const mergedSources = Array.from(sources);
-        const seenCount = row.seen_count || 1;
-        const importanceScore = rescoreWithSignals(
-          row.importance_score,
-          row.source_count || parseSources(row.sources, row.source).length || 1,
-          seenCount,
-          mergedSources.length,
-          seenCount
-        );
-        return env.news_db.prepare(
-          'UPDATE articles SET sources = ?1, source_count = ?2, importance_score = ?3, cluster_id = ?4, expires_at = ?5, last_seen_at = ?6 WHERE id = ?7'
-        ).bind(
-          JSON.stringify(mergedSources),
-          mergedSources.length,
-          importanceScore,
-          clusterId,
-          computeExpiresAt(mergedSources, importanceScore, now, row.expires_at),
-          nowSql,
-          row.id
-        );
-      });
+    const clusterUpdates: D1PreparedStatement[] = [];
+    for (const row of storedRows) {
+      const entry = plan.get(row.id);
+      if (!entry) continue;
+      const dbSources = parseSources(row.sources, row.source);
+      // Plan sources are a superset of the row's own, so a longer list means new sources were gained.
+      if (entry.sources.length === dbSources.length && entry.clusterId === row.cluster_id) continue;
+
+      const seenCount = row.seen_count || 1;
+      const importanceScore = rescoreWithSignals(
+        row.importance_score,
+        row.source_count || dbSources.length || 1,
+        seenCount,
+        entry.sources.length,
+        seenCount
+      );
+      clusterUpdates.push(env.news_db.prepare(
+        'UPDATE articles SET sources = ?1, source_count = ?2, importance_score = ?3, cluster_id = ?4, expires_at = ?5, last_seen_at = ?6 WHERE id = ?7'
+      ).bind(
+        JSON.stringify(entry.sources),
+        entry.sources.length,
+        importanceScore,
+        entry.clusterId,
+        computeExpiresAt(entry.sources, importanceScore, now, row.expires_at),
+        nowSql,
+        row.id
+      ));
+    }
+    if (clusterUpdates.length > 0) {
       await env.news_db.batch(clusterUpdates);
       stats.clustered = clusterUpdates.length;
     }
@@ -2065,8 +2238,27 @@ interface ExistingArticleRow {
 }
 
 interface RecentClusterRow extends ExistingArticleRow {
+  title: string;
+  summary: string | null;
+  created_at: string | null;
   cluster_id: string | null;
   embedding: string | null;
+}
+
+const RECENT_CLUSTER_COLUMNS = 'id, url, title, summary, source, sources, source_count, seen_count, importance_score, cluster_id, created_at, expires_at, embedding';
+
+// Adapts Workers AI text generation to the binding-free judge in dedup.ts.
+function completeWithWorkersAi(env: Bindings): TextCompletion {
+  return async (systemPrompt, userContent) => {
+    const res = await env.AI.run(DUPLICATE_JUDGE_MODEL, {
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userContent }
+      ],
+      max_tokens: DUPLICATE_JUDGE_MAX_TOKENS
+    });
+    return typeof res === 'object' && res !== null && 'response' in res ? res.response : undefined;
+  };
 }
 
 // Expired articles are removed unless liked; liked articles are kept indefinitely.

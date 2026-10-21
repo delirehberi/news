@@ -1,4 +1,8 @@
-.PHONY: test typecheck types setup init push-secrets worker-init db-init db-migrate db-migrate-local db-migrate-list db-migrate-create vectorize-init dev-worker dev-frontend frontend-build deploy-worker deploy video-init video-test video-typecheck video-draft video-approve video-produce video-auth
+# Re-clustering judges hundreds of candidate pairs with the LLM, so it can take several minutes.
+RECLUSTER_ENDPOINT ?= https://news.emre.xyz/api/admin/recluster
+RECLUSTER_TIMEOUT_SECONDS ?= 900
+
+.PHONY: recluster recluster-dry test typecheck types setup init push-secrets worker-init db-init db-migrate db-migrate-local db-migrate-list db-migrate-create vectorize-init dev-worker dev-frontend frontend-build deploy-worker deploy video-init video-test video-typecheck video-draft video-approve video-produce video-auth
 
 NVM_CMD=. ~/.nvm/nvm.sh && nvm use &&
 
@@ -92,6 +96,16 @@ ingest:
 	else \
 		curl -s "http://localhost:8787/api/admin/ingest" | jq . || curl -s "https://news.emre.xyz/api/admin/ingest" | jq .; \
 	fi
+
+recluster-dry:
+	@echo "Previewing duplicate re-clustering of live articles (no writes)..."
+	@if [ -z "$$INGESTION_SECRET" ]; then echo "INGESTION_SECRET must be set"; exit 1; fi
+	@curl -sS --fail-with-body --max-time $(RECLUSTER_TIMEOUT_SECONDS) -X POST -H "Authorization: Bearer $$INGESTION_SECRET" "$(RECLUSTER_ENDPOINT)?dryRun=1" | jq .
+
+recluster:
+	@echo "Re-clustering live articles and rewriting cluster_id/sources..."
+	@if [ -z "$$INGESTION_SECRET" ]; then echo "INGESTION_SECRET must be set"; exit 1; fi
+	@curl -sS --fail-with-body --max-time $(RECLUSTER_TIMEOUT_SECONDS) -X POST -H "Authorization: Bearer $$INGESTION_SECRET" "$(RECLUSTER_ENDPOINT)" | jq .
 
 types:
 	@echo "Regenerating Worker binding types from wrangler.jsonc..."

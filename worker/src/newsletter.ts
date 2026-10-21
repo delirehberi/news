@@ -530,7 +530,7 @@ export function extractBalancedJsonObjects(text: string): string[] {
   return objects;
 }
 
-function stripMarkdownCodeFences(raw: string): string {
+export function stripMarkdownCodeFences(raw: string): string {
   let trimmed = raw.trim();
   const fenceMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)(?:```|$)/i);
   if (fenceMatch && fenceMatch[1] && (fenceMatch[1].trim().startsWith('[') || fenceMatch[1].trim().startsWith('{'))) {

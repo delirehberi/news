@@ -19,7 +19,12 @@ export const AFFINITY_WEIGHT = 0.4;
 export const SAME_SOURCE_REPEAT_WEIGHT = 0.5;
 export const SCORE_DECIMALS = 2;
 
-export const CLUSTER_SIMILARITY_THRESHOLD = 0.82;
+// bge-base puts unrelated same-topic stories at 0.82-0.92, so cosine only nominates candidates;
+// an LLM judge confirms that a pair covers the same event before anything is merged.
+export const DUPLICATE_CANDIDATE_THRESHOLD = 0.88;
+export const DUPLICATE_MAX_MATCHES_PER_ARTICLE = 3;
+// Bounds LLM judge cost per ingestion run or re-cluster call.
+export const DUPLICATE_MAX_PAIRS_PER_RUN = 60;
 export const CLUSTER_LOOKBACK_HOURS = 48;
 // Bounds per-run CPU: new items x candidates x 768-dim dot products.
 export const CLUSTER_MAX_CANDIDATES = 300;
@@ -263,3 +268,209 @@ export function pickSnapshotCandidates<T extends SnapshotCandidate>(
   return candidates;
 }
 
+
+export interface EmbeddedArticle {
+  id: string;
+  url: string;
+  embedding: number[];
+}
+
+export interface DuplicateCandidate {
+  aId: string;
+  bId: string;
+  similarity: number;
+}
+
+export interface ConfirmedPair {
+  aId: string;
+  bId: string;
+}
+
+// Order-independent key so (a, b) and (b, a) describe the same pair.
+export function pairKey(aId: string, bId: string): string {
+  return aId < bId ? `${aId}|${bId}` : `${bId}|${aId}`;
+}
+
+/**
+ * Nominates likely duplicates of `items` within `pool` (which may include `items` themselves).
+ * Only each item's strongest neighbours are kept so one generic article cannot fan out across the pool.
+ * Same-URL pairs are skipped: URL deduplication already merges those before clustering.
+ */
+export function findDuplicateCandidates(
+  items: EmbeddedArticle[],
+  pool: EmbeddedArticle[],
+  threshold: number = DUPLICATE_CANDIDATE_THRESHOLD,
+  maxPerItem: number = DUPLICATE_MAX_MATCHES_PER_ARTICLE
+): DuplicateCandidate[] {
+  const byKey = new Map<string, DuplicateCandidate>();
+  for (const item of items) {
+    const matches: Array<{ other: EmbeddedArticle; similarity: number }> = [];
+    for (const other of pool) {
+      if (other.id === item.id || other.url === item.url) continue;
+      const similarity = cosineSimilarity(item.embedding, other.embedding);
+      if (similarity >= threshold) matches.push({ other, similarity });
+    }
+    matches.sort((a, b) => b.similarity - a.similarity);
+    for (const { other, similarity } of matches.slice(0, maxPerItem)) {
+      const key = pairKey(item.id, other.id);
+      if (!byKey.has(key)) byKey.set(key, { aId: item.id, bId: other.id, similarity });
+    }
+  }
+  return Array.from(byKey.values()).sort((a, b) => b.similarity - a.similarity);
+}
+
+export interface ClusterMember {
+  id: string;
+  cluster_id?: string | null;
+  created_at?: string | null;
+}
+
+function compareByFirstSeen(a: ClusterMember, b: ClusterMember): number {
+  const aTime = parseSqliteDateTime(a.created_at)?.getTime() ?? Number.MAX_SAFE_INTEGER;
+  const bTime = parseSqliteDateTime(b.created_at)?.getTime() ?? Number.MAX_SAFE_INTEGER;
+  return (aTime - bTime) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+}
+
+// The earliest sighting is the primary, so permalinks and redirects never flip as a cluster grows.
+export function pickClusterPrimary<T extends ClusterMember>(members: T[]): T | undefined {
+  return [...members].sort(compareByFirstSeen)[0];
+}
+
+/**
+ * Groups members connected by confirmed pairs or by an already shared cluster_id (union-find),
+ * and returns memberId -> clusterId for every member of a multi-member group.
+ * The oldest member's existing cluster_id is reused so stored clusters keep their id.
+ */
+export function assignClusters(members: ClusterMember[], confirmedPairs: ConfirmedPair[]): Map<string, string> {
+  const parent = new Map<string, string>();
+  for (const m of members) parent.set(m.id, m.id);
+
+  const find = (id: string): string => {
+    let root = id;
+    while (parent.get(root) !== root) root = parent.get(root)!;
+    let node = id;
+    while (node !== root) {
+      const next = parent.get(node)!;
+      parent.set(node, root);
+      node = next;
+    }
+    return root;
+  };
+  const union = (a: string, b: string): void => {
+    if (!parent.has(a) || !parent.has(b)) return;
+    const rootA = find(a);
+    const rootB = find(b);
+    if (rootA !== rootB) parent.set(rootB, rootA);
+  };
+
+  const firstByCluster = new Map<string, string>();
+  for (const m of members) {
+    if (!m.cluster_id) continue;
+    const first = firstByCluster.get(m.cluster_id);
+    if (first) union(first, m.id);
+    else firstByCluster.set(m.cluster_id, m.id);
+  }
+  for (const pair of confirmedPairs) union(pair.aId, pair.bId);
+
+  const groups = new Map<string, ClusterMember[]>();
+  for (const m of members) {
+    const root = find(m.id);
+    const group = groups.get(root);
+    if (group) group.push(m);
+    else groups.set(root, [m]);
+  }
+
+  const assignment = new Map<string, string>();
+  for (const group of groups.values()) {
+    if (group.length < 2) continue;
+    const ordered = [...group].sort(compareByFirstSeen);
+    const clusterId = ordered.find(m => m.cluster_id)?.cluster_id || `cluster-${ordered[0].id}`;
+    for (const m of group) assignment.set(m.id, clusterId);
+  }
+  return assignment;
+}
+
+export interface RelatedArticle {
+  id: string;
+  title: string;
+  url: string;
+  source: string;
+}
+
+export interface CollapsibleArticle extends ClusterMember {
+  title: string;
+  url: string;
+  source: string;
+  sources?: string[];
+  source_count?: number;
+}
+
+/**
+ * Collapses cluster members into one entry per story. Each cluster keeps the position of its
+ * best-ranked member (input order is the rank) but renders its stable primary, with the
+ * other members attached as `related` coverage.
+ */
+export function collapseClusters<T extends CollapsibleArticle>(ranked: T[]): Array<T & { related: RelatedArticle[] }> {
+  const groups = new Map<string, T[]>();
+  for (const article of ranked) {
+    if (!article.cluster_id) continue;
+    const group = groups.get(article.cluster_id);
+    if (group) group.push(article);
+    else groups.set(article.cluster_id, [article]);
+  }
+
+  const emitted = new Set<string>();
+  const result: Array<T & { related: RelatedArticle[] }> = [];
+  for (const article of ranked) {
+    const group = article.cluster_id ? groups.get(article.cluster_id) : undefined;
+    if (!group || group.length < 2) {
+      result.push({ ...article, related: [] });
+      continue;
+    }
+    if (emitted.has(article.cluster_id!)) continue;
+    emitted.add(article.cluster_id!);
+
+    const primary = pickClusterPrimary(group)!;
+    const sources = Array.from(new Set(group.flatMap(m => m.sources && m.sources.length > 0 ? m.sources : [m.source])));
+    result.push({
+      ...primary,
+      sources,
+      source_count: Math.max(primary.source_count ?? 0, sources.length),
+      related: group
+        .filter(m => m.id !== primary.id)
+        .map(m => ({ id: m.id, title: m.title, url: m.url, source: m.source }))
+    });
+  }
+  return result;
+}
+
+/**
+ * Feed ordering with duplicate stories collapsed. Hot ranking runs over the whole live set before
+ * collapsing so a cluster's lower-ranked members still attach as related coverage; the limit then
+ * applies to stories, not rows.
+ */
+export function collapseForFeed<T extends RankableArticle & CollapsibleArticle>(
+  articles: T[],
+  rankByHot: boolean,
+  now: Date,
+  limit: number = FEED_LIMIT
+): Array<T & { related: RelatedArticle[] }> {
+  const ordered: T[] = rankByHot ? rankHot(articles, now, articles.length) : articles;
+  return collapseClusters(ordered).slice(0, limit);
+}
+
+export type ClusterView<T> =
+  | { kind: 'render'; article: T & { related: RelatedArticle[] } }
+  | { kind: 'redirect'; primaryId: string };
+
+/**
+ * Decides how a permalink renders: the cluster's primary renders with its siblings as related
+ * coverage, and any other member redirects to it. `siblings` are the live cluster members; the
+ * requested article is always considered, so a lone or expired-sibling article renders as itself.
+ */
+export function resolveClusterView<T extends CollapsibleArticle>(article: T, siblings: T[]): ClusterView<T> {
+  const members = [article, ...siblings.filter(s => s.id !== article.id)];
+  const [story] = collapseClusters(members.map(m => ({ ...m, cluster_id: article.cluster_id })));
+  if (story.id !== article.id) return { kind: 'redirect', primaryId: story.id };
+  return { kind: 'render', article: story };
+}

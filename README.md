@@ -74,17 +74,28 @@ make deploy
 
 ## Routes & Endpoints
 - `GET /` — Server-side rendered news feed with filters (`?sort=hot|latest|digest`, `?source=hackernews|lobsters|reddit|stackernews|newsletter`).
-- `GET /article/:id` — SSR single-article permalink page with social card preview meta tags.
+- `GET /article/:id` — SSR single-article permalink page with social card preview meta tags. A secondary member of a duplicate cluster 302-redirects to the cluster's primary.
 - `GET /weekly` — Turkish SSR archive of approved and published weekly editions (`lang="tr"`).
 - `GET /weekly/:week` — Turkish SSR weekly edition page (`YYYY-Www`) with curated Turkish summaries and responsive YouTube video embed.
 - `GET /rss.xml` — Real-time RSS 2.0 feed of curated articles.
 - `GET /api/articles` — JSON API for articles.
 - `POST /api/articles/:id/like` — Like an article (anonymous or signed Nostr event).
 - `POST /api/articles/:id/dislike` — Curator dislike and AI negative taste embedding.
+- `POST /api/admin/recluster` — Admin-guarded rebuild of duplicate clusters for live articles (`?dryRun=1` previews without writing). Run via `make recluster-dry` / `make recluster`.
 - `POST /api/admin/weekly/snapshot` — Admin-guarded manual trigger to snapshot live top/liked stories into `weekly_candidates`.
 - `GET /api/admin/weekly/:week/candidates` — Admin-guarded candidate list for a given ISO week (`YYYY-Www`).
 - `GET /api/admin/weekly/:week` — Admin-guarded weekly edition state (`draft | approved | published`).
 - `PUT /api/admin/weekly/:week` — Admin-guarded weekly edition upsert with forward-only status transitions (`draft → approved → published`).
+
+## Duplicate Story Merging
+The same story often arrives from several sources under different titles and URLs (e.g. an HN post linking a mailing-list announcement and a Lobsters post linking the project blog). These are merged into one story:
+
+1. **Candidates**: during ingestion, cosine similarity of `bge-base` embeddings nominates pairs at or above `DUPLICATE_CANDIDATE_THRESHOLD` (0.88), keeping only each article's top `DUPLICATE_MAX_MATCHES_PER_ARTICLE` neighbours. Embeddings alone are not enough: unrelated same-topic stories (two different Bitcoin posts) score as high as true duplicates.
+2. **Confirmation**: a batched LLM judge (`worker/src/dedup.ts`) confirms that both entries report the same specific event. If the judge fails or returns malformed output, nothing is merged.
+3. **Clusters**: confirmed pairs share a `cluster_id` and the union of their `sources`, which feeds the cross-source importance boost.
+4. **Display**: the feed, RSS and JSON API show one entry per cluster. The primary is the earliest sighting, and the other members are listed as "Also on" links (discussion page and URL).
+
+`make recluster-dry` previews a full rebuild of live clusters, and `make recluster` applies it (both need `INGESTION_SECRET`; override `RECLUSTER_ENDPOINT` for local runs). A rebuild resets every live row to its own source before re-merging. A same-URL multi-source signal (one link posted on both HN and Lobsters) is therefore dropped until that URL is sighted again by ingestion.
 
 ## Weekly Turkish Video & Digest Pipeline (`video/`)
 

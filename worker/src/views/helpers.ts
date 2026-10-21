@@ -1,3 +1,7 @@
+import type { RelatedArticle } from '../scoring'
+
+export type { RelatedArticle }
+
 export interface ArticleModel {
   id: string;
   title: string;
@@ -16,6 +20,7 @@ export interface ArticleModel {
   seen_count?: number;
   last_seen_at?: string | null;
   expires_at?: string | null;
+  related?: RelatedArticle[];
 }
 
 export function formatTimestamp(isoString?: string | null): string {

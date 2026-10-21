@@ -1,13 +1,15 @@
 import type { FC } from 'hono/jsx'
 import { ArticleModel, formatTimestamp, getOriginalPostUrl, getSourceBadgeInfo, getDomain } from './helpers'
+import { RelatedCoverage } from './RelatedCoverage'
 
 interface ArticleCardProps {
   article: ArticleModel;
   index: number;
   initialOpen?: boolean;
+  showRelatedTitles?: boolean;
 }
 
-export const ArticleCard: FC<ArticleCardProps> = ({ article, index, initialOpen = false }) => {
+export const ArticleCard: FC<ArticleCardProps> = ({ article, index, initialOpen = false, showRelatedTitles = false }) => {
   const sources = Array.isArray(article.sources) && article.sources.length > 0
     ? article.sources
     : [article.source];
@@ -66,6 +68,7 @@ export const ArticleCard: FC<ArticleCardProps> = ({ article, index, initialOpen 
               </span>
             )}
           </h2>
+          <RelatedCoverage related={article.related} primaryUrl={article.url} showTitles={showRelatedTitles} />
         </div>
 
         {/* Right: Controls (Summary Accordion Toggle | Like Icon | Dislike Icon) */}

@@ -14,6 +14,14 @@ import {
   groupDigest,
   isoWeek,
   pickSnapshotCandidates,
+  findDuplicateCandidates,
+  assignClusters,
+  pickClusterPrimary,
+  collapseClusters,
+  collapseForFeed,
+  resolveClusterView,
+  pairKey,
+  DUPLICATE_CANDIDATE_THRESHOLD,
   HOT_PROMOTION_THRESHOLD,
   RETENTION_DAYS
 } from './scoring'
@@ -316,3 +324,166 @@ describe('pickSnapshotCandidates', () => {
   });
 });
 
+
+// Unit vectors at a chosen cosine to the x axis make similarities exact and readable.
+function vecAt(similarity: number): number[] {
+  return [similarity, Math.sqrt(1 - similarity * similarity), 0];
+}
+
+describe('findDuplicateCandidates', () => {
+  it('nominates pairs at or above the threshold and skips those below', () => {
+    const items = [{ id: 'a', url: 'https://a', embedding: [1, 0, 0] }];
+    const pool = [
+      { id: 'b', url: 'https://b', embedding: vecAt(DUPLICATE_CANDIDATE_THRESHOLD) },
+      { id: 'c', url: 'https://c', embedding: vecAt(DUPLICATE_CANDIDATE_THRESHOLD - 0.01) }
+    ];
+    const pairs = findDuplicateCandidates(items, pool);
+    expect(pairs.map(p => p.bId)).toEqual(['b']);
+  });
+
+  it('keeps only the strongest neighbours per item', () => {
+    const items = [{ id: 'a', url: 'https://a', embedding: [1, 0, 0] }];
+    const pool = [0.9, 0.95, 0.99, 0.93].map((s, i) => ({ id: `p${i}`, url: `https://p${i}`, embedding: vecAt(s) }));
+    const pairs = findDuplicateCandidates(items, pool, DUPLICATE_CANDIDATE_THRESHOLD, 2);
+    expect(pairs.map(p => p.bId)).toEqual(['p2', 'p1']);
+  });
+
+  it('skips self and same-URL matches and reports each pair once', () => {
+    const a = { id: 'a', url: 'https://same', embedding: [1, 0, 0] };
+    const b = { id: 'b', url: 'https://same', embedding: [1, 0, 0] };
+    const c = { id: 'c', url: 'https://c', embedding: [1, 0, 0] };
+    const pairs = findDuplicateCandidates([a, b, c], [a, b, c]);
+    expect(pairs.map(p => pairKey(p.aId, p.bId)).sort()).toEqual(['a|c', 'b|c']);
+  });
+
+  it('returns nothing for empty input', () => {
+    expect(findDuplicateCandidates([], [])).toEqual([]);
+  });
+});
+
+describe('assignClusters', () => {
+  const members = [
+    { id: 'a', created_at: '2026-10-21 01:00:00' },
+    { id: 'b', created_at: '2026-10-21 05:00:00' },
+    { id: 'c', created_at: '2026-10-21 06:00:00' }
+  ];
+
+  it('does not cluster anything without a confirmed pair', () => {
+    expect(assignClusters(members, []).size).toBe(0);
+  });
+
+  it('names a new cluster after its earliest member', () => {
+    const assignment = assignClusters(members, [{ aId: 'b', bId: 'a' }]);
+    expect(Object.fromEntries(assignment)).toEqual({ a: 'cluster-a', b: 'cluster-a' });
+  });
+
+  it('reuses the existing cluster id and pulls in its stored members', () => {
+    const stored = [
+      { id: 'a', created_at: '2026-10-21 01:00:00', cluster_id: 'cluster-old' },
+      { id: 'b', created_at: '2026-10-21 05:00:00', cluster_id: 'cluster-old' },
+      { id: 'c', created_at: '2026-10-21 06:00:00' }
+    ];
+    const assignment = assignClusters(stored, [{ aId: 'c', bId: 'b' }]);
+    expect(Object.fromEntries(assignment)).toEqual({ a: 'cluster-old', b: 'cluster-old', c: 'cluster-old' });
+  });
+
+  it('ignores pairs that reference unknown members', () => {
+    expect(assignClusters(members, [{ aId: 'a', bId: 'zzz' }]).size).toBe(0);
+  });
+});
+
+describe('pickClusterPrimary', () => {
+  it('picks the earliest sighting and breaks ties by id', () => {
+    expect(pickClusterPrimary([
+      { id: 'b', created_at: '2026-10-21 01:00:00' },
+      { id: 'a', created_at: '2026-10-21 01:00:00' },
+      { id: 'c', created_at: '2026-10-20 23:00:00' }
+    ])?.id).toBe('c');
+    expect(pickClusterPrimary([
+      { id: 'b', created_at: '2026-10-21 01:00:00' },
+      { id: 'a', created_at: '2026-10-21 01:00:00' }
+    ])?.id).toBe('a');
+  });
+
+  it('returns undefined for an empty cluster', () => {
+    expect(pickClusterPrimary([])).toBeUndefined();
+  });
+});
+
+describe('collapseClusters', () => {
+  const article = (id: string, created_at: string, cluster_id: string | null, source: string) => ({
+    id, created_at, cluster_id, source, sources: [source], source_count: 1, title: `t-${id}`, url: `https://${id}`
+  });
+
+  it('renders the primary at the best-ranked position with related coverage', () => {
+    const ranked = [
+      article('x', '2026-10-21 02:00:00', null, 'reddit'),
+      article('hn-1', '2026-10-21 05:00:00', 'cluster-php', 'hackernews'),
+      article('y', '2026-10-21 03:00:00', null, 'reddit'),
+      article('lobsters-1', '2026-10-21 01:00:00', 'cluster-php', 'lobsters')
+    ];
+    const collapsed = collapseClusters(ranked);
+    expect(collapsed.map(a => a.id)).toEqual(['x', 'lobsters-1', 'y']);
+    expect(collapsed[1].related).toEqual([{ id: 'hn-1', title: 't-hn-1', url: 'https://hn-1', source: 'hackernews' }]);
+    expect(collapsed[1].sources).toEqual(['hackernews', 'lobsters']);
+    expect(collapsed[1].source_count).toBe(2);
+  });
+
+  it('leaves a single live member of a cluster as a normal entry', () => {
+    const collapsed = collapseClusters([article('a', '2026-10-21 01:00:00', 'cluster-a', 'hackernews')]);
+    expect(collapsed).toEqual([{ ...article('a', '2026-10-21 01:00:00', 'cluster-a', 'hackernews'), related: [] }]);
+  });
+
+  it('returns an empty list for empty input', () => {
+    expect(collapseClusters([])).toEqual([]);
+  });
+});
+
+describe('collapseForFeed', () => {
+  const row = (id: string, created_at: string, importance_score: number, cluster_id: string | null) => ({
+    id, created_at, importance_score, cluster_id, source: 'hackernews', title: id, url: `https://${id}`
+  });
+
+  it('collapses a hot-ranked cluster into one story and limits by stories', () => {
+    const articles = [
+      row('hn-php', '2026-10-15 10:00:00', 10, 'cluster-php'),
+      row('lobsters-php', '2026-10-15 08:00:00', 1, 'cluster-php'),
+      row('other-1', '2026-10-15 09:00:00', 5, null),
+      row('other-2', '2026-10-15 09:30:00', 0.1, null)
+    ];
+    const feed = collapseForFeed(articles, true, NOW, 2);
+    expect(feed.map(a => a.id)).toEqual(['lobsters-php', 'other-1']);
+    expect(feed[0].related.map(r => r.id)).toEqual(['hn-php']);
+  });
+
+  it('keeps the given order when not ranking by hot', () => {
+    const articles = [row('b', '2026-10-15 09:00:00', 1, null), row('a', '2026-10-15 10:00:00', 1, null)];
+    expect(collapseForFeed(articles, false, NOW).map(a => a.id)).toEqual(['b', 'a']);
+  });
+});
+
+describe('resolveClusterView', () => {
+  const member = (id: string, created_at: string, cluster_id: string | null = 'cluster-php') => ({
+    id, created_at, cluster_id, source: id.split('-')[0], sources: [id.split('-')[0]], title: id, url: `https://${id}`
+  });
+  const lobsters = member('lobsters-ekxoyt', '2026-10-21 01:00:41');
+  const hn = member('hn-50172041', '2026-10-21 05:00:57');
+
+  it('redirects a secondary member to the primary', () => {
+    expect(resolveClusterView(hn, [lobsters, hn])).toEqual({ kind: 'redirect', primaryId: 'lobsters-ekxoyt' });
+  });
+
+  it('renders the primary with its siblings as related coverage', () => {
+    const view = resolveClusterView(lobsters, [lobsters, hn]);
+    expect(view.kind).toBe('render');
+    if (view.kind !== 'render') return;
+    expect(view.article.related.map(r => r.id)).toEqual(['hn-50172041']);
+    expect(view.article.sources).toEqual(['lobsters', 'hn']);
+  });
+
+  it('renders a lone member, or an unclustered article, as itself', () => {
+    expect(resolveClusterView(hn, [])).toEqual({ kind: 'render', article: { ...hn, related: [] } });
+    const solo = member('reddit-1', '2026-10-21 01:00:00', null);
+    expect(resolveClusterView(solo, [])).toEqual({ kind: 'render', article: { ...solo, related: [] } });
+  });
+});

@@ -39,7 +39,7 @@ export const ArticleDetailView: FC<ArticleDetailViewProps> = ({
 
       <main class="news-container pb-24">
         <div id="feed" class="flex flex-col gap-1.5">
-          <ArticleCard article={article} index={0} initialOpen={true} />
+          <ArticleCard article={article} index={0} initialOpen={true} showRelatedTitles={true} />
         </div>
       </main>
     </Layout>
