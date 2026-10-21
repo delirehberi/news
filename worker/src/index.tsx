@@ -1532,13 +1532,13 @@ async function reclusterLiveArticles(env: Bindings, dryRun: boolean, now: Date, 
   const rows = results || [];
 
   const embedded: EmbeddedArticle[] = rows
-    .map(row => ({ id: row.id, url: row.url, embedding: parseEmbedding(row.embedding) }))
-    .filter((r): r is EmbeddedArticle => r.embedding !== null);
+    .map(row => ({ id: row.id, url: row.url, source: row.source, created_at: row.created_at, embedding: parseEmbedding(row.embedding) }))
+    .filter((r): r is typeof r & { embedding: number[] } => r.embedding !== null);
   const allCandidates = findDuplicateCandidates(embedded, embedded);
   const candidates = allCandidates.slice(0, RECLUSTER_MAX_PAIRS);
 
   const judgeArticles = new Map<string, JudgeArticle>(
-    rows.map(row => [row.id, { id: row.id, title: row.title, url: row.url, summary: row.summary }])
+    rows.map(row => [row.id, { id: row.id, title: row.title, url: row.url, source: row.source, created_at: row.created_at, summary: row.summary }])
   );
   const confirmed = await confirmDuplicatesWithLLM(completeWithWorkersAi(env), candidates, judgeArticles, signal);
 
@@ -2060,10 +2060,10 @@ async function handleIngestion(env: Bindings, targetSource?: string) {
 
     const newEmbedded: EmbeddedArticle[] = filteredArticles
       .filter(a => Array.isArray(a.embedding))
-      .map(a => ({ id: a.id, url: a.url, embedding: a.embedding }));
+      .map(a => ({ id: a.id, url: a.url, source: a.source, created_at: nowSql, embedding: a.embedding }));
     const storedEmbedded: EmbeddedArticle[] = storedRows
-      .map(row => ({ id: row.id, url: row.url, embedding: parseEmbedding(row.embedding) }))
-      .filter((r): r is EmbeddedArticle => r.embedding !== null);
+      .map(row => ({ id: row.id, url: row.url, source: row.source, created_at: row.created_at, embedding: parseEmbedding(row.embedding) }))
+      .filter((r): r is typeof r & { embedding: number[] } => r.embedding !== null);
 
     const candidates = findDuplicateCandidates(newEmbedded, [...newEmbedded, ...storedEmbedded])
       .slice(0, DUPLICATE_MAX_PAIRS_PER_RUN);
@@ -2071,10 +2071,10 @@ async function handleIngestion(env: Bindings, targetSource?: string) {
 
     const judgeArticles = new Map<string, JudgeArticle>();
     for (const row of storedRows) {
-      judgeArticles.set(row.id, { id: row.id, title: row.title, url: row.url, summary: row.summary });
+      judgeArticles.set(row.id, { id: row.id, title: row.title, url: row.url, source: row.source, created_at: row.created_at, summary: row.summary });
     }
     for (const a of filteredArticles) {
-      judgeArticles.set(a.id, { id: a.id, title: a.title, url: a.url, summary: a.details?.description || a.summary });
+      judgeArticles.set(a.id, { id: a.id, title: a.title, url: a.url, source: a.source, created_at: nowSql, summary: a.details?.description || a.summary });
     }
 
     const confirmed = candidates.length > 0

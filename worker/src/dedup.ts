@@ -10,15 +10,20 @@ export const DUPLICATE_JUDGE_SNIPPET_CHARS = 300;
 export const DUPLICATE_JUDGE_MAX_TOKENS = 512;
 
 export const DUPLICATE_JUDGE_SYSTEM_PROMPT = `You deduplicate a tech news feed that aggregates Hacker News, Lobsters, Reddit, Stacker News and newsletters.
-For each numbered pair, decide whether both entries report the SAME specific event, announcement, release, incident or publication.
+For each numbered pair, decide whether both entries are the SAME news item: one specific event, announcement, release, incident or publication, covered twice.
 
-Mark a pair as duplicate only when a reader would see the second entry as the same news again, for example:
-- The same release announced on two sites ("PHP 8.5 security release" on php.net and on a mailing list).
-- Two write-ups of the same incident, vulnerability or launch.
+Mark a pair as duplicate ONLY when a reader would see the second entry as literally the same news again, for example:
+- One release announced on two sites ("Upcoming critical PHP security release" on php.net and on the PHP mailing list).
+- Two write-ups of one specific incident, vulnerability or launch, naming the same product and the same event.
 
-Do NOT mark as duplicate when the entries merely share a topic, technology, company or theme, for example:
-- Two different Bitcoin opinion pieces, two different Rust blog posts, or two different security bugs.
-- A news item and an unrelated discussion thread in the same community.
+These are NOT duplicates:
+- Different releases, models or products, even from the same company in the same week (two different Mistral models are two news items).
+- Releases or announcements from different companies, even when they are similar kinds of things.
+- Different people reporting or asking about similar problems (several users each posting about bot traffic).
+- Recurring threads with the same title posted on different days ("Daily Discussion Thread").
+- Entries that merely share a topic, technology, company or theme (two different Bitcoin opinion pieces).
+
+If you are not sure, it is NOT a duplicate.
 
 Return ONLY a valid JSON object listing the pair numbers that are duplicates.
 Format:
@@ -28,6 +33,8 @@ export interface JudgeArticle {
   id: string;
   title: string;
   url: string;
+  source: string;
+  created_at?: string | null;
   summary?: string | null;
 }
 
@@ -43,9 +50,11 @@ function domainOf(url: string): string {
   }
 }
 
-function describeForJudge(article: JudgeArticle): { title: string; domain: string; summary: string } {
+function describeForJudge(article: JudgeArticle): { title: string; source: string; posted: string; domain: string; summary: string } {
   return {
     title: article.title,
+    source: article.source,
+    posted: article.created_at || '',
     domain: domainOf(article.url),
     summary: (article.summary || '').trim().substring(0, DUPLICATE_JUDGE_SNIPPET_CHARS)
   };

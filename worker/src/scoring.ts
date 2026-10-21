@@ -25,6 +25,9 @@ export const DUPLICATE_CANDIDATE_THRESHOLD = 0.88;
 export const DUPLICATE_MAX_MATCHES_PER_ARTICLE = 3;
 // Bounds LLM judge cost per ingestion run or re-cluster call.
 export const DUPLICATE_MAX_PAIRS_PER_RUN = 60;
+// Cross-source coverage of one story lands within a day or two; a wider gap is a different event
+// (e.g. the same recurring "Daily Discussion Thread" title posted on another day).
+export const DUPLICATE_MAX_GAP_HOURS = 48;
 export const CLUSTER_LOOKBACK_HOURS = 48;
 // Bounds per-run CPU: new items x candidates x 768-dim dot products.
 export const CLUSTER_MAX_CANDIDATES = 300;
@@ -272,6 +275,8 @@ export function pickSnapshotCandidates<T extends SnapshotCandidate>(
 export interface EmbeddedArticle {
   id: string;
   url: string;
+  source: string;
+  created_at?: string | null;
   embedding: number[];
 }
 
@@ -291,10 +296,21 @@ export function pairKey(aId: string, bId: string): string {
   return aId < bId ? `${aId}|${bId}` : `${bId}|${aId}`;
 }
 
+function hoursApart(a?: string | null, b?: string | null): number | null {
+  const aTime = parseSqliteDateTime(a)?.getTime();
+  const bTime = parseSqliteDateTime(b)?.getTime();
+  if (aTime === undefined || bTime === undefined) return null;
+  return Math.abs(aTime - bTime) / MS_PER_HOUR;
+}
+
 /**
  * Nominates likely duplicates of `items` within `pool` (which may include `items` themselves).
  * Only each item's strongest neighbours are kept so one generic article cannot fan out across the pool.
- * Same-URL pairs are skipped: URL deduplication already merges those before clustering.
+ * Skipped pairs:
+ * - Same URL: URL deduplication already merges those before clustering.
+ * - Same source: two distinct posts on one site are different submissions (recurring threads,
+ *   different users reporting similar problems), and a true repost of one link is caught by URL.
+ * - Posted more than DUPLICATE_MAX_GAP_HOURS apart.
  */
 export function findDuplicateCandidates(
   items: EmbeddedArticle[],
@@ -306,7 +322,9 @@ export function findDuplicateCandidates(
   for (const item of items) {
     const matches: Array<{ other: EmbeddedArticle; similarity: number }> = [];
     for (const other of pool) {
-      if (other.id === item.id || other.url === item.url) continue;
+      if (other.id === item.id || other.url === item.url || other.source === item.source) continue;
+      const gap = hoursApart(item.created_at, other.created_at);
+      if (gap !== null && gap > DUPLICATE_MAX_GAP_HOURS) continue;
       const similarity = cosineSimilarity(item.embedding, other.embedding);
       if (similarity >= threshold) matches.push({ other, similarity });
     }
@@ -321,6 +339,7 @@ export function findDuplicateCandidates(
 
 export interface ClusterMember {
   id: string;
+  source?: string;
   cluster_id?: string | null;
   created_at?: string | null;
 }
@@ -340,6 +359,9 @@ export function pickClusterPrimary<T extends ClusterMember>(members: T[]): T | u
  * Groups members connected by confirmed pairs or by an already shared cluster_id (union-find),
  * and returns memberId -> clusterId for every member of a multi-member group.
  * The oldest member's existing cluster_id is reused so stored clusters keep their id.
+ * A confirmed pair is refused when it would put two members of the same source into one group:
+ * this stops one wrong verdict from chaining unrelated stories (A~B, B~C making A~C). Pairs are
+ * applied in the given order, so pass the strongest first.
  */
 export function assignClusters(members: ClusterMember[], confirmedPairs: ConfirmedPair[]): Map<string, string> {
   const parent = new Map<string, string>();
@@ -356,21 +378,30 @@ export function assignClusters(members: ClusterMember[], confirmedPairs: Confirm
     }
     return root;
   };
-  const union = (a: string, b: string): void => {
+  const sourcesByRoot = new Map<string, Set<string>>();
+  for (const m of members) sourcesByRoot.set(m.id, new Set(m.source ? [m.source] : []));
+
+  const union = (a: string, b: string, allowSourceOverlap: boolean): void => {
     if (!parent.has(a) || !parent.has(b)) return;
     const rootA = find(a);
     const rootB = find(b);
-    if (rootA !== rootB) parent.set(rootB, rootA);
+    if (rootA === rootB) return;
+    const sourcesA = sourcesByRoot.get(rootA)!;
+    const sourcesB = sourcesByRoot.get(rootB)!;
+    if (!allowSourceOverlap && [...sourcesB].some(source => sourcesA.has(source))) return;
+    parent.set(rootB, rootA);
+    for (const source of sourcesB) sourcesA.add(source);
   };
 
   const firstByCluster = new Map<string, string>();
   for (const m of members) {
     if (!m.cluster_id) continue;
     const first = firstByCluster.get(m.cluster_id);
-    if (first) union(first, m.id);
+    // Stored clusters were already confirmed; keep them whole.
+    if (first) union(first, m.id, true);
     else firstByCluster.set(m.cluster_id, m.id);
   }
-  for (const pair of confirmedPairs) union(pair.aId, pair.bId);
+  for (const pair of confirmedPairs) union(pair.aId, pair.bId, false);
 
   const groups = new Map<string, ClusterMember[]>();
   for (const m of members) {

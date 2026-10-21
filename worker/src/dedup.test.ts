@@ -11,17 +11,21 @@ import { DuplicateCandidate } from './scoring'
 const PHP_HN: JudgeArticle = {
   id: 'hn-50172041',
   title: 'Upcoming critical PHP security release',
-  url: 'https://news-web.php.net/php.announce/509'
+  url: 'https://news-web.php.net/php.announce/509',
+  source: 'hackernews',
+  created_at: '2026-10-21 05:00:57'
 };
 const PHP_LOBSTERS: JudgeArticle = {
   id: 'lobsters-ekxoyt',
   title: 'Upcoming Critical PHP Security Release',
-  url: 'https://www.php.net/archive/2026.php'
+  url: 'https://www.php.net/archive/2026.php',
+  source: 'lobsters'
 };
 const BITCOIN: JudgeArticle = {
   id: 'stacker-1',
   title: 'Is Bitcoin already freedom money?',
-  url: 'https://stacker.news/items/1'
+  url: 'https://stacker.news/items/1',
+  source: 'stackernews'
 };
 
 const ARTICLES = new Map([PHP_HN, PHP_LOBSTERS, BITCOIN].map(a => [a.id, a]));
@@ -60,7 +64,13 @@ describe('confirmDuplicatesWithLLM', () => {
     expect(confirmed).toEqual([{ aId: PHP_HN.id, bId: PHP_LOBSTERS.id }]);
 
     const payload = JSON.parse(complete.mock.calls[0][1]);
-    expect(payload[0].a).toEqual({ title: PHP_HN.title, domain: 'news-web.php.net', summary: '' });
+    expect(payload[0].a).toEqual({
+      title: PHP_HN.title,
+      source: 'hackernews',
+      posted: '2026-10-21 05:00:57',
+      domain: 'news-web.php.net',
+      summary: ''
+    });
     expect(payload[0].b.domain).toBe('php.net');
   });
 

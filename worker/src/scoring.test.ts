@@ -331,29 +331,45 @@ function vecAt(similarity: number): number[] {
 }
 
 describe('findDuplicateCandidates', () => {
+  const art = (id: string, source: string, embedding: number[], created_at?: string) => ({
+    id, url: `https://${id}`, source, embedding, created_at
+  });
+
   it('nominates pairs at or above the threshold and skips those below', () => {
-    const items = [{ id: 'a', url: 'https://a', embedding: [1, 0, 0] }];
+    const items = [art('a', 'hackernews', [1, 0, 0])];
     const pool = [
-      { id: 'b', url: 'https://b', embedding: vecAt(DUPLICATE_CANDIDATE_THRESHOLD) },
-      { id: 'c', url: 'https://c', embedding: vecAt(DUPLICATE_CANDIDATE_THRESHOLD - 0.01) }
+      art('b', 'lobsters', vecAt(DUPLICATE_CANDIDATE_THRESHOLD)),
+      art('c', 'lobsters', vecAt(DUPLICATE_CANDIDATE_THRESHOLD - 0.01))
     ];
-    const pairs = findDuplicateCandidates(items, pool);
-    expect(pairs.map(p => p.bId)).toEqual(['b']);
+    expect(findDuplicateCandidates(items, pool).map(p => p.bId)).toEqual(['b']);
   });
 
   it('keeps only the strongest neighbours per item', () => {
-    const items = [{ id: 'a', url: 'https://a', embedding: [1, 0, 0] }];
-    const pool = [0.9, 0.95, 0.99, 0.93].map((s, i) => ({ id: `p${i}`, url: `https://p${i}`, embedding: vecAt(s) }));
+    const items = [art('a', 'hackernews', [1, 0, 0])];
+    const pool = [0.9, 0.95, 0.99, 0.93].map((s, i) => art(`p${i}`, 'lobsters', vecAt(s)));
     const pairs = findDuplicateCandidates(items, pool, DUPLICATE_CANDIDATE_THRESHOLD, 2);
     expect(pairs.map(p => p.bId)).toEqual(['p2', 'p1']);
   });
 
   it('skips self and same-URL matches and reports each pair once', () => {
-    const a = { id: 'a', url: 'https://same', embedding: [1, 0, 0] };
-    const b = { id: 'b', url: 'https://same', embedding: [1, 0, 0] };
-    const c = { id: 'c', url: 'https://c', embedding: [1, 0, 0] };
+    const a = { ...art('a', 'hackernews', [1, 0, 0]), url: 'https://same' };
+    const b = { ...art('b', 'lobsters', [1, 0, 0]), url: 'https://same' };
+    const c = art('c', 'reddit', [1, 0, 0]);
     const pairs = findDuplicateCandidates([a, b, c], [a, b, c]);
     expect(pairs.map(p => pairKey(p.aId, p.bId)).sort()).toEqual(['a|c', 'b|c']);
+  });
+
+  it('never pairs two posts from the same source, such as recurring daily threads', () => {
+    const monday = art('stacker-1', 'stackernews', [1, 0, 0], '2026-10-19 08:00:00');
+    const tuesday = art('stacker-2', 'stackernews', [1, 0, 0], '2026-10-20 08:00:00');
+    expect(findDuplicateCandidates([monday], [monday, tuesday])).toEqual([]);
+  });
+
+  it('skips pairs posted more than DUPLICATE_MAX_GAP_HOURS apart', () => {
+    const early = art('hn-1', 'hackernews', [1, 0, 0], '2026-10-15 00:00:00');
+    const inWindow = art('lobsters-1', 'lobsters', [1, 0, 0], '2026-10-16 23:00:00');
+    const tooLate = art('reddit-1', 'reddit', [1, 0, 0], '2026-10-17 01:00:00');
+    expect(findDuplicateCandidates([early], [inWindow, tooLate]).map(p => p.bId)).toEqual(['lobsters-1']);
   });
 
   it('returns nothing for empty input', () => {
@@ -385,6 +401,23 @@ describe('assignClusters', () => {
     ];
     const assignment = assignClusters(stored, [{ aId: 'c', bId: 'b' }]);
     expect(Object.fromEntries(assignment)).toEqual({ a: 'cluster-old', b: 'cluster-old', c: 'cluster-old' });
+  });
+
+  it('refuses a confirmed pair that would chain two items of one source together', () => {
+    // Timestral (hn) ~ Clairic (reddit) ~ Voxtral (hn): the second verdict would put two HN posts in one story.
+    const chain = [
+      { id: 'hn-timestral', source: 'hackernews', created_at: '2026-10-20 10:00:00' },
+      { id: 'reddit-clairic', source: 'reddit', created_at: '2026-10-20 11:00:00' },
+      { id: 'hn-voxtral', source: 'hackernews', created_at: '2026-10-20 15:00:00' }
+    ];
+    const assignment = assignClusters(chain, [
+      { aId: 'hn-timestral', bId: 'reddit-clairic' },
+      { aId: 'reddit-clairic', bId: 'hn-voxtral' }
+    ]);
+    expect(Object.fromEntries(assignment)).toEqual({
+      'hn-timestral': 'cluster-hn-timestral',
+      'reddit-clairic': 'cluster-hn-timestral'
+    });
   });
 
   it('ignores pairs that reference unknown members', () => {
