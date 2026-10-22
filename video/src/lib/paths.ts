@@ -54,6 +54,7 @@ export interface WeekPaths {
   imagesDir: string;
   videoMp4: string;
   thumbnailPng: string;
+  uploadJson: string;
 }
 
 /**
@@ -77,6 +78,7 @@ export function getWeekPaths(week: string, outRoot: string = DEFAULT_OUT_ROOT): 
     imagesDir: path.join(dir, 'images'),
     videoMp4: path.join(dir, 'video.mp4'),
     thumbnailPng: path.join(dir, 'thumbnail.png'),
+    uploadJson: path.join(dir, 'upload.json'),
   };
 }
 

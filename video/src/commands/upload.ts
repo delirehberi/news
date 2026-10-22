@@ -13,7 +13,14 @@ import {
   type VideoTimeline,
   type WeeklyVideoProps,
 } from '../domain/timeline.ts';
-import { fileExists, getWeekPaths, isValidIsoWeek, readJson } from '../lib/paths.ts';
+import {
+  fileExists,
+  getWeekPaths,
+  isValidIsoWeek,
+  readJson,
+  writeJsonAtomic,
+  type WeekPaths,
+} from '../lib/paths.ts';
 import {
   createWorkerClient,
   type WeeklyEdition,
@@ -269,6 +276,149 @@ async function loadAudioSegmentsForTimeline(
   return segments;
 }
 
+/**
+ * Local record of a finished YouTube upload (`out/<week>/upload.json`). It is written
+ * before any Worker call, so the video ID survives a failed PUT or an aborted run.
+ */
+const UploadReceiptSchema = z.object({
+  video_id: z.string().trim().min(1),
+  uploaded_at: z.string().min(1),
+  thumbnail_set: z.boolean(),
+});
+
+export type UploadReceipt = z.infer<typeof UploadReceiptSchema>;
+
+async function readUploadReceipt(filePath: string): Promise<UploadReceipt | null> {
+  if (!(await fileExists(filePath))) {
+    return null;
+  }
+
+  const raw = await readJson<unknown>(filePath);
+  const parsed = UploadReceiptSchema.safeParse(raw);
+  if (!parsed.success) {
+    const details = parsed.error.issues
+      .map((i) => `${i.path.join('.') || '<root>'}: ${i.message}`)
+      .join('; ');
+    // Ignoring a corrupt receipt could upload a duplicate video, so stop instead.
+    throw new Error(
+      `Invalid upload receipt in ${filePath}: ${details}. Check YouTube Studio for an existing upload of this week before fixing or removing the file.`
+    );
+  }
+
+  return parsed.data;
+}
+
+/**
+ * Picks the video ID of a previous upload from the Worker edition or the local receipt.
+ * Throws if both exist and disagree, because guessing could publish the wrong video.
+ */
+function resolveExistingVideoId(
+  editionVideoId: string | null,
+  receipt: UploadReceipt | null,
+  receiptPath: string
+): string | null {
+  const receiptVideoId = receipt?.video_id ?? null;
+  if (editionVideoId && receiptVideoId && editionVideoId !== receiptVideoId) {
+    throw new Error(
+      `YouTube video ID mismatch: the Worker edition has "${editionVideoId}" but ${receiptPath} has "${receiptVideoId}". Resolve it by hand before running "upload" again.`
+    );
+  }
+  return editionVideoId ?? receiptVideoId;
+}
+
+interface FinishUploadOptions {
+  ctx: CommandContext;
+  paths: WeekPaths;
+  workerClient: WorkerClient;
+  stdout: (msg: string) => void;
+  edition: WeeklyEdition;
+  videoId: string;
+  receipt: UploadReceipt;
+  getAccessToken: () => Promise<string>;
+  fetchImpl?: typeof fetch;
+}
+
+interface FinishUploadResult {
+  edition: WeeklyEdition;
+  thumbnailSet: boolean;
+}
+
+async function putEditionOrExplain(
+  options: FinishUploadOptions,
+  payload: { youtube_video_id?: string; status?: 'published' },
+  action: string
+): Promise<WeeklyEdition> {
+  const { ctx, paths, workerClient, videoId } = options;
+  try {
+    return await workerClient.putEdition(ctx.week, payload, ctx.signal);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `Failed to ${action} for edition ${ctx.week}: ${message}. YouTube video ${videoId} is saved in ${paths.uploadJson}; run "upload" again to finish without uploading the video again.`,
+      { cause: err }
+    );
+  }
+}
+
+/**
+ * Sets the custom thumbnail. A failure is only a warning: YouTube returns 403 for
+ * channels that are not verified, and that must not block publishing the edition.
+ * Cancellation is still propagated.
+ */
+async function trySetThumbnail(options: FinishUploadOptions): Promise<boolean> {
+  const { ctx, paths, stdout, videoId } = options;
+  const accessToken = await options.getAccessToken();
+
+  stdout(`Setting custom thumbnail ${paths.thumbnailPng} on YouTube video ${videoId}...`);
+  try {
+    await setVideoThumbnail({
+      accessToken,
+      videoId,
+      thumbnailPath: paths.thumbnailPng,
+      signal: ctx.signal,
+      fetchImpl: options.fetchImpl,
+    });
+    return true;
+  } catch (err) {
+    if (ctx.signal.aborted) {
+      throw err;
+    }
+    const message = err instanceof Error ? err.message : String(err);
+    stdout(
+      `Warning: could not set the custom thumbnail on YouTube video ${videoId}: ${message}. Continuing without it.`
+    );
+    return false;
+  }
+}
+
+/**
+ * Finishes an upload whose video ID is already known: saves the ID on the Worker if it
+ * is missing there, sets the thumbnail if it is not set yet, and publishes the edition last.
+ */
+async function finishUpload(options: FinishUploadOptions): Promise<FinishUploadResult> {
+  const { paths, videoId } = options;
+  let edition = options.edition;
+  let receipt = options.receipt;
+
+  if (edition.youtube_video_id?.trim() !== videoId) {
+    edition = await putEditionOrExplain(
+      options,
+      { youtube_video_id: videoId },
+      'save the YouTube video ID on the Worker'
+    );
+  }
+
+  if (!receipt.thumbnail_set) {
+    const thumbnailSet = await trySetThumbnail(options);
+    receipt = { ...receipt, thumbnail_set: thumbnailSet };
+    await writeJsonAtomic(paths.uploadJson, receipt);
+  }
+
+  edition = await putEditionOrExplain(options, { status: 'published' }, 'publish');
+
+  return { edition, thumbnailSet: receipt.thumbnail_set };
+}
+
 export interface UploadCommandDeps {
   workerClient?: WorkerClient;
   outRoot?: string;
@@ -283,6 +433,7 @@ export interface UploadCommandResult {
   edition: WeeklyEdition;
   metadata?: YouTubeVideoMetadata;
   chapters?: YouTubeChapter[];
+  thumbnailSet?: boolean;
 }
 
 /**
@@ -291,7 +442,14 @@ export interface UploadCommandResult {
  * source links, and `/weekly/<week>` URL), then marks the weekly edition as `published`
  * with `youtube_video_id`.
  *
- * Idempotent: if the edition already has `youtube_video_id`, exits without uploading again.
+ * Steps, in order: upload the video, write `out/<week>/upload.json`, save
+ * `youtube_video_id` on the Worker (status stays `approved`), set the thumbnail
+ * (a failure only warns), and set `status: 'published'` last.
+ *
+ * Idempotent:
+ * - A `published` edition with `youtube_video_id` exits without doing anything.
+ * - If a video ID is known from the edition or from `upload.json`, the video is never
+ *   uploaded again; only the missing steps (Worker ID, thumbnail, publish) are run.
  */
 export async function runUploadCommand(
   ctx: CommandContext,
@@ -315,16 +473,71 @@ export async function runUploadCommand(
     ctx.signal
   );
 
-  const existingVideoId = existingEdition.youtube_video_id?.trim();
-  if (existingVideoId) {
+  const editionVideoId = existingEdition.youtube_video_id?.trim() || null;
+  if (editionVideoId && existingEdition.status === 'published') {
     stdout(
-      `Edition ${ctx.week} already has YouTube video ID "${existingVideoId}" (status: "${existingEdition.status}"). Skipping upload.`
+      `Edition ${ctx.week} already has YouTube video ID "${editionVideoId}" (status: "${existingEdition.status}"). Skipping upload.`
     );
     return {
       skipped: true,
-      videoId: existingVideoId,
+      videoId: editionVideoId,
       privacyStatus: ctx.env.YOUTUBE_PRIVACY,
       edition: existingEdition,
+    };
+  }
+
+  let cachedAccessToken: string | null = null;
+  const getAccessToken = async (): Promise<string> => {
+    if (cachedAccessToken) return cachedAccessToken;
+    const env = requireYouTubeUploadEnv(ctx.env);
+    stdout(`Exchanging YouTube OAuth refresh token for access token...`);
+    cachedAccessToken = await exchangeRefreshTokenForAccessToken({
+      clientId: env.YOUTUBE_CLIENT_ID,
+      clientSecret: env.YOUTUBE_CLIENT_SECRET,
+      refreshToken: env.YOUTUBE_REFRESH_TOKEN,
+      signal: ctx.signal,
+      fetchImpl: deps.fetchImpl,
+    });
+    return cachedAccessToken;
+  };
+
+  const existingReceipt = await readUploadReceipt(paths.uploadJson);
+  const resumeVideoId = resolveExistingVideoId(
+    editionVideoId,
+    existingReceipt,
+    paths.uploadJson
+  );
+
+  if (resumeVideoId) {
+    stdout(
+      `YouTube video "${resumeVideoId}" was already uploaded for ${ctx.week}. Finishing the remaining steps without uploading again.`
+    );
+    // No receipt means the ID came from the Worker only, so the thumbnail state is unknown and is retried.
+    const receipt: UploadReceipt = existingReceipt ?? {
+      video_id: resumeVideoId,
+      uploaded_at: existingEdition.updated_at,
+      thumbnail_set: false,
+    };
+
+    const finished = await finishUpload({
+      ctx,
+      paths,
+      workerClient,
+      stdout,
+      edition: existingEdition,
+      videoId: resumeVideoId,
+      receipt,
+      getAccessToken,
+      fetchImpl: deps.fetchImpl,
+    });
+
+    stdout(`Published edition ${ctx.week} with YouTube video ${resumeVideoId} at /weekly/${ctx.week}.`);
+    return {
+      skipped: false,
+      videoId: resumeVideoId,
+      privacyStatus: ctx.env.YOUTUBE_PRIVACY,
+      edition: finished.edition,
+      thumbnailSet: finished.thumbnailSet,
     };
   }
 
@@ -452,14 +665,7 @@ export async function runUploadCommand(
     privacyStatus: uploadEnv.YOUTUBE_PRIVACY,
   };
 
-  stdout(`Exchanging YouTube OAuth refresh token for access token...`);
-  const accessToken = await exchangeRefreshTokenForAccessToken({
-    clientId: uploadEnv.YOUTUBE_CLIENT_ID,
-    clientSecret: uploadEnv.YOUTUBE_CLIENT_SECRET,
-    refreshToken: uploadEnv.YOUTUBE_REFRESH_TOKEN,
-    signal: ctx.signal,
-    fetchImpl: deps.fetchImpl,
-  });
+  const accessToken = await getAccessToken();
 
   stdout(
     `Uploading ${paths.videoMp4} to YouTube (privacy: ${metadata.privacyStatus}, ${chapters.length} chapter(s))...`
@@ -472,23 +678,26 @@ export async function runUploadCommand(
     fetchImpl: deps.fetchImpl,
   });
 
-  stdout(`Setting custom thumbnail ${paths.thumbnailPng} on YouTube video ${videoId}...`);
-  await setVideoThumbnail({
-    accessToken,
+  // Save the ID locally before any other call, so no later failure can cause a duplicate upload.
+  const receipt: UploadReceipt = {
+    video_id: videoId,
+    uploaded_at: new Date().toISOString(),
+    thumbnail_set: false,
+  };
+  await writeJsonAtomic(paths.uploadJson, receipt);
+  stdout(`Saved YouTube video ID ${videoId} to ${paths.uploadJson}.`);
+
+  const finished = await finishUpload({
+    ctx,
+    paths,
+    workerClient,
+    stdout,
+    edition: existingEdition,
     videoId,
-    thumbnailPath: paths.thumbnailPng,
-    signal: ctx.signal,
+    receipt,
+    getAccessToken,
     fetchImpl: deps.fetchImpl,
   });
-
-  const updatedEdition = await workerClient.putEdition(
-    ctx.week,
-    {
-      youtube_video_id: videoId,
-      status: 'published',
-    },
-    ctx.signal
-  );
 
   stdout(
     `Uploaded YouTube video ${videoId} (${metadata.privacyStatus}) and published edition ${ctx.week} at /weekly/${ctx.week}.`
@@ -498,9 +707,10 @@ export async function runUploadCommand(
     skipped: false,
     videoId,
     privacyStatus: metadata.privacyStatus,
-    edition: updatedEdition,
+    edition: finished.edition,
     metadata,
     chapters,
+    thumbnailSet: finished.thumbnailSet,
   };
 }
 

@@ -4,7 +4,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { VideoEnv } from '../config/env.ts';
 import { buildVideoTimeline, VIDEO_FPS, type WeeklyVideoProps } from '../domain/timeline.ts';
-import { getWeekPaths, writeJsonAtomic } from '../lib/paths.ts';
+import { getWeekPaths, readJson, writeJsonAtomic } from '../lib/paths.ts';
 import type { WeeklyEdition, WorkerClient } from '../lib/workerClient.ts';
 import {
   buildYouTubeChapters,
@@ -355,15 +355,26 @@ describe('src/commands/upload.ts', () => {
       expect(result.metadata?.description).toContain('00:10 Birinci Haber Başlığı');
       expect(result.metadata?.description).toContain('https://news.emre.xyz/weekly/2026-W42');
 
-      expect(workerClient.putEdition).toHaveBeenCalledTimes(1);
-      expect(workerClient.putEdition).toHaveBeenCalledWith(
+      expect(result.thumbnailSet).toBe(true);
+
+      expect(workerClient.putEdition).toHaveBeenCalledTimes(2);
+      expect(workerClient.putEdition).toHaveBeenNthCalledWith(
+        1,
         '2026-W42',
-        {
-          youtube_video_id: 'dQw4w9WgXcQ',
-          status: 'published',
-        },
+        { youtube_video_id: 'dQw4w9WgXcQ' },
         controller.signal
       );
+      expect(workerClient.putEdition).toHaveBeenNthCalledWith(
+        2,
+        '2026-W42',
+        { status: 'published' },
+        controller.signal
+      );
+
+      const receipt = await readJson<Record<string, unknown>>(
+        getWeekPaths('2026-W42', tempDir).uploadJson
+      );
+      expect(receipt).toMatchObject({ video_id: 'dQw4w9WgXcQ', thumbnail_set: true });
     });
 
     it('is idempotent: exits without uploading again if the edition already has a youtube_video_id', async () => {
@@ -402,6 +413,240 @@ describe('src/commands/upload.ts', () => {
       expect(mockFetch).not.toHaveBeenCalled();
       expect(workerClient.putEdition).not.toHaveBeenCalled();
       expect(lines.join('\n')).toContain('already has YouTube video ID "existing_yt_id_123"');
+    });
+
+    const UPLOADED_VIDEO_ID = 'dQw4w9WgXcQ';
+    const TOKEN_URL = 'https://oauth2.googleapis.com/token';
+    const HTTP_FORBIDDEN = 403;
+
+    function makeYouTubeFetch(options: { thumbnailStatus?: number } = {}) {
+      const thumbnailStatus = options.thumbnailStatus ?? 200;
+      const sessionUri =
+        'https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&upload_id=sess-42';
+
+      return vi.fn().mockImplementation(async (url: string, init?: RequestInit) => {
+        if (url === TOKEN_URL) {
+          return new Response(
+            JSON.stringify({ access_token: 'ya29.upload-token', expires_in: 3600 }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        if (url.includes('part=snippet%2Cstatus') || url.includes('part=snippet,status')) {
+          return new Response('', { status: 200, headers: { Location: sessionUri } });
+        }
+        if (url === sessionUri) {
+          if (init?.body) {
+            await new Response(init.body as BodyInit).arrayBuffer();
+          }
+          return new Response(JSON.stringify({ id: UPLOADED_VIDEO_ID }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        if (url.includes('thumbnails/set')) {
+          if (init?.body) {
+            await new Response(init.body as BodyInit).arrayBuffer();
+          }
+          const body =
+            thumbnailStatus === 200
+              ? { items: [{}] }
+              : { error: { code: thumbnailStatus, message: 'Thumbnails not allowed' } };
+          return new Response(JSON.stringify(body), {
+            status: thumbnailStatus,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        throw new Error(`Unexpected fetch URL: ${url}`);
+      });
+    }
+
+    function calledUrls(mockFetch: ReturnType<typeof vi.fn>): string[] {
+      return mockFetch.mock.calls.map(([url]) => String(url));
+    }
+
+    function countVideoUploadCalls(mockFetch: ReturnType<typeof vi.fn>): number {
+      return calledUrls(mockFetch).filter(
+        (url) => url.includes('part=snippet') || url.includes('upload_id=')
+      ).length;
+    }
+
+    function makeEchoWorkerClient(edition: WeeklyEdition): WorkerClient {
+      let current = edition;
+      return {
+        getCandidates: vi.fn(),
+        getEdition: vi.fn().mockImplementation(async () => current),
+        putEdition: vi.fn().mockImplementation(async (_week, payload) => {
+          current = {
+            ...current,
+            ...(payload.youtube_video_id !== undefined
+              ? { youtube_video_id: payload.youtube_video_id }
+              : {}),
+            ...(payload.status !== undefined ? { status: payload.status } : {}),
+          };
+          return current;
+        }),
+        triggerSnapshot: vi.fn(),
+      };
+    }
+
+    it('saves the video ID and still publishes when the thumbnail upload is rejected', async () => {
+      await seedRenderedWeekFiles('2026-W42');
+      const controller = new AbortController();
+      const lines: string[] = [];
+      const mockFetch = makeYouTubeFetch({ thumbnailStatus: HTTP_FORBIDDEN });
+      const workerClient = makeEchoWorkerClient(makeApprovedEdition());
+
+      const result = await runUploadCommand(
+        { week: '2026-W42', env: makeUploadEnv(), signal: controller.signal },
+        { workerClient, outRoot: tempDir, fetchImpl: mockFetch, stdout: (msg) => lines.push(msg) }
+      );
+
+      expect(result.videoId).toBe(UPLOADED_VIDEO_ID);
+      expect(result.thumbnailSet).toBe(false);
+      expect(result.edition.status).toBe('published');
+      expect(result.edition.youtube_video_id).toBe(UPLOADED_VIDEO_ID);
+      expect(lines.join('\n')).toContain('Warning: could not set the custom thumbnail');
+
+      const receipt = await readJson<Record<string, unknown>>(
+        getWeekPaths('2026-W42', tempDir).uploadJson
+      );
+      expect(receipt).toMatchObject({ video_id: UPLOADED_VIDEO_ID, thumbnail_set: false });
+    });
+
+    it('keeps the video ID when the Worker PUT fails and does not upload again on re-run', async () => {
+      await seedRenderedWeekFiles('2026-W42');
+      const controller = new AbortController();
+      const mockFetch = makeYouTubeFetch();
+      const workerClient = makeEchoWorkerClient(makeApprovedEdition());
+      vi.mocked(workerClient.putEdition).mockRejectedValueOnce(new Error('Worker unavailable'));
+
+      await expect(
+        runUploadCommand(
+          { week: '2026-W42', env: makeUploadEnv(), signal: controller.signal },
+          { workerClient, outRoot: tempDir, fetchImpl: mockFetch, stdout: () => undefined }
+        )
+      ).rejects.toThrowError(/Worker unavailable.*upload\.json.*run "upload" again/s);
+
+      expect(countVideoUploadCalls(mockFetch)).toBe(2);
+      const receipt = await readJson<Record<string, unknown>>(
+        getWeekPaths('2026-W42', tempDir).uploadJson
+      );
+      expect(receipt).toMatchObject({ video_id: UPLOADED_VIDEO_ID, thumbnail_set: false });
+
+      const rerunFetch = makeYouTubeFetch();
+      const result = await runUploadCommand(
+        { week: '2026-W42', env: makeUploadEnv(), signal: controller.signal },
+        { workerClient, outRoot: tempDir, fetchImpl: rerunFetch, stdout: () => undefined }
+      );
+
+      expect(countVideoUploadCalls(rerunFetch)).toBe(0);
+      expect(calledUrls(rerunFetch).some((url) => url.includes('thumbnails/set'))).toBe(true);
+      expect(result.skipped).toBe(false);
+      expect(result.videoId).toBe(UPLOADED_VIDEO_ID);
+      expect(result.edition.status).toBe('published');
+      expect(result.edition.youtube_video_id).toBe(UPLOADED_VIDEO_ID);
+    });
+
+    it('re-run on an approved edition that already has a video ID only retries the thumbnail and publishes', async () => {
+      const controller = new AbortController();
+      await fs.mkdir(getWeekPaths('2026-W42', tempDir).dir, { recursive: true });
+      await fs.writeFile(
+        getWeekPaths('2026-W42', tempDir).thumbnailPng,
+        Buffer.from('FAKE_PNG_DATA_BYTES')
+      );
+      const mockFetch = makeYouTubeFetch();
+      const workerClient = makeEchoWorkerClient(
+        makeApprovedEdition({ youtube_video_id: UPLOADED_VIDEO_ID })
+      );
+
+      const result = await runUploadCommand(
+        { week: '2026-W42', env: makeUploadEnv(), signal: controller.signal },
+        { workerClient, outRoot: tempDir, fetchImpl: mockFetch, stdout: () => undefined }
+      );
+
+      expect(countVideoUploadCalls(mockFetch)).toBe(0);
+      expect(calledUrls(mockFetch).filter((url) => url.includes('thumbnails/set'))).toHaveLength(1);
+      expect(workerClient.putEdition).toHaveBeenCalledTimes(1);
+      expect(workerClient.putEdition).toHaveBeenCalledWith(
+        '2026-W42',
+        { status: 'published' },
+        controller.signal
+      );
+      expect(result.thumbnailSet).toBe(true);
+      expect(result.edition.status).toBe('published');
+    });
+
+    it('does not call YouTube again when the receipt says the thumbnail is already set', async () => {
+      const controller = new AbortController();
+      await writeJsonAtomic(getWeekPaths('2026-W42', tempDir).uploadJson, {
+        video_id: UPLOADED_VIDEO_ID,
+        uploaded_at: '2026-10-20T18:00:00.000Z',
+        thumbnail_set: true,
+      });
+      const mockFetch = makeYouTubeFetch();
+      const workerClient = makeEchoWorkerClient(makeApprovedEdition());
+
+      const result = await runUploadCommand(
+        {
+          week: '2026-W42',
+          env: makeUploadEnv({ YOUTUBE_REFRESH_TOKEN: undefined }),
+          signal: controller.signal,
+        },
+        { workerClient, outRoot: tempDir, fetchImpl: mockFetch, stdout: () => undefined }
+      );
+
+      expect(mockFetch).not.toHaveBeenCalled();
+      expect(workerClient.putEdition).toHaveBeenNthCalledWith(
+        1,
+        '2026-W42',
+        { youtube_video_id: UPLOADED_VIDEO_ID },
+        controller.signal
+      );
+      expect(workerClient.putEdition).toHaveBeenNthCalledWith(
+        2,
+        '2026-W42',
+        { status: 'published' },
+        controller.signal
+      );
+      expect(result.thumbnailSet).toBe(true);
+      expect(result.edition.status).toBe('published');
+    });
+
+    it('refuses to continue when the edition and the receipt have different video IDs', async () => {
+      const controller = new AbortController();
+      await writeJsonAtomic(getWeekPaths('2026-W42', tempDir).uploadJson, {
+        video_id: 'otherVideo1',
+        uploaded_at: '2026-10-20T18:00:00.000Z',
+        thumbnail_set: true,
+      });
+      const mockFetch = makeYouTubeFetch();
+      const workerClient = makeEchoWorkerClient(
+        makeApprovedEdition({ youtube_video_id: UPLOADED_VIDEO_ID })
+      );
+
+      await expect(
+        runUploadCommand(
+          { week: '2026-W42', env: makeUploadEnv(), signal: controller.signal },
+          { workerClient, outRoot: tempDir, fetchImpl: mockFetch, stdout: () => undefined }
+        )
+      ).rejects.toThrowError(/video ID mismatch/);
+      expect(mockFetch).not.toHaveBeenCalled();
+      expect(workerClient.putEdition).not.toHaveBeenCalled();
+    });
+
+    it('refuses to continue when the upload receipt is malformed', async () => {
+      const controller = new AbortController();
+      await writeJsonAtomic(getWeekPaths('2026-W42', tempDir).uploadJson, { video_id: '' });
+      const mockFetch = makeYouTubeFetch();
+      const workerClient = makeEchoWorkerClient(makeApprovedEdition());
+
+      await expect(
+        runUploadCommand(
+          { week: '2026-W42', env: makeUploadEnv(), signal: controller.signal },
+          { workerClient, outRoot: tempDir, fetchImpl: mockFetch, stdout: () => undefined }
+        )
+      ).rejects.toThrowError(/Invalid upload receipt/);
+      expect(mockFetch).not.toHaveBeenCalled();
     });
 
     it('refuses to run if the edition is still draft', async () => {

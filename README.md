@@ -141,7 +141,7 @@ All `video-*` targets default to the **previous ISO week in UTC** (`YYYY-Www`). 
 - `make video-produce [WEEK=YYYY-Www]` — Run the production stage (`voice` → `render` → `upload`):
   - `voice`: Synthesizes per-segment Turkish audio (`audio/<n>.mp3`) and word/caption timings (`audio/<n>.json`), caching segments by SHA-256 `narration_hash`.
   - `render`: Downloads story OG images (with branded card fallback) and renders `video.mp4` + `thumbnail.png` via Remotion.
-  - `upload`: Streams `video.mp4` (resumable upload) and `thumbnail.png` to YouTube with Turkish chapters (`00:00` first) and source links, then marks the edition `status: "published"` with `youtube_video_id` (idempotent on re-runs).
+  - `upload`: Streams `video.mp4` (resumable upload) and `thumbnail.png` to YouTube with Turkish chapters (`00:00` first) and source links, saves the video ID to `out/<week>/upload.json` and the edition, sets the thumbnail (a failure, e.g. 403 on unverified channels, only warns), and marks the edition `status: "published"` last. Re-runs never upload the video twice: they only finish the missing steps.
 - `make video-typecheck` — Run `tsc --noEmit` on the `video/` package.
 - `make video-test` — Run Vitest unit and end-to-end tests in `video/`.
 

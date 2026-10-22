@@ -46,6 +46,7 @@ describe('src/lib/paths.ts', () => {
     expect(paths.imagesDir).toBe('/tmp/video-out/2026-W42/images');
     expect(paths.videoMp4).toBe('/tmp/video-out/2026-W42/video.mp4');
     expect(paths.thumbnailPng).toBe('/tmp/video-out/2026-W42/thumbnail.png');
+    expect(paths.uploadJson).toBe('/tmp/video-out/2026-W42/upload.json');
 
     expect(() => getWeekPaths('bad-week', '/tmp/video-out')).toThrowError(
       /Invalid ISO week format/
