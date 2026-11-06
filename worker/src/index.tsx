@@ -46,10 +46,12 @@ import {
 import {
   GMAIL_MAX_LIST_RESULTS,
   GMAIL_MAX_MESSAGES_PER_RUN,
+  GMAIL_MAX_PREVIEW_MESSAGES,
   NEWSLETTER_MARKDOWN_MAX_CHARS,
   NEWSLETTER_DECOMPOSE_MAX_TOKENS,
   MAX_REDIRECT_RESOLVES_PER_RUN,
   CURATION_BATCH_SIZE,
+  GmailFetchOptions,
   unwrapTrackingUrl,
   normalizeUrl,
   isOpaqueRedirectUrl,
@@ -2339,7 +2341,10 @@ async function fetchRedditPosts(env: Bindings) {
   return articles;
 }
 
-async function fetchGmailNewsletters(env: Bindings): Promise<{
+export async function fetchGmailNewsletters(
+  env: Bindings,
+  options: GmailFetchOptions = {}
+): Promise<{
   id: string;
   title: string;
   url: string;
@@ -2348,6 +2353,8 @@ async function fetchGmailNewsletters(env: Bindings): Promise<{
   summary?: string;
   details?: ScrapedDetails;
 }[]> {
+  const mode = options.mode ?? 'ingest';
+  const isPreview = mode === 'preview';
   const articles: {
     id: string;
     title: string;
@@ -2390,7 +2397,7 @@ async function fetchGmailNewsletters(env: Bindings): Promise<{
   const listedMessages: Array<{ id: string }> = searchData.messages || [];
 
   let messages = listedMessages;
-  if (listedMessages.length > 0) {
+  if (!isPreview && listedMessages.length > 0) {
     try {
       const processedIds = new Set<string>();
       for (let i = 0; i < listedMessages.length; i += D1_MAX_BOUND_PARAMS) {
@@ -2409,7 +2416,8 @@ async function fetchGmailNewsletters(env: Bindings): Promise<{
     }
   }
 
-  messages = messages.slice(0, GMAIL_MAX_MESSAGES_PER_RUN);
+  const maxMessages = isPreview ? GMAIL_MAX_PREVIEW_MESSAGES : GMAIL_MAX_MESSAGES_PER_RUN;
+  messages = messages.slice(0, maxMessages);
 
   for (const msg of messages) {
     const msgRes = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=full`, {
@@ -2516,7 +2524,7 @@ Format:
       }
 
       // Marked only after a successful decomposition so failed or unparseable responses are retried next cycle.
-      if (extractedStories.length > 0) {
+      if (!isPreview && extractedStories.length > 0) {
         try {
           await env.news_db.prepare(
             'INSERT INTO processed_emails (message_id) VALUES (?1) ON CONFLICT(message_id) DO NOTHING'
@@ -2599,7 +2607,7 @@ async function fetchStackerNews(): Promise<{ id: string, title: string, url: str
   return articles;
 }
 
-async function runDebugPipeline(env: Bindings, targetSource: string = 'all'): Promise<DiagnosticReport> {
+export async function runDebugPipeline(env: Bindings, targetSource: string = 'all'): Promise<DiagnosticReport> {
   const startTime = performance.now();
   const errors: string[] = [];
   const rawArticles: {
@@ -2682,7 +2690,7 @@ async function runDebugPipeline(env: Bindings, targetSource: string = 'all'): Pr
 
   if (!sourceKey || sourceKey === 'gmail') {
     try {
-      const newsletterArticles = await fetchGmailNewsletters(env);
+      const newsletterArticles = await fetchGmailNewsletters(env, { mode: 'preview' });
       rawArticles.push(...newsletterArticles);
     } catch (e: any) {
       errors.push('Gmail newsletter error: ' + (e.message || String(e)));

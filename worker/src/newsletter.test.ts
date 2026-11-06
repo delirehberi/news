@@ -1,5 +1,7 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  GMAIL_MAX_MESSAGES_PER_RUN,
+  GMAIL_MAX_PREVIEW_MESSAGES,
   buildStoryFallbackUrl,
   convertEmailToStructuredMarkdown,
   decodeBase64Utf8,
@@ -13,6 +15,7 @@ import {
   resolveRedirectUrl,
   unwrapTrackingUrl,
 } from './newsletter';
+import { app, fetchGmailNewsletters, runDebugPipeline } from './index';
 
 const HTTP_STATUS_FOUND = 302;
 const HTTP_STATUS_MOVED_PERMANENTLY = 301;
@@ -258,4 +261,228 @@ describe('parseDecomposedStories and parseCuratedIds', () => {
     expect(Array.from(fromTruncatedString)).toEqual(['newsletter-msg1-0', 'hn-41001']);
   });
 });
+
+describe('fetchGmailNewsletters ingest vs preview mode', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function createNewsletterTestHarness(initialProcessedIds: string[] = []) {
+    const processedEmails = new Set<string>(initialProcessedIds);
+    const dbQueries: string[] = [];
+    const decomposedMsgIds: string[] = [];
+
+    const mockDb: any = {
+      prepare(query: string) {
+        dbQueries.push(query);
+        const createRunner = (params: any[] = []) => ({
+          async all() {
+            if (query.includes('FROM processed_emails')) {
+              const results = params
+                .filter((id) => processedEmails.has(String(id)))
+                .map((id) => ({ message_id: String(id) }));
+              return { results };
+            }
+            return { results: [] };
+          },
+          async first() {
+            return null;
+          },
+          async run() {
+            if (query.includes('INSERT INTO processed_emails')) {
+              for (const id of params) {
+                processedEmails.add(String(id));
+              }
+            }
+            return { success: true };
+          },
+        });
+
+        return {
+          ...createRunner([]),
+          bind(...params: any[]) {
+            return createRunner(params);
+          },
+        };
+      },
+    };
+
+    const mockAi = {
+      async run(model: string, input: any) {
+        if (model.includes('bge-base-en')) {
+          const texts: string[] = Array.isArray(input?.text) ? input.text : [];
+          return {
+            data: texts.map(() => [0.1, 0.2, 0.3]),
+          };
+        }
+
+        const systemContent: string = input?.messages?.[0]?.content || '';
+        const subjectMatch = systemContent.match(/Subject-([a-zA-Z0-9_-]+)/);
+        const msgId = subjectMatch ? subjectMatch[1] : 'unknown';
+        decomposedMsgIds.push(msgId);
+
+        if (systemContent.includes('selected_ids')) {
+          return {
+            response: JSON.stringify({ selected_ids: [] }),
+          };
+        }
+
+        return {
+          response: JSON.stringify([
+            {
+              title: `Story from ${msgId}`,
+              summary: `Detailed technical summary for ${msgId} covering distributed systems architecture.`,
+              category: 'Engineering',
+              url: `https://example.com/articles/${msgId}`,
+              is_sponsored: false,
+            },
+          ]),
+        };
+      },
+    };
+
+    const env: any = {
+      news_db: mockDb,
+      AI: mockAi,
+      GMAIL_CLIENT_ID: 'test-client-id',
+      GMAIL_CLIENT_SECRET: 'test-client-secret',
+      GMAIL_REFRESH_TOKEN: 'test-refresh-token',
+    };
+
+    function installFetchMock(messageIds: string[]) {
+      const htmlBody = encodeBase64Url(
+        '<html><body><h2>Newsletter Digest</h2><p>This newsletter issue contains more than fifty characters of technical content and analysis for developers.</p></body></html>'
+      );
+
+      vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+        const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+
+        if (url === 'https://oauth2.googleapis.com/token') {
+          return new Response(JSON.stringify({ access_token: 'mock-access-token' }), {
+            status: HTTP_STATUS_OK,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+
+        if (url.startsWith('https://gmail.googleapis.com/gmail/v1/users/me/messages?')) {
+          return new Response(
+            JSON.stringify({
+              messages: messageIds.map((id) => ({ id })),
+            }),
+            {
+              status: HTTP_STATUS_OK,
+              headers: { 'Content-Type': 'application/json' },
+            }
+          );
+        }
+
+        const msgMatch = url.match(/\/messages\/([^?]+)\?format=full/);
+        if (msgMatch) {
+          const msgId = msgMatch[1];
+          return new Response(
+            JSON.stringify({
+              id: msgId,
+              payload: {
+                headers: [
+                  { name: 'Subject', value: `Subject-${msgId}` },
+                  { name: 'From', value: 'Newsletter <digest@example.com>' },
+                ],
+                mimeType: 'text/html',
+                body: { data: htmlBody },
+              },
+            }),
+            {
+              status: HTTP_STATUS_OK,
+              headers: { 'Content-Type': 'application/json' },
+            }
+          );
+        }
+
+        return new Response('<html><head><title>Article</title></head><body><p>Content</p></body></html>', {
+          status: HTTP_STATUS_OK,
+        });
+      });
+    }
+
+    return {
+      env,
+      processedEmails,
+      dbQueries,
+      decomposedMsgIds,
+      installFetchMock,
+    };
+  }
+
+  it('defaults to ingest mode: filters out processed_emails, caps at GMAIL_MAX_MESSAGES_PER_RUN, and inserts newly decomposed messages', async () => {
+    const listedIds = Array.from({ length: 14 }, (_, i) => `msg-${i + 1}`);
+    const alreadyProcessed = ['msg-1', 'msg-2'];
+    const { env, processedEmails, dbQueries, decomposedMsgIds, installFetchMock } =
+      createNewsletterTestHarness(alreadyProcessed);
+
+    installFetchMock(listedIds);
+
+    const articles = await fetchGmailNewsletters(env);
+
+    // 14 listed - 2 already processed = 12 remaining -> capped at GMAIL_MAX_MESSAGES_PER_RUN (10)
+    expect(decomposedMsgIds).toHaveLength(GMAIL_MAX_MESSAGES_PER_RUN);
+    expect(decomposedMsgIds).not.toContain('msg-1');
+    expect(decomposedMsgIds).not.toContain('msg-2');
+    expect(decomposedMsgIds[0]).toBe('msg-3');
+    expect(decomposedMsgIds[GMAIL_MAX_MESSAGES_PER_RUN - 1]).toBe('msg-12');
+    expect(articles).toHaveLength(GMAIL_MAX_MESSAGES_PER_RUN);
+
+    // All 10 decomposed messages should now be recorded in processed_emails (2 initial + 10 new = 12)
+    expect(processedEmails.size).toBe(2 + GMAIL_MAX_MESSAGES_PER_RUN);
+    for (const id of decomposedMsgIds) {
+      expect(processedEmails.has(id)).toBe(true);
+    }
+    expect(dbQueries.some((q) => q.includes('SELECT message_id FROM processed_emails'))).toBe(true);
+    expect(dbQueries.some((q) => q.includes('INSERT INTO processed_emails'))).toBe(true);
+  });
+
+  it('in preview mode: does not filter by processed_emails, never inserts into processed_emails, and caps at GMAIL_MAX_PREVIEW_MESSAGES', async () => {
+    const listedIds = Array.from({ length: 12 }, (_, i) => `msg-${i + 1}`);
+    // Even if all messages are already in processed_emails, preview mode still decomposes the top GMAIL_MAX_PREVIEW_MESSAGES
+    const { env, processedEmails, dbQueries, decomposedMsgIds, installFetchMock } =
+      createNewsletterTestHarness(['msg-1', 'msg-2', 'msg-3']);
+
+    installFetchMock(listedIds);
+
+    const articles = await fetchGmailNewsletters(env, { mode: 'preview' });
+
+    expect(decomposedMsgIds).toHaveLength(GMAIL_MAX_PREVIEW_MESSAGES);
+    expect(decomposedMsgIds).toEqual(['msg-1', 'msg-2', 'msg-3', 'msg-4', 'msg-5']);
+    expect(articles).toHaveLength(GMAIL_MAX_PREVIEW_MESSAGES);
+
+    // processed_emails row count and contents are completely unchanged
+    expect(processedEmails.size).toBe(3);
+    expect(Array.from(processedEmails)).toEqual(['msg-1', 'msg-2', 'msg-3']);
+    expect(dbQueries.some((q) => q.includes('processed_emails'))).toBe(false);
+  });
+
+  it('runDebugPipeline and /debug?source=gmail use preview mode so processed emails are shown and unprocessed emails are not consumed', async () => {
+    const listedIds = ['msg-processed-1', 'msg-unprocessed-2'];
+    const { env, processedEmails, installFetchMock } = createNewsletterTestHarness(['msg-processed-1']);
+
+    installFetchMock(listedIds);
+
+    const report = await runDebugPipeline(env, 'gmail');
+    expect(report.stats.total_raw).toBe(2);
+    expect(report.items.map((item) => item.title)).toEqual([
+      'Story from msg-processed-1',
+      'Story from msg-unprocessed-2',
+    ]);
+    // processed_emails count remains 1 (msg-unprocessed-2 was NOT marked processed)
+    expect(processedEmails.size).toBe(1);
+    expect(processedEmails.has('msg-unprocessed-2')).toBe(false);
+
+    const res = await app.request('http://localhost:8787/debug?source=gmail', {}, env);
+    expect(res.status).toBe(HTTP_STATUS_OK);
+    const html = await res.text();
+    expect(html).toContain('Story from msg-processed-1');
+    expect(html).toContain('Story from msg-unprocessed-2');
+    expect(processedEmails.size).toBe(1);
+  });
+});
+
 

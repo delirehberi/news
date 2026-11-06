@@ -1,5 +1,6 @@
 export const GMAIL_MAX_LIST_RESULTS = 50;
 export const GMAIL_MAX_MESSAGES_PER_RUN = 10;
+export const GMAIL_MAX_PREVIEW_MESSAGES = 5;
 export const NEWSLETTER_MARKDOWN_MAX_CHARS = 18000;
 export const NEWSLETTER_DECOMPOSE_MAX_TOKENS = 4096;
 export const REDIRECT_RESOLVE_TIMEOUT_MS = 2500;
@@ -7,6 +8,12 @@ export const MAX_REDIRECT_HOPS = 3;
 export const MAX_REDIRECT_RESOLVES_PER_RUN = 25;
 export const CURATION_BATCH_SIZE = 20;
 export const STORY_HASH_PREFIX = '#story-';
+
+export type GmailFetchMode = 'ingest' | 'preview';
+
+export interface GmailFetchOptions {
+  mode?: GmailFetchMode;
+}
 
 const TRACKING_QUERY_PARAMS = new Set([
   'utm_source',
