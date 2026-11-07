@@ -10,15 +10,18 @@ import {
 } from '@remotion/renderer';
 import { z } from 'zod';
 import type { CommandContext } from '../cli.ts';
+import { PageCaptureMetadataSchema, type PageCaptureMetadata } from '../domain/pageCapture.ts';
 import { ScriptSchema, type Script } from '../domain/script.ts';
 import {
   buildVideoTimeline,
   CaptionChunkSchema,
   DEFAULT_SITE_URL,
   extractHostname,
+  StorySceneCueSchema,
   THUMBNAIL_FRAME,
   VIDEO_FPS,
   WEEKLY_VIDEO_COMPOSITION_ID,
+  type StorySceneCue,
   type StorySceneItem,
   type VideoTimeline,
   type WeeklyVideoProps,
@@ -36,6 +39,7 @@ import {
   type WorkerClient,
 } from '../lib/workerClient.ts';
 import { assertEditionApproved } from './approve.ts';
+import { loadCachedPageCapture } from './capture.ts';
 import { buildVoiceSegments } from './voice.ts';
 
 export const IMAGE_DOWNLOAD_TIMEOUT_MS = 15_000;
@@ -215,6 +219,76 @@ export async function downloadStoryImage(
   }
 }
 
+/**
+ * Loads a captured page (`out/<week>/pages/<storyIndex>.png` + `<storyIndex>.json`)
+ * if available on disk for the story. Checks URL-hash match first, and falls back
+ * to index-matched valid capture metadata if present.
+ */
+export async function loadStoryPageCapture(options: {
+  pagesDir: string;
+  storyIndex: number;
+  url: string;
+}): Promise<PageCaptureMetadata | null> {
+  const { pagesDir, storyIndex, url } = options;
+
+  const exactCached = await loadCachedPageCapture(pagesDir, storyIndex, url);
+  if (exactCached) {
+    return {
+      ...exactCached,
+      screenshot_path: exactCached.screenshot_path || `pages/${storyIndex}.png`,
+    };
+  }
+
+  const pngPath = path.join(pagesDir, `${storyIndex}.png`);
+  const jsonPath = path.join(pagesDir, `${storyIndex}.json`);
+
+  const [hasPng, hasJson] = await Promise.all([
+    fileExists(pngPath),
+    fileExists(jsonPath),
+  ]);
+
+  if (!hasPng || !hasJson) {
+    return null;
+  }
+
+  try {
+    const raw = await readJson<unknown>(jsonPath);
+    const parsed = PageCaptureMetadataSchema.safeParse(raw);
+    if (!parsed.success) {
+      return null;
+    }
+    return {
+      ...parsed.data,
+      screenshot_path: parsed.data.screenshot_path || `pages/${storyIndex}.png`,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function extractOptionalSegmentCues(rawSegment: unknown): StorySceneCue[] | undefined {
+  if (!rawSegment || typeof rawSegment !== 'object') {
+    return undefined;
+  }
+  const candidate =
+    (rawSegment as { cues?: unknown; visuals?: unknown }).cues ??
+    (rawSegment as { cues?: unknown; visuals?: unknown }).visuals;
+
+  if (!Array.isArray(candidate) || candidate.length === 0) {
+    return undefined;
+  }
+
+  const valid: StorySceneCue[] = [];
+  for (const item of candidate) {
+    const parsed = StorySceneCueSchema.safeParse(item);
+    if (parsed.success) {
+      valid.push(parsed.data);
+    }
+  }
+
+  return valid.length > 0 ? valid : undefined;
+}
+
 async function loadAudioSegments(
   audioDir: string,
   script: Script
@@ -351,10 +425,12 @@ export interface RenderCommandResult {
   thumbnailPath: string;
   downloadedImagesCount: number;
   fallbackCardCount: number;
+  pageCapturesCount: number;
 }
 
 /**
  * Downloads story OG images to `out/<week>/images/` (with fallback to branded cards),
+ * loads captured article pages from `out/<week>/pages/<n>.png` + `<n>.json` when available,
  * bundles the Remotion composition (`src/remotion/Root.tsx`), and renders
  * `out/<week>/video.mp4` (`renderMedia`) and `out/<week>/thumbnail.png` (`renderStill`).
  */
@@ -395,6 +471,14 @@ export async function runRenderCommand(
 
   const translation = parsedTranslation.data;
   const script = parsedScript.data;
+  const rawScriptSegments =
+    rawScript &&
+    typeof rawScript === 'object' &&
+    'segments' in rawScript &&
+    Array.isArray((rawScript as { segments: unknown[] }).segments)
+      ? (rawScript as { segments: unknown[] }).segments
+      : [];
+
   const audioSegments = await loadAudioSegments(paths.audioDir, script);
 
   const translationByUrl = new Map<string, WeeklyItem>();
@@ -411,6 +495,7 @@ export async function runRenderCommand(
   const stories: StorySceneItem[] = [];
   let downloadedImagesCount = 0;
   let fallbackCardCount = 0;
+  let pageCapturesCount = 0;
 
   for (let i = 0; i < script.segments.length; i++) {
     if (ctx.signal.aborted) {
@@ -419,7 +504,8 @@ export async function runRenderCommand(
 
     const segment = script.segments[i];
     const storyIndex = i + 1;
-    const translatedItem = translationByUrl.get(segment.item_url.trim());
+    const storyUrl = segment.item_url.trim();
+    const translatedItem = translationByUrl.get(storyUrl);
     const audioSegment = audioSegments.get(storyIndex);
 
     if (!audioSegment) {
@@ -428,15 +514,22 @@ export async function runRenderCommand(
       );
     }
 
-    const imageSrc = await downloadStoryImage({
-      imageUrl: translatedItem?.image_url ?? null,
-      storyIndex,
-      imagesDir: paths.imagesDir,
-      signal: ctx.signal,
-      timeoutMs: deps.imageTimeoutMs,
-      fetchImpl: deps.fetchImpl,
-      onWarn: (msg) => stdout(`[warn] ${msg}`),
-    });
+    const [imageSrc, pageCapture] = await Promise.all([
+      downloadStoryImage({
+        imageUrl: translatedItem?.image_url ?? null,
+        storyIndex,
+        imagesDir: paths.imagesDir,
+        signal: ctx.signal,
+        timeoutMs: deps.imageTimeoutMs,
+        fetchImpl: deps.fetchImpl,
+        onWarn: (msg) => stdout(`[warn] ${msg}`),
+      }),
+      loadStoryPageCapture({
+        pagesDir: paths.pagesDir,
+        storyIndex,
+        url: storyUrl,
+      }),
+    ]);
 
     if (imageSrc) {
       downloadedImagesCount++;
@@ -444,10 +537,16 @@ export async function runRenderCommand(
       fallbackCardCount++;
     }
 
+    if (pageCapture) {
+      pageCapturesCount++;
+    }
+
+    const segmentCues = extractOptionalSegmentCues(rawScriptSegments[i]);
+
     stories.push({
       index: storyIndex,
-      url: segment.item_url.trim(),
-      domain: extractHostname(segment.item_url.trim()),
+      url: storyUrl,
+      domain: extractHostname(storyUrl),
       source: translatedItem?.source ?? 'news',
       headline_tr: segment.headline_tr,
       summary_tr: translatedItem?.summary_tr ?? '',
@@ -455,6 +554,8 @@ export async function runRenderCommand(
       audioSrc: `audio/${storyIndex}.mp3`,
       audioDurationSeconds: audioSegment.duration_seconds,
       captions: audioSegment.captions,
+      ...(pageCapture ? { page: pageCapture } : {}),
+      ...(segmentCues ? { cues: segmentCues } : {}),
     });
   }
 
@@ -520,7 +621,7 @@ export async function runRenderCommand(
   }
 
   stdout(
-    `Completed render for ${ctx.week}: ${paths.videoMp4} (${timeline.totalDurationSeconds.toFixed(1)}s) & ${paths.thumbnailPng} (${downloadedImagesCount} image(s), ${fallbackCardCount} fallback card(s)).`
+    `Completed render for ${ctx.week}: ${paths.videoMp4} (${timeline.totalDurationSeconds.toFixed(1)}s) & ${paths.thumbnailPng} (${pageCapturesCount} page capture(s), ${downloadedImagesCount} image(s), ${fallbackCardCount} fallback card(s)).`
   );
 
   return {
@@ -530,6 +631,8 @@ export async function runRenderCommand(
     thumbnailPath: paths.thumbnailPng,
     downloadedImagesCount,
     fallbackCardCount,
+    pageCapturesCount,
   };
 }
+
 

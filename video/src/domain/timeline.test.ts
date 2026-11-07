@@ -255,5 +255,291 @@ describe('src/domain/timeline.ts', () => {
       expect(getSourceBadgeTheme('newsletter').label).toBe('Newsletter');
     });
   });
+
+  describe('StorySceneItemSchema backward compatibility & page/cues extension', () => {
+    it('parses legacy StorySceneItem without page or cues and keeps THUMBNAIL_FRAME on intro', async () => {
+      const {
+        StorySceneItemSchema,
+        WeeklyVideoPropsSchema,
+        THUMBNAIL_FRAME,
+      } = await import('./timeline.ts');
+
+      const legacyStory = {
+        index: 1,
+        url: 'https://example.com/legacy-story',
+        domain: 'example.com',
+        source: 'hn',
+        headline_tr: 'Eski Hafta Haberi',
+        summary_tr: 'Eski hafta özeti.',
+        imageSrc: 'images/1.jpg',
+        audioSrc: 'audio/1.mp3',
+        audioDurationSeconds: 30,
+        captions: [],
+      };
+
+      const parsedLegacy = StorySceneItemSchema.parse(legacyStory);
+      expect(parsedLegacy.page).toBeUndefined();
+      expect(parsedLegacy.cues).toBeUndefined();
+      expect(parsedLegacy.imageSrc).toBe('images/1.jpg');
+
+      const props = WeeklyVideoPropsSchema.parse({
+        week: '2026-W41',
+        title_tr: 'Geçen Hafta Özeti',
+        siteUrl: 'news.emre.xyz',
+        intro: {
+          audioSrc: 'audio/0.mp3',
+          audioDurationSeconds: 8,
+          captions: [],
+        },
+        stories: [legacyStory],
+        outro: {
+          audioSrc: 'audio/2.mp3',
+          audioDurationSeconds: 6,
+          captions: [],
+        },
+      });
+
+      const timeline = buildVideoTimeline(props, VIDEO_FPS);
+      const introScene = timeline.scenes[0];
+      expect(introScene.kind).toBe('intro');
+      expect(THUMBNAIL_FRAME).toBeGreaterThanOrEqual(introScene.startFrame);
+      expect(THUMBNAIL_FRAME).toBeLessThan(
+        introScene.startFrame + introScene.durationInFrames
+      );
+    });
+
+    it('parses StorySceneItem with full PageCaptureMetadata or flexible page object and visual cues', async () => {
+      const { StorySceneItemSchema, normalizeStoryPage } = await import(
+        './timeline.ts'
+      );
+
+      const storyWithPageAndCues = StorySceneItemSchema.parse({
+        index: 1,
+        url: 'https://example.com/story-1',
+        domain: 'example.com',
+        source: 'hn',
+        headline_tr: 'Rust Derleyicisi %40 Daha Hızlı',
+        imageSrc: 'images/1.png',
+        audioSrc: 'audio/1.mp3',
+        audioDurationSeconds: 24,
+        captions: [],
+        page: {
+          index: 1,
+          url: 'https://example.com/story-1',
+          url_hash: '0123456789abcdef',
+          captured_at: '2026-10-20T12:00:00.000Z',
+          screenshot_path: 'pages/1.png',
+          viewport: {
+            width: 1440,
+            height: 900,
+            deviceScaleFactor: 1,
+          },
+          page_height: 2600,
+          excerpt: 'Rust compiler parallel frontend...',
+          elements: [
+            {
+              id: 'h1',
+              kind: 'h1',
+              tagName: 'h1',
+              text: 'Rust Compiler Is 40% Faster',
+              box: { x: 120, y: 140, width: 920, height: 84 },
+            },
+          ],
+        },
+        cues: [
+          {
+            kind: 'focus',
+            anchor: 'Rust Derleyicisi',
+            target: 'h1',
+          },
+          {
+            kind: 'stat',
+            anchor: '%40 daha hızlı',
+            value: '%40 daha hızlı',
+          },
+        ],
+      });
+
+      expect(storyWithPageAndCues.cues).toHaveLength(2);
+      const normalized = normalizeStoryPage(storyWithPageAndCues.page);
+      expect(normalized).not.toBeNull();
+      expect(normalized?.screenshotSrc).toBe('pages/1.png');
+      expect(normalized?.page_height).toBe(2600);
+      expect(normalized?.elements).toHaveLength(1);
+    });
+  });
+
+  describe('StoryScene fallback ladder, lower-third headline, and walkthrough helpers', () => {
+    it('resolves the 3-level fallback ladder: page capture -> OG image -> branded card', async () => {
+      const { resolveStoryFallbackMode } = await import('./timeline.ts');
+
+      const fullStory = {
+        page: {
+          screenshot_path: 'pages/1.png',
+          page_height: 2200,
+          elements: [],
+        },
+        imageSrc: 'images/1.png',
+      };
+
+      // 1. Page capture present and healthy -> 'page'
+      expect(resolveStoryFallbackMode(fullStory)).toBe('page');
+
+      // 2. Page capture failed at load time -> falls back to 'og'
+      expect(
+        resolveStoryFallbackMode(fullStory, { pageLoadFailed: true })
+      ).toBe('og');
+
+      // 3. Both page and OG image failed or missing -> falls back to 'card'
+      expect(
+        resolveStoryFallbackMode(fullStory, {
+          pageLoadFailed: true,
+          imageLoadFailed: true,
+        })
+      ).toBe('card');
+      expect(
+        resolveStoryFallbackMode({ page: null, imageSrc: 'images/1.png' })
+      ).toBe('og');
+      expect(
+        resolveStoryFallbackMode({ page: null, imageSrc: null })
+      ).toBe('card');
+    });
+
+    it('slides in lower-third headline and collapses to a compact chip after ~3s (90 frames at 30fps)', async () => {
+      const { computeHeadlineLowerThirdState } = await import('./timeline.ts');
+
+      const atStart = computeHeadlineLowerThirdState(0, 30);
+      expect(atStart.collapsed).toBe(false);
+      expect(atStart.collapseProgress).toBe(0);
+      expect(atStart.translateY).toBeGreaterThan(0);
+
+      const atTwoSeconds = computeHeadlineLowerThirdState(60, 30);
+      expect(atTwoSeconds.collapsed).toBe(false);
+      expect(atTwoSeconds.collapseProgress).toBe(0);
+      expect(atTwoSeconds.opacity).toBe(1);
+      expect(atTwoSeconds.translateY).toBe(0);
+
+      const midCollapse = computeHeadlineLowerThirdState(99, 30);
+      expect(midCollapse.collapseProgress).toBeGreaterThan(0.2);
+      expect(midCollapse.collapseProgress).toBeLessThan(0.8);
+
+      const afterCollapse = computeHeadlineLowerThirdState(120, 30);
+      expect(afterCollapse.collapsed).toBe(true);
+      expect(afterCollapse.collapseProgress).toBe(1);
+    });
+
+    it('extracts salient headline keywords and builds walkthrough plan with heuristic or LLM cues', async () => {
+      const { extractHeadlineKeywords } = await import('./timeline.ts');
+      const {
+        buildOgKeywordAnnotations,
+        buildStoryWalkthroughPlan,
+      } = await import('../remotion/WeeklyVideo.tsx');
+
+      const keywords = extractHeadlineKeywords(
+        'Linux Çekirdeğinde Rust Sürücüleri ile %40 Daha Hızlı Performans',
+        3
+      );
+      expect(keywords).toContain('%40');
+      expect(keywords.length).toBe(3);
+
+      const ogAnnotations = buildOgKeywordAnnotations(
+        'Linux Çekirdeğinde Rust Sürücüleri ile %40 Daha Hızlı Performans',
+        240,
+        1
+      );
+      expect(ogAnnotations).toHaveLength(3);
+      expect(ogAnnotations[0]?.annotation.targetBox).toBeDefined();
+
+      // Heuristic walkthrough when cues are absent
+      const heuristicPlan = buildStoryWalkthroughPlan(
+        {
+          index: 1,
+          url: 'https://example.com/rust',
+          domain: 'example.com',
+          source: 'hn',
+          headline_tr: 'Rust Derleyicisi Hızlandı',
+          summary_tr: 'Bu özet ekranda gösterilmez.',
+          imageSrc: 'images/1.png',
+          audioSrc: 'audio/1.mp3',
+          audioDurationSeconds: 10,
+          captions: [],
+          page: {
+            screenshot_path: 'pages/1.png',
+            page_height: 2400,
+            elements: [
+              {
+                id: 'h1',
+                kind: 'h1',
+                tagName: 'h1',
+                text: 'Rust Compiler Speedup',
+                box: { x: 100, y: 120, width: 900, height: 80 },
+              },
+            ],
+          },
+        },
+        300,
+        30
+      );
+      expect(heuristicPlan.cues.length).toBeGreaterThanOrEqual(4);
+      expect(heuristicPlan.track.keyframes.length).toBeGreaterThanOrEqual(4);
+
+      // Explicit LLM cues walkthrough
+      const directedPlan = buildStoryWalkthroughPlan(
+        {
+          index: 1,
+          url: 'https://example.com/rust',
+          domain: 'example.com',
+          source: 'hn',
+          headline_tr: 'Rust Derleyicisi Hızlandı',
+          summary_tr: '',
+          imageSrc: 'images/1.png',
+          audioSrc: 'audio/1.mp3',
+          audioDurationSeconds: 10,
+          captions: [
+            {
+              text: 'Rust derleyicisi yüzde 40 hızlandı',
+              start: 0.5,
+              end: 2.5,
+              words: [
+                { word: 'Rust', start: 0.5, end: 0.9 },
+                { word: 'derleyicisi', start: 0.95, end: 1.4 },
+                { word: 'yüzde', start: 1.5, end: 1.8 },
+                { word: '40', start: 1.85, end: 2.1 },
+                { word: 'hızlandı', start: 2.15, end: 2.5 },
+              ],
+            },
+          ],
+          page: {
+            screenshot_path: 'pages/1.png',
+            page_height: 2400,
+            elements: [
+              {
+                id: 'h1',
+                kind: 'h1',
+                tagName: 'h1',
+                text: 'Rust Compiler Speedup',
+                box: { x: 100, y: 120, width: 900, height: 80 },
+              },
+            ],
+          },
+          cues: [
+            { kind: 'focus', anchor: 'Rust derleyicisi', target: 'h1' },
+            { kind: 'circle', anchor: 'yüzde 40', target: 'h1' },
+          ],
+        },
+        300,
+        30
+      );
+      expect(directedPlan.cues).toHaveLength(2);
+      expect(directedPlan.cues[0]?.matched).toBe(true);
+      expect(directedPlan.cues[0]?.box).toEqual({
+        x: 100,
+        y: 120,
+        width: 900,
+        height: 80,
+      });
+    });
+  });
 });
+
 

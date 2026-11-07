@@ -1,5 +1,10 @@
 import { z } from 'zod';
 import type { CaptionChunk, WordTiming } from './captions.ts';
+import {
+  PageCaptureMetadataSchema,
+  PageElementSchema,
+  type PageElement,
+} from './pageCapture.ts';
 
 export const VIDEO_WIDTH = 1920;
 export const VIDEO_HEIGHT = 1080;
@@ -35,14 +40,96 @@ export const SceneAudioPropsSchema = z.object({
 
 export type SceneAudioProps = z.infer<typeof SceneAudioPropsSchema>;
 
+export const StorySceneCueKindSchema = z.enum([
+  'scroll',
+  'focus',
+  'highlight',
+  'circle',
+  'underline',
+  'arrow',
+  'stat',
+  'quote',
+  'image',
+]);
+
+export type StorySceneCueKind = z.infer<typeof StorySceneCueKindSchema>;
+
+export const StorySceneCueSchema = z.object({
+  kind: StorySceneCueKindSchema,
+  anchor: z.string().trim().min(1),
+  target: z.string().trim().min(1).optional(),
+  value: z.string().trim().min(1).optional(),
+  startFrame: z.number().nonnegative().optional(),
+  endFrame: z.number().nonnegative().optional(),
+  startSeconds: z.number().nonnegative().optional(),
+  endSeconds: z.number().nonnegative().optional(),
+  matched: z.boolean().optional(),
+  box: z
+    .object({
+      x: z.number().nonnegative(),
+      y: z.number().nonnegative(),
+      width: z.number().positive(),
+      height: z.number().positive(),
+    })
+    .nullable()
+    .optional(),
+});
+
+export type StorySceneCue = z.infer<typeof StorySceneCueSchema>;
+
+const FlexiblePageCaptureSchema = z
+  .object({
+    screenshotSrc: z.string().min(1).optional(),
+    screenshot_path: z.string().min(1).optional(),
+    viewport: z
+      .object({
+        width: z.number().int().positive(),
+        height: z.number().int().positive(),
+        deviceScaleFactor: z.number().positive().optional(),
+      })
+      .optional(),
+    page_height: z.number().int().positive().optional(),
+    pageHeight: z.number().int().positive().optional(),
+    elements: z.array(PageElementSchema).optional().default([]),
+    index: z.number().int().positive().optional(),
+    url: z.string().optional(),
+    url_hash: z.string().optional(),
+    captured_at: z.string().optional(),
+    excerpt: z.string().optional(),
+  })
+  .refine(
+    (val) => Boolean(val.screenshotSrc || val.screenshot_path),
+    'StoryScenePage must define either screenshotSrc or screenshot_path'
+  );
+
+export const StoryScenePageSchema = z.union([
+  PageCaptureMetadataSchema,
+  FlexiblePageCaptureSchema,
+]);
+
+export type StoryScenePage = z.infer<typeof StoryScenePageSchema>;
+
+export interface NormalizedStoryPage {
+  screenshotSrc: string;
+  viewport: {
+    width: number;
+    height: number;
+    deviceScaleFactor: number;
+  };
+  page_height: number;
+  elements: PageElement[];
+}
+
 export const StorySceneItemSchema = SceneAudioPropsSchema.extend({
   index: z.number().int().positive(),
   url: z.string().min(1),
   domain: z.string(),
   source: z.string().min(1),
   headline_tr: z.string().min(1),
-  summary_tr: z.string(),
+  summary_tr: z.string().optional().default(''),
   imageSrc: z.string().nullable(),
+  page: StoryScenePageSchema.nullable().optional(),
+  cues: z.array(StorySceneCueSchema).optional(),
 });
 
 export type StorySceneItem = z.infer<typeof StorySceneItemSchema>;
@@ -389,4 +476,254 @@ export function getSourceBadgeTheme(source: string): SourceBadgeTheme {
       };
   }
 }
+
+export type StoryFallbackMode = 'page' | 'og' | 'card';
+
+export const LOWER_THIRD_COLLAPSE_SECONDS = 3.0;
+export const LOWER_THIRD_TRANSITION_FRAMES = 18;
+
+export interface HeadlineLowerThirdState {
+  collapsed: boolean;
+  collapseProgress: number;
+  entranceProgress: number;
+  translateY: number;
+  opacity: number;
+}
+
+const TURKISH_STOPWORDS = new Set([
+  've',
+  'ile',
+  'bir',
+  'bu',
+  'da',
+  'de',
+  'mi',
+  'mu',
+  'm\u0131',
+  'm\u00fc',
+  'i\u00e7in',
+  'icin',
+  'gibi',
+  'daha',
+  'en',
+  '\u00e7ok',
+  'cok',
+  'yeni',
+  'olan',
+  'olarak',
+  '\u00fczerinde',
+  'uzerinde',
+  'sonra',
+  '\u00f6nce',
+  'once',
+  'kadar',
+  'g\u00f6re',
+  'gore',
+  'art\u0131k',
+  'artik',
+  'neden',
+  'nas\u0131l',
+  'nasil',
+  'ne',
+  'ya',
+  'veya',
+  'hem',
+  'ama',
+  'ancak',
+  'fakat',
+  'her',
+  't\u00fcm',
+  'tum',
+]);
+
+/**
+ * Normalizes an optional `StoryScenePage` into a consistent `NormalizedStoryPage`
+ * with `screenshotSrc`, `viewport`, `page_height`, and `elements`, or returns `null`
+ * if no valid screenshot path is present.
+ */
+export function normalizeStoryPage(
+  page: StoryScenePage | null | undefined
+): NormalizedStoryPage | null {
+  if (!page) {
+    return null;
+  }
+
+  const rawScreenshot =
+    ('screenshotSrc' in page && typeof page.screenshotSrc === 'string'
+      ? page.screenshotSrc
+      : '') ||
+    ('screenshot_path' in page && typeof page.screenshot_path === 'string'
+      ? page.screenshot_path
+      : '');
+
+  const screenshotSrc = rawScreenshot.trim();
+  if (!screenshotSrc) {
+    return null;
+  }
+
+  const width =
+    page.viewport && typeof page.viewport.width === 'number' && page.viewport.width > 0
+      ? page.viewport.width
+      : 1440;
+  const height =
+    page.viewport && typeof page.viewport.height === 'number' && page.viewport.height > 0
+      ? page.viewport.height
+      : 900;
+  const deviceScaleFactor =
+    page.viewport &&
+    typeof page.viewport.deviceScaleFactor === 'number' &&
+    page.viewport.deviceScaleFactor > 0
+      ? page.viewport.deviceScaleFactor
+      : 1;
+
+  const rawPageHeight =
+    ('page_height' in page && typeof page.page_height === 'number' ? page.page_height : 0) ||
+    ('pageHeight' in page && typeof page.pageHeight === 'number' ? page.pageHeight : 0);
+
+  const elements = Array.isArray(page.elements) ? page.elements : [];
+  let maxElementBottom = height;
+  for (const el of elements) {
+    if (el?.box) {
+      maxElementBottom = Math.max(maxElementBottom, el.box.y + el.box.height + 120);
+    }
+  }
+
+  const page_height = Math.max(
+    height,
+    rawPageHeight > 0 ? Math.round(rawPageHeight) : Math.round(maxElementBottom)
+  );
+
+  return {
+    screenshotSrc,
+    viewport: {
+      width,
+      height,
+      deviceScaleFactor,
+    },
+    page_height,
+    elements,
+  };
+}
+
+/**
+ * Resolves which stage of the StoryScene visual fallback ladder is active:
+ * 1. `'page'` when a captured page screenshot exists and has not failed to load.
+ * 2. `'og'` when an OG `imageSrc` exists and has not failed to load.
+ * 3. `'card'` (branded fallback card) otherwise.
+ */
+export function resolveStoryFallbackMode(
+  story: Pick<StorySceneItem, 'page' | 'imageSrc'>,
+  options?: {
+    pageLoadFailed?: boolean;
+    imageLoadFailed?: boolean;
+  }
+): StoryFallbackMode {
+  const normalizedPage = normalizeStoryPage(story.page);
+  if (normalizedPage && !options?.pageLoadFailed) {
+    return 'page';
+  }
+
+  const cleanImageSrc = story.imageSrc?.trim() ?? '';
+  if (cleanImageSrc.length > 0 && !options?.imageLoadFailed) {
+    return 'og';
+  }
+
+  return 'card';
+}
+
+/**
+ * Pure frame-deterministic helper computing the animated lower-third headline state:
+ * - Slides in over the first ~14 frames.
+ * - Holds as a prominent lower-third banner until `collapseSeconds` (~3.0s, frame 90 at 30fps).
+ * - Smoothly collapses into a compact chip (`collapseProgress: 0 -> 1`).
+ */
+export function computeHeadlineLowerThirdState(
+  frameInScene: number,
+  fps: number = VIDEO_FPS,
+  options?: {
+    collapseSeconds?: number;
+    transitionFrames?: number;
+  }
+): HeadlineLowerThirdState {
+  const safeFps = Number.isFinite(fps) && fps > 0 ? fps : VIDEO_FPS;
+  const collapseSeconds = options?.collapseSeconds ?? LOWER_THIRD_COLLAPSE_SECONDS;
+  const transitionFrames = Math.max(
+    1,
+    Math.round(options?.transitionFrames ?? LOWER_THIRD_TRANSITION_FRAMES)
+  );
+
+  const clampedFrame = Math.max(0, frameInScene);
+  const entranceRaw = Math.min(1, clampedFrame / 14);
+  const entranceProgress = Number((1 - Math.pow(1 - entranceRaw, 3)).toFixed(4));
+  const translateY = Number(((1 - entranceProgress) * 28).toFixed(2));
+  const opacity = Number(Math.min(1, clampedFrame / 10).toFixed(4));
+
+  const collapseStartFrame = Math.max(15, Math.round(collapseSeconds * safeFps));
+  const rawCollapse = Math.min(
+    1,
+    Math.max(0, (clampedFrame - collapseStartFrame) / transitionFrames)
+  );
+  // Smooth Hermite easing for collapse transition
+  const collapseProgress = Number(
+    (rawCollapse * rawCollapse * (3 - 2 * rawCollapse)).toFixed(4)
+  );
+
+  return {
+    collapsed: collapseProgress >= 0.99,
+    collapseProgress,
+    entranceProgress,
+    translateY,
+    opacity,
+  };
+}
+
+/**
+ * Extracts 1..maxKeywords salient keywords or numeric/technical tokens from a Turkish headline
+ * so the OG-image fallback mode can highlight and hand-annotate headline keywords on screen.
+ */
+export function extractHeadlineKeywords(
+  headline: string,
+  maxKeywords: number = 3
+): string[] {
+  const cleaned = headline
+    .replace(/[^\p{L}\p{N}%$.+-]+/gu, ' ')
+    .trim();
+  if (!cleaned) {
+    return [];
+  }
+
+  const rawTokens = cleaned.split(/\s+/);
+  const candidates: Array<{ token: string; score: number; index: number }> = [];
+  const seen = new Set<string>();
+
+  rawTokens.forEach((token, index) => {
+    const lower = token.toLocaleLowerCase('tr-TR');
+    if (lower.length < 2 || TURKISH_STOPWORDS.has(lower) || seen.has(lower)) {
+      return;
+    }
+    seen.add(lower);
+
+    let score = Math.min(10, token.length);
+    // Boost numbers/percentages/metrics (e.g. %40, 3x, 2026) so stats always surface
+    if (/\d/.test(token)) {
+      score += 12;
+    }
+    // Boost acronyms / capitalized technical terms (e.g. Rust, SQLite, Linux, AI, GPU)
+    if (/^[A-Z\u00c7\u011e\u0130\u00d6\u015e\u00dc]/.test(token) && index > 0) {
+      score += 3;
+    }
+    if (/^[A-Z0-9]{2,}$/.test(token)) {
+      score += 4;
+    }
+
+    candidates.push({ token, score, index });
+  });
+
+  candidates.sort((a, b) => b.score - a.score || a.index - b.index);
+  return candidates
+    .slice(0, Math.max(1, maxKeywords))
+    .sort((a, b) => a.index - b.index)
+    .map((c) => c.token);
+}
+
 

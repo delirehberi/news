@@ -509,6 +509,13 @@ describe('Weekly Video Pipeline End-to-End & Security Audit', () => {
     });
     expect(renderResult.downloadedImagesCount).toBe(1);
     expect(renderResult.fallbackCardCount).toBe(1);
+    expect(renderResult.pageCapturesCount).toBe(2);
+    expect(renderResult.props.stories[0]?.page).toMatchObject({
+      screenshot_path: 'pages/1.png',
+    });
+    expect(renderResult.props.stories[1]?.page).toMatchObject({
+      screenshot_path: 'pages/2.png',
+    });
 
     const uploadResult = await runUploadCommand(ctx, {
       workerClient,

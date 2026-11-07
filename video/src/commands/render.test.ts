@@ -332,6 +332,129 @@ describe('src/commands/render.ts', () => {
         )
       ).rejects.toThrowError(/Run "voice" first/);
     });
+
+    it('populates story.page (pages/<n>.png + element map) and optional cues when captures exist, and omits them when missing', async () => {
+      await seedWeekArtifacts(tempDir);
+      const paths = getWeekPaths(week, tempDir);
+      const { computeUrlHash } = await import('../domain/pageCapture.ts');
+
+      // Seed page capture only for story #1 (story #2 has no capture -> falls back to OG/card)
+      await writeBytesAtomic(
+        path.join(paths.pagesDir, '1.png'),
+        new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+      );
+      await writeJsonAtomic(path.join(paths.pagesDir, '1.json'), {
+        index: 1,
+        url: 'https://example.com/story-1',
+        url_hash: computeUrlHash('https://example.com/story-1'),
+        captured_at: '2026-10-20T15:30:00.000Z',
+        screenshot_path: 'pages/1.png',
+        viewport: {
+          width: 1440,
+          height: 900,
+          deviceScaleFactor: 1,
+        },
+        page_height: 2450,
+        excerpt: 'Captured story 1 excerpt text.',
+        elements: [
+          {
+            id: 'h1',
+            kind: 'h1',
+            tagName: 'h1',
+            text: 'Birinci Haber Başlığı',
+            box: { x: 120, y: 110, width: 880, height: 76 },
+          },
+          {
+            id: 'p1',
+            kind: 'paragraph',
+            tagName: 'p',
+            text: 'Birinci haber anlatımı burada yer alıyor.',
+            box: { x: 120, y: 220, width: 840, height: 96 },
+          },
+        ],
+      });
+
+      // Also include optional cues in script.json for story #1
+      await writeJsonAtomic(paths.scriptJson, {
+        intro: 'Merhaba, haftalık bültene hoş geldiniz.',
+        segments: [
+          {
+            item_url: 'https://example.com/story-1',
+            headline_tr: 'Birinci Haber Başlığı',
+            narration_tr: 'Birinci haber anlatımı burada yer alıyor.',
+            cues: [
+              {
+                kind: 'focus',
+                anchor: 'Birinci haber',
+                target: 'h1',
+              },
+            ],
+          },
+          {
+            item_url: 'https://lobste.rs/s/story-2',
+            headline_tr: 'İkinci Haber Başlığı',
+            narration_tr: 'İkinci haber anlatımı burada yer alıyor.',
+          },
+        ],
+        outro: 'İzlediğiniz için teşekkürler, haftaya görüşmek üzere.',
+      });
+
+      const workerClient: WorkerClient = {
+        getCandidates: vi.fn(),
+        getEdition: vi.fn().mockResolvedValue(createApprovedEdition(week, 'approved')),
+        putEdition: vi.fn(),
+        triggerSnapshot: vi.fn(),
+      };
+
+      const mockFetch = vi.fn<typeof fetch>().mockResolvedValue(
+        new Response('Upstream error', { status: 502 })
+      );
+
+      const bundleComposition = vi
+        .fn<RemotionRendererAdapter['bundleComposition']>()
+        .mockResolvedValue('/tmp/fake-remotion-bundle');
+      const renderComposition = vi
+        .fn<RemotionRendererAdapter['renderComposition']>()
+        .mockImplementation(async ({ videoOutputPath, thumbnailOutputPath }) => {
+          await writeBytesAtomic(videoOutputPath, new Uint8Array([0x00, 0x00, 0x00, 0x18]));
+          await writeBytesAtomic(thumbnailOutputPath, new Uint8Array([0x89, 0x50, 0x4e, 0x47]));
+        });
+
+      const controller = new AbortController();
+      const result = await runRenderCommand(
+        { week, env: createTestEnv(), signal: controller.signal },
+        {
+          workerClient,
+          outRoot: tempDir,
+          fetchImpl: mockFetch,
+          remotionAdapter: {
+            bundleComposition,
+            renderComposition,
+          },
+          stdout: () => {},
+        }
+      );
+
+      expect(result.pageCapturesCount).toBe(1);
+      expect(result.props.stories[0].page).toBeDefined();
+      expect(result.props.stories[0].page).toMatchObject({
+        screenshot_path: 'pages/1.png',
+        page_height: 2450,
+      });
+      expect(result.props.stories[0].page?.elements).toHaveLength(2);
+      expect(result.props.stories[0].cues).toEqual([
+        {
+          kind: 'focus',
+          anchor: 'Birinci haber',
+          target: 'h1',
+        },
+      ]);
+
+      // Story #2 had no page capture and no cues
+      expect(result.props.stories[1].page).toBeUndefined();
+      expect(result.props.stories[1].cues).toBeUndefined();
+    });
   });
 });
+
 
