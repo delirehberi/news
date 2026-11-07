@@ -120,7 +120,7 @@ describe('src/commands/upload.ts', () => {
             summary_tr: 'Özet 2',
             imageSrc: null,
             audioSrc: 'audio/2.mp3',
-            audioDurationSeconds: 54.4, // + 0.6s padding = 55.0s -> ends at 115.0s
+            audioDurationSeconds: 54.4, // + 0.6s padding = 55.0s, overlaps Story 1 by 0.5s -> starts at 59.5s, ends at 114.5s
             captions: [],
           },
         ],
@@ -142,19 +142,19 @@ describe('src/commands/upload.ts', () => {
           label: 'SQLite Üzerinde Dağıtık İşlemler',
         },
         {
-          timestamp: '01:00',
-          startSeconds: 60,
+          timestamp: '00:59',
+          startSeconds: 59,
           label: 'Linux Çekirdeğinde Rust Sürücüleri',
         },
-        { timestamp: '01:55', startSeconds: 115, label: 'Kapanış' },
+        { timestamp: '01:54', startSeconds: 114, label: 'Kapanış' },
       ]);
 
       expect(formatYouTubeChapters(chapters)).toBe(
         [
           '00:00 Giriş',
           '00:12 SQLite Üzerinde Dağıtık İşlemler',
-          '01:00 Linux Çekirdeğinde Rust Sürücüleri',
-          '01:55 Kapanış',
+          '00:59 Linux Çekirdeğinde Rust Sürücüleri',
+          '01:54 Kapanış',
         ].join('\n')
       );
     });

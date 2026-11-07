@@ -126,45 +126,52 @@ describe('src/domain/timeline.ts', () => {
         durationSeconds: 46,
       });
 
-      // Scene 2: Story 2
+      // Scene 2: Story 2 (overlaps Story 1 by 15 frames = 0.5s)
       expect(timeline.scenes[2]).toEqual({
         index: 2,
         kind: 'story',
         label: 'İkinci Haber Başlığı',
         storyIndex: 1,
-        startFrame: 1770,
+        startFrame: 1755,
         durationInFrames: 1530,
-        startSeconds: 59,
+        startSeconds: 58.5,
         durationSeconds: 51,
       });
 
-      // Scene 3: Story 3
+      // Scene 3: Story 3 (overlaps Story 2 by 15 frames = 0.5s)
       expect(timeline.scenes[3]).toEqual({
         index: 3,
         kind: 'story',
         label: 'Üçüncü Haber Başlığı',
         storyIndex: 2,
-        startFrame: 3300,
+        startFrame: 3270,
         durationInFrames: 1170,
-        startSeconds: 110,
+        startSeconds: 109,
         durationSeconds: 39,
       });
 
-      // Scene 4: Outro
+      // Scene 4: Outro (starts when Story 3 ends)
       expect(timeline.scenes[4]).toEqual({
         index: 4,
         kind: 'outro',
         label: 'Kapanış',
-        startFrame: 4470,
+        startFrame: 4440,
         durationInFrames: 330,
-        startSeconds: 149,
+        startSeconds: 148,
         durationSeconds: 11,
       });
 
-      // Total duration: 13 + 46 + 51 + 39 + 11 = 160s (2m 40s, within 2–5 min target) = 4800 frames
-      expect(timeline.totalDurationInFrames).toBe(4800);
-      expect(timeline.totalDurationSeconds).toBe(160);
-      expect(calculateTotalDurationFrames(props)).toBe(4800);
+      // Total duration: 4800 raw frames - 2 story transitions * 15 frames = 4770 frames (159.0s)
+      expect(timeline.transitionDurationInFrames).toBe(15);
+      expect(timeline.transitionOverlapCount).toBe(2);
+      expect(timeline.totalDurationInFrames).toBe(4770);
+      expect(timeline.totalDurationSeconds).toBe(159);
+      expect(calculateTotalDurationFrames(props)).toBe(4770);
+
+      // With transitionFrames = 0, no overlap is subtracted
+      expect(calculateTotalDurationFrames(props, VIDEO_FPS, SCENE_PADDING_SECONDS, 0)).toBe(
+        4800
+      );
     });
   });
 
@@ -538,6 +545,141 @@ describe('src/domain/timeline.ts', () => {
         width: 900,
         height: 80,
       });
+    });
+
+    it('animates Intro kinetic title word-by-word, keeps THUMBNAIL_FRAME readable, and builds card stack with or without page captures', async () => {
+      const { THUMBNAIL_FRAME } = await import('./timeline.ts');
+      const {
+        computeIntroCardStackStates,
+        computeKineticTitleWordStates,
+      } = await import('../remotion/WeeklyVideo.tsx');
+      const {
+        calculateTransitionSeriesDuration,
+        resolveStoryTransitionSpec,
+      } = await import('../remotion/primitives/index.ts');
+
+      const title = 'Haftalık Teknoloji Özeti: Yapay Zeka ve Rust';
+      const atZero = computeKineticTitleWordStates(title, 0, 30);
+      const atThumb = computeKineticTitleWordStates(title, THUMBNAIL_FRAME, 30);
+
+      expect(atZero).toHaveLength(7);
+      expect(atZero[0]?.delayFrames).toBe(0);
+      expect(atZero[6]?.delayFrames).toBeGreaterThan(0);
+      expect(atZero[6]?.opacity).toBe(0);
+
+      // Every word is fully opaque and settled near rest position at THUMBNAIL_FRAME (15)
+      for (const wordState of atThumb) {
+        expect(wordState.opacity).toBe(1);
+        expect(wordState.progress).toBeGreaterThan(0.85);
+        expect(Math.abs(wordState.translateY)).toBeLessThan(4);
+      }
+
+      // Intro works cleanly when no stories or no page captures exist
+      expect(computeIntroCardStackStates(undefined, THUMBNAIL_FRAME, 30)).toEqual([]);
+      expect(
+        computeIntroCardStackStates(
+          [
+            {
+              index: 1,
+              url: 'https://example.com/1',
+              domain: 'example.com',
+              source: 'hn',
+              headline_tr: 'Haber 1',
+              summary_tr: '',
+              imageSrc: null,
+              audioSrc: 'audio/1.mp3',
+              audioDurationSeconds: 10,
+              captions: [],
+            },
+          ],
+          THUMBNAIL_FRAME,
+          30
+        )
+      ).toEqual([]);
+
+      // When page captures exist, they fly in as a deterministic card stack and are visible at THUMBNAIL_FRAME
+      const storiesWithCaptures = [
+        {
+          index: 1,
+          url: 'https://example.com/1',
+          domain: 'example.com',
+          source: 'hn',
+          headline_tr: 'Haber 1',
+          summary_tr: '',
+          imageSrc: null,
+          audioSrc: 'audio/1.mp3',
+          audioDurationSeconds: 10,
+          captions: [],
+          page: {
+            screenshot_path: 'pages/1.png',
+            page_height: 2000,
+            elements: [],
+          },
+        },
+        {
+          index: 2,
+          url: 'https://lobste.rs/s/2',
+          domain: 'lobste.rs',
+          source: 'lobsters',
+          headline_tr: 'Haber 2',
+          summary_tr: '',
+          imageSrc: null,
+          audioSrc: 'audio/2.mp3',
+          audioDurationSeconds: 12,
+          captions: [],
+          page: {
+            screenshot_path: 'pages/2.png',
+            page_height: 2200,
+            elements: [],
+          },
+        },
+      ];
+
+      const stackAtZero = computeIntroCardStackStates(storiesWithCaptures, 0, 30);
+      const stackAtThumb = computeIntroCardStackStates(
+        storiesWithCaptures,
+        THUMBNAIL_FRAME,
+        30
+      );
+      expect(stackAtZero).toHaveLength(2);
+      expect(stackAtThumb).toHaveLength(2);
+      expect(stackAtThumb[0]?.opacity).toBe(1);
+      expect(stackAtThumb[1]?.opacity).toBe(1);
+      expect(stackAtThumb[0]?.translateX).toBeLessThan(stackAtZero[0]!.translateX);
+
+      // Deterministic transition choice seeded by story transition index
+      const t0A = resolveStoryTransitionSpec(0);
+      const t0B = resolveStoryTransitionSpec(0);
+      const t1 = resolveStoryTransitionSpec(1);
+      const t2 = resolveStoryTransitionSpec(2);
+      expect(t0A.kind).toBe('slide');
+      expect(t0B.kind).toBe('slide');
+      expect(t0A.direction).toBe(t0B.direction);
+      expect(t1.kind).toBe('wipe');
+      expect(t2.kind).toBe('slide');
+      expect(t2.direction).toBe('from-bottom');
+
+      // Story transition series duration matches timeline story span
+      const timeline = buildVideoTimeline({
+        week: '2026-W42',
+        title_tr: title,
+        siteUrl: 'news.emre.xyz',
+        intro: { audioSrc: '', audioDurationSeconds: 4, captions: [] },
+        stories: storiesWithCaptures,
+        outro: { audioSrc: '', audioDurationSeconds: 4, captions: [] },
+      });
+      const storyDurations = timeline.scenes
+        .filter((s) => s.kind === 'story')
+        .map((s) => s.durationInFrames);
+      const seriesDuration = calculateTransitionSeriesDuration(
+        storyDurations,
+        timeline.transitionDurationInFrames
+      );
+      const introFrames = timeline.scenes[0]!.durationInFrames;
+      const outroFrames = timeline.scenes[timeline.scenes.length - 1]!.durationInFrames;
+      expect(introFrames + seriesDuration + outroFrames).toBe(
+        timeline.totalDurationInFrames
+      );
     });
   });
 });

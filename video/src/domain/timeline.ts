@@ -11,6 +11,7 @@ export const VIDEO_HEIGHT = 1080;
 export const VIDEO_FPS = 30;
 export const SCENE_PADDING_SECONDS = 0.6;
 export const MIN_SCENE_DURATION_SECONDS = 1.5;
+export const STORY_TRANSITION_FRAMES = 15;
 export const THUMBNAIL_FRAME = 15;
 export const WEEKLY_VIDEO_COMPOSITION_ID = 'WeeklyVideo';
 export const DEFAULT_SITE_URL = 'news.emre.xyz';
@@ -161,6 +162,8 @@ export interface SceneTiming {
 export interface VideoTimeline {
   fps: number;
   scenes: SceneTiming[];
+  transitionDurationInFrames: number;
+  transitionOverlapCount: number;
   totalDurationInFrames: number;
   totalDurationSeconds: number;
 }
@@ -234,15 +237,22 @@ export function calculateSceneDurationFrames(
 /**
  * Pure function that builds the full ordered timeline (`intro`, `stories[0..N-1]`, `outro`)
  * with start frames, frame counts, and start/duration seconds for each scene.
+ * Consecutive story scenes overlap by `transitionFrames` (default `STORY_TRANSITION_FRAMES = 15`),
+ * matching `@remotion/transitions`'s `TransitionSeries` duration calculation.
  */
 export function buildVideoTimeline(
   props: WeeklyVideoProps,
   fps: number = VIDEO_FPS,
-  paddingSeconds: number = SCENE_PADDING_SECONDS
+  paddingSeconds: number = SCENE_PADDING_SECONDS,
+  transitionFrames: number = STORY_TRANSITION_FRAMES
 ): VideoTimeline {
   if (!Number.isFinite(fps) || fps <= 0) {
     throw new Error(`Invalid fps (${fps}): must be a positive number.`);
   }
+  const safeTransitionFrames =
+    Number.isFinite(transitionFrames) && transitionFrames >= 0
+      ? Math.round(transitionFrames)
+      : STORY_TRANSITION_FRAMES;
 
   const scenes: SceneTiming[] = [];
   let cursorFrame = 0;
@@ -264,6 +274,9 @@ export function buildVideoTimeline(
   cursorFrame += introFrames;
 
   props.stories.forEach((story, idx) => {
+    if (idx > 0 && safeTransitionFrames > 0) {
+      cursorFrame = Math.max(0, cursorFrame - safeTransitionFrames);
+    }
     const storyFrames = calculateSceneDurationFrames(
       story.audioDurationSeconds,
       fps,
@@ -298,10 +311,13 @@ export function buildVideoTimeline(
   });
   cursorFrame += outroFrames;
 
+  const transitionOverlapCount = Math.max(0, props.stories.length - 1);
   const totalDurationInFrames = Math.max(1, cursorFrame);
   return {
     fps,
     scenes,
+    transitionDurationInFrames: safeTransitionFrames,
+    transitionOverlapCount,
     totalDurationInFrames,
     totalDurationSeconds: totalDurationInFrames / fps,
   };
@@ -313,9 +329,11 @@ export function buildVideoTimeline(
 export function calculateTotalDurationFrames(
   props: WeeklyVideoProps,
   fps: number = VIDEO_FPS,
-  paddingSeconds: number = SCENE_PADDING_SECONDS
+  paddingSeconds: number = SCENE_PADDING_SECONDS,
+  transitionFrames: number = STORY_TRANSITION_FRAMES
 ): number {
-  return buildVideoTimeline(props, fps, paddingSeconds).totalDurationInFrames;
+  return buildVideoTimeline(props, fps, paddingSeconds, transitionFrames)
+    .totalDurationInFrames;
 }
 
 /**

@@ -5,6 +5,7 @@ import {
   Img,
   Sequence,
   interpolate,
+  spring,
   staticFile,
   useCurrentFrame,
   useVideoConfig,
@@ -29,6 +30,7 @@ import {
   getSourceBadgeTheme,
   normalizeStoryPage,
   resolveStoryFallbackMode,
+  STORY_TRANSITION_FRAMES,
   VIDEO_FPS,
   type NormalizedStoryPage,
   type SceneAudioProps,
@@ -43,7 +45,9 @@ import {
   QuoteCallout,
   Spotlight,
   StatCallout,
+  StoryTransitionSeries,
   type AnnotationItemProps,
+  type SceneTransitionItem,
 } from './primitives/index.ts';
 
 const FONT_SANS =
@@ -98,6 +102,183 @@ export function flattenCaptionWords(captions: readonly CaptionChunk[]): WordTimi
     }
   }
   return words;
+}
+
+export interface KineticTitleWordState {
+  word: string;
+  index: number;
+  delayFrames: number;
+  progress: number;
+  opacity: number;
+  translateY: number;
+  scale: number;
+}
+
+/**
+ * Pure frame-deterministic helper computing word-by-word spring states for the Intro kinetic title.
+ * Stagger is bounded so every word is readable by `THUMBNAIL_FRAME` (frame 15 at 30fps).
+ */
+export function computeKineticTitleWordStates(
+  title: string,
+  frame: number,
+  fps: number = VIDEO_FPS
+): KineticTitleWordState[] {
+  const safeFps = Number.isFinite(fps) && fps > 0 ? fps : VIDEO_FPS;
+  const words = title
+    .trim()
+    .split(/\s+/)
+    .filter((w) => w.length > 0);
+
+  if (words.length === 0) {
+    return [];
+  }
+
+  const maxStaggerFrames = 6;
+  const step =
+    words.length > 1 ? Math.min(1.2, maxStaggerFrames / (words.length - 1)) : 0;
+
+  return words.map((word, index) => {
+    const delayFrames = Number((index * step).toFixed(2));
+    const localFrame = Math.max(0, frame - delayFrames);
+    const progress = spring({
+      frame: localFrame,
+      fps: safeFps,
+      config: {
+        damping: 16,
+        stiffness: 220,
+        mass: 0.65,
+      },
+    });
+
+    const opacity = Number(
+      interpolate(localFrame, [0, 5], [0, 1], {
+        extrapolateLeft: 'clamp',
+        extrapolateRight: 'clamp',
+      }).toFixed(4)
+    );
+    const translateY = Number(interpolate(progress, [0, 1], [24, 0]).toFixed(2));
+    const scale = Number(interpolate(progress, [0, 1], [0.92, 1]).toFixed(4));
+
+    return {
+      word,
+      index,
+      delayFrames,
+      progress: Number(progress.toFixed(4)),
+      opacity,
+      translateY,
+      scale,
+    };
+  });
+}
+
+export interface IntroCaptureCardState {
+  storyIndex: number;
+  domain: string;
+  source: string;
+  headline: string;
+  screenshotSrc: string;
+  delayFrames: number;
+  progress: number;
+  opacity: number;
+  translateX: number;
+  translateY: number;
+  rotateDeg: number;
+  scale: number;
+}
+
+const CARD_STACK_ROTATIONS_DEG = [-6, 4.5, -2.5, 2] as const;
+
+/**
+ * Pure frame-deterministic helper extracting the week's page captures and computing their
+ * flying-in card stack transforms for the Intro montage. Returns `[]` when no stories have page captures.
+ */
+export function computeIntroCardStackStates(
+  stories: readonly StorySceneItem[] | undefined,
+  frame: number,
+  fps: number = VIDEO_FPS,
+  maxCards: number = 4
+): IntroCaptureCardState[] {
+  if (!stories || stories.length === 0) {
+    return [];
+  }
+
+  const safeFps = Number.isFinite(fps) && fps > 0 ? fps : VIDEO_FPS;
+  const captured: Array<{
+    story: StorySceneItem;
+    page: NormalizedStoryPage;
+  }> = [];
+
+  for (const story of stories) {
+    const normalized = normalizeStoryPage(story.page);
+    if (normalized) {
+      captured.push({ story, page: normalized });
+    }
+    if (captured.length >= Math.max(1, maxCards)) {
+      break;
+    }
+  }
+
+  if (captured.length === 0) {
+    return [];
+  }
+
+  const total = captured.length;
+  return captured.map(({ story, page }, idx) => {
+    const delayFrames = idx * 2;
+    const localFrame = Math.max(0, frame - delayFrames);
+    const progress = spring({
+      frame: localFrame,
+      fps: safeFps,
+      config: {
+        damping: 17,
+        stiffness: 190,
+        mass: 0.75,
+      },
+    });
+
+    const depthFromFront = total - 1 - idx;
+    const targetX = -depthFromFront * 18;
+    const targetY = -depthFromFront * 14;
+    const targetRotate =
+      total === 1
+        ? -2
+        : CARD_STACK_ROTATIONS_DEG[idx % CARD_STACK_ROTATIONS_DEG.length];
+    const targetScale = Number((1 - depthFromFront * 0.045).toFixed(4));
+
+    const translateX = Number(
+      interpolate(progress, [0, 1], [140 + idx * 24, targetX]).toFixed(2)
+    );
+    const translateY = Number(
+      interpolate(progress, [0, 1], [72 + idx * 16, targetY]).toFixed(2)
+    );
+    const rotateDeg = Number(
+      interpolate(progress, [0, 1], [targetRotate + 10, targetRotate]).toFixed(2)
+    );
+    const scale = Number(
+      interpolate(progress, [0, 1], [0.84, targetScale]).toFixed(4)
+    );
+    const opacity = Number(
+      interpolate(localFrame, [0, 6], [0, 1], {
+        extrapolateLeft: 'clamp',
+        extrapolateRight: 'clamp',
+      }).toFixed(4)
+    );
+
+    return {
+      storyIndex: story.index,
+      domain: story.domain || extractHostname(story.url),
+      source: story.source,
+      headline: story.headline_tr,
+      screenshotSrc: page.screenshotSrc,
+      delayFrames,
+      progress: Number(progress.toFixed(4)),
+      opacity,
+      translateX,
+      translateY,
+      rotateDeg,
+      scale,
+    };
+  });
 }
 
 export interface StoryWalkthroughPlan {
@@ -339,6 +520,7 @@ export interface IntroProps {
   siteUrl: string;
   storyCount: number;
   intro: SceneAudioProps;
+  stories?: readonly StorySceneItem[];
 }
 
 export const Intro: React.FC<IntroProps> = ({
@@ -347,23 +529,37 @@ export const Intro: React.FC<IntroProps> = ({
   siteUrl,
   storyCount,
   intro,
+  stories,
 }) => {
   const frame = useCurrentFrame();
   const { fps } = useVideoConfig();
 
-  const entranceOpacity = interpolate(frame, [0, 15], [0, 1], {
+  const eyebrowOpacity = interpolate(frame, [0, 10], [0, 1], {
     extrapolateLeft: 'clamp',
     extrapolateRight: 'clamp',
   });
-  const entranceTranslateY = interpolate(frame, [0, 18], [28, 0], {
+  const eyebrowTranslateY = interpolate(frame, [0, 12], [14, 0], {
     extrapolateLeft: 'clamp',
     extrapolateRight: 'clamp',
   });
+
+  const wordStates = useMemo(
+    () => computeKineticTitleWordStates(title_tr, frame, fps),
+    [title_tr, frame, fps]
+  );
+
+  const cardStack = useMemo(
+    () => computeIntroCardStackStates(stories, frame, fps, 4),
+    [stories, frame, fps]
+  );
+  const hasCardStack = cardStack.length > 0;
 
   const resolvedAudio = resolveAssetSrc(intro.audioSrc);
 
   return (
     <AbsoluteFill
+      data-scene="intro"
+      data-has-card-stack={hasCardStack ? 'true' : 'false'}
       style={{
         backgroundColor: COLOR_BG_DEEP,
         backgroundImage:
@@ -443,43 +639,233 @@ export const Intro: React.FC<IntroProps> = ({
         </div>
       </div>
 
-      {/* Center Hero Title */}
+      {/* Center Hero: Kinetic Word-by-Word Title + Optional Page Capture Card Stack Montage */}
       <div
         style={{
-          opacity: entranceOpacity,
-          transform: `translateY(${entranceTranslateY}px)`,
           display: 'flex',
-          flexDirection: 'column',
-          gap: 28,
-          maxWidth: 1560,
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: 56,
           marginTop: 'auto',
           marginBottom: 'auto',
+          width: '100%',
         }}
       >
         <div
           style={{
-            fontFamily: FONT_MONO,
-            fontSize: 24,
-            fontWeight: 600,
-            textTransform: 'uppercase',
-            letterSpacing: '0.16em',
-            color: COLOR_ACCENT,
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 28,
+            maxWidth: hasCardStack ? 1040 : 1560,
+            flex: 1,
           }}
         >
-          Haftalık Teknoloji ve Yazılım Özeti
+          <div
+            style={{
+              fontFamily: FONT_MONO,
+              fontSize: 24,
+              fontWeight: 600,
+              textTransform: 'uppercase',
+              letterSpacing: '0.16em',
+              color: COLOR_ACCENT,
+              opacity: eyebrowOpacity,
+              transform: `translateY(${eyebrowTranslateY.toFixed(2)}px)`,
+            }}
+          >
+            Haftalık Teknoloji ve Yazılım Özeti
+          </div>
+
+          <h1
+            data-component="intro-kinetic-title"
+            style={{
+              fontSize: hasCardStack ? 68 : 76,
+              fontWeight: 800,
+              lineHeight: 1.14,
+              letterSpacing: '-0.025em',
+              margin: 0,
+              color: COLOR_INK,
+              display: 'flex',
+              flexWrap: 'wrap',
+              gap: '8px 18px',
+            }}
+          >
+            {wordStates.map((ws) => (
+              <span
+                key={`title-word-${ws.index}-${ws.word}`}
+                data-word-index={ws.index}
+                style={{
+                  display: 'inline-block',
+                  opacity: ws.opacity,
+                  transform: `translate3d(0, ${ws.translateY}px, 0) scale(${ws.scale})`,
+                  transformOrigin: 'center bottom',
+                }}
+              >
+                {ws.word}
+              </span>
+            ))}
+          </h1>
         </div>
-        <h1
-          style={{
-            fontSize: 76,
-            fontWeight: 800,
-            lineHeight: 1.12,
-            letterSpacing: '-0.025em',
-            margin: 0,
-            color: COLOR_INK,
-          }}
-        >
-          {title_tr}
-        </h1>
+
+        {hasCardStack ? (
+          <div
+            data-component="intro-card-stack"
+            style={{
+              position: 'relative',
+              width: 560,
+              height: 400,
+              flexShrink: 0,
+            }}
+          >
+            {cardStack.map((card, idx) => {
+              const badge = getSourceBadgeTheme(card.source);
+              const resolvedSrc = resolveAssetSrc(card.screenshotSrc);
+              return (
+                <div
+                  key={`intro-card-${card.storyIndex}-${idx}`}
+                  data-card-story-index={card.storyIndex}
+                  style={{
+                    position: 'absolute',
+                    right: 12,
+                    bottom: 12,
+                    width: 500,
+                    height: 336,
+                    borderRadius: 16,
+                    overflow: 'hidden',
+                    backgroundColor: '#0f172a',
+                    border: '1px solid rgba(248, 250, 252, 0.22)',
+                    boxShadow:
+                      '0 24px 60px rgba(0, 0, 0, 0.65), 0 0 0 1px rgba(245, 158, 11, 0.14)',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    opacity: card.opacity,
+                    transform: `translate3d(${card.translateX}px, ${card.translateY}px, 0) rotate(${card.rotateDeg}deg) scale(${card.scale})`,
+                    transformOrigin: 'center center',
+                    zIndex: idx + 1,
+                  }}
+                >
+                  {/* Mini Browser Header */}
+                  <div
+                    style={{
+                      height: 34,
+                      backgroundColor: '#111827',
+                      borderBottom: '1px solid rgba(148, 163, 184, 0.2)',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      padding: '0 14px',
+                      gap: 10,
+                    }}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                      <span
+                        style={{
+                          width: 8,
+                          height: 8,
+                          borderRadius: 999,
+                          backgroundColor: '#ef4444',
+                        }}
+                      />
+                      <span
+                        style={{
+                          width: 8,
+                          height: 8,
+                          borderRadius: 999,
+                          backgroundColor: '#f59e0b',
+                        }}
+                      />
+                      <span
+                        style={{
+                          width: 8,
+                          height: 8,
+                          borderRadius: 999,
+                          backgroundColor: '#10b981',
+                        }}
+                      />
+                      <span
+                        style={{
+                          fontFamily: FONT_MONO,
+                          fontSize: 12,
+                          color: COLOR_INK_MUTED,
+                          marginLeft: 6,
+                          maxWidth: 240,
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                          whiteSpace: 'nowrap',
+                        }}
+                      >
+                        {card.domain}
+                      </span>
+                    </div>
+                    <span
+                      style={{
+                        fontFamily: FONT_MONO,
+                        fontSize: 11,
+                        fontWeight: 700,
+                        color: badge.textColor,
+                        backgroundColor: badge.backgroundColor,
+                        border: `1px solid ${badge.borderColor}`,
+                        borderRadius: 999,
+                        padding: '1px 8px',
+                      }}
+                    >
+                      #{card.storyIndex} {badge.label}
+                    </span>
+                  </div>
+
+                  {/* Page Capture Preview */}
+                  <div
+                    style={{
+                      position: 'relative',
+                      flex: 1,
+                      width: '100%',
+                      overflow: 'hidden',
+                      backgroundColor: COLOR_BG_CARD,
+                    }}
+                  >
+                    {resolvedSrc ? (
+                      <Img
+                        src={resolvedSrc}
+                        style={{
+                          width: '100%',
+                          height: '100%',
+                          objectFit: 'cover',
+                          objectPosition: 'top center',
+                        }}
+                      />
+                    ) : null}
+                    <div
+                      style={{
+                        position: 'absolute',
+                        inset: 0,
+                        background:
+                          'linear-gradient(180deg, rgba(9, 13, 22, 0.05) 0%, rgba(9, 13, 22, 0.86) 100%)',
+                        display: 'flex',
+                        alignItems: 'flex-end',
+                        padding: '14px 16px',
+                      }}
+                    >
+                      <span
+                        style={{
+                          fontFamily: FONT_SANS,
+                          fontSize: 16,
+                          fontWeight: 700,
+                          lineHeight: 1.25,
+                          color: COLOR_INK,
+                          display: '-webkit-box',
+                          WebkitLineClamp: 2,
+                          WebkitBoxOrient: 'vertical',
+                          overflow: 'hidden',
+                        }}
+                      >
+                        {card.headline}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        ) : null}
       </div>
 
       <CaptionOverlay captions={intro.captions} frameInScene={frame} fps={fps} />
@@ -1221,99 +1607,204 @@ export interface OutroProps {
   week: string;
   siteUrl: string;
   outro: SceneAudioProps;
+  stories?: readonly StorySceneItem[];
 }
 
-export const Outro: React.FC<OutroProps> = ({ week, siteUrl, outro }) => {
+export const Outro: React.FC<OutroProps> = ({
+  week,
+  siteUrl,
+  outro,
+  stories,
+}) => {
   const frame = useCurrentFrame();
   const { fps } = useVideoConfig();
 
   const resolvedAudio = resolveAssetSrc(outro.audioSrc);
-  const weeklyUrl = `${siteUrl.replace(/\/+$/, '')}/weekly/${week}`;
+  const cleanSiteUrl = siteUrl.replace(/^https?:\/\//i, '').replace(/\/+$/, '');
+  const weeklyUrl = `${cleanSiteUrl}/weekly/${week}`;
+  const fullWeeklyHref = `https://${weeklyUrl}`;
 
-  const entranceOpacity = interpolate(frame, [0, 15], [0, 1], {
+  const contentOpacity = interpolate(frame, [10, 26], [0, 1], {
+    extrapolateLeft: 'clamp',
+    extrapolateRight: 'clamp',
+  });
+  const contentTranslateY = interpolate(frame, [10, 28], [22, 0], {
     extrapolateLeft: 'clamp',
     extrapolateRight: 'clamp',
   });
 
+  const previewStories = (stories ?? []).slice(0, 4);
+
   return (
     <AbsoluteFill
+      data-scene="outro"
       style={{
         backgroundColor: COLOR_BG_DEEP,
         backgroundImage:
           'radial-gradient(circle at 50% 35%, rgba(245, 158, 11, 0.16), transparent 55%)',
         color: COLOR_INK,
         fontFamily: FONT_SANS,
-        padding: '88px 112px 168px 112px',
+        padding: '36px 56px 112px 56px',
+        boxSizing: 'border-box',
         display: 'flex',
         flexDirection: 'column',
-        justifyContent: 'space-between',
-        alignItems: 'center',
-        textAlign: 'center',
       }}
     >
       {resolvedAudio ? <Audio src={resolvedAudio} /> : null}
 
-      <div
-        style={{
-          fontFamily: FONT_MONO,
-          fontSize: 24,
-          color: COLOR_ACCENT,
-          letterSpacing: '0.12em',
-          textTransform: 'uppercase',
-        }}
+      <BrowserFrame
+        url={fullWeeklyHref}
+        typeStartFrame={2}
+        typeDurationInFrames={24}
+        typewriter={true}
+        badgeText={`Haftalık Bülten • ${week}`}
+        width="100%"
+        height="100%"
+        borderRadius={22}
       >
-        Haftalık Bülten • {week}
-      </div>
-
-      <div
-        style={{
-          opacity: entranceOpacity,
-          display: 'flex',
-          flexDirection: 'column',
-          alignItems: 'center',
-          gap: 32,
-          maxWidth: 1380,
-        }}
-      >
-        <h2
-          style={{
-            fontSize: 68,
-            fontWeight: 800,
-            lineHeight: 1.15,
-            margin: 0,
-            letterSpacing: '-0.02em',
-          }}
-        >
-          Tüm Haber Bağlantıları ve Türkçe Özetler
-        </h2>
-
         <div
           style={{
-            fontFamily: FONT_MONO,
-            fontSize: 44,
-            fontWeight: 700,
-            color: COLOR_ACCENT,
-            backgroundColor: COLOR_ACCENT_SOFT,
-            border: '2px solid rgba(245, 158, 11, 0.45)',
-            borderRadius: 18,
-            padding: '20px 42px',
+            width: '100%',
+            height: '100%',
+            padding: '48px 64px',
+            boxSizing: 'border-box',
+            display: 'flex',
+            flexDirection: 'column',
+            justifyContent: 'space-between',
+            background:
+              'linear-gradient(180deg, rgba(15, 23, 42, 0.96) 0%, rgba(9, 13, 22, 0.98) 100%)',
+            opacity: contentOpacity,
+            transform: `translate3d(0, ${contentTranslateY.toFixed(2)}px, 0)`,
           }}
         >
-          {weeklyUrl}
-        </div>
+          <div
+            style={{
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              textAlign: 'center',
+              gap: 20,
+              marginTop: 'auto',
+              marginBottom: 'auto',
+            }}
+          >
+            <div
+              style={{
+                fontFamily: FONT_MONO,
+                fontSize: 20,
+                color: COLOR_ACCENT,
+                letterSpacing: '0.14em',
+                textTransform: 'uppercase',
+              }}
+            >
+              Haftalık Arşiv • {week}
+            </div>
 
-        <p
-          style={{
-            fontSize: 32,
-            color: COLOR_INK_MUTED,
-            margin: 0,
-            lineHeight: 1.45,
-          }}
-        >
-          Kanala abone olmayı unutmayın • Canlı haber akışı için{' '}
-          <strong style={{ color: COLOR_INK }}>{siteUrl}</strong>
-        </p>
-      </div>
+            <h2
+              style={{
+                fontSize: 56,
+                fontWeight: 800,
+                lineHeight: 1.15,
+                margin: 0,
+                letterSpacing: '-0.02em',
+                maxWidth: 1240,
+              }}
+            >
+              Tüm Haber Bağlantıları ve Türkçe Özetler
+            </h2>
+
+            <div
+              data-component="outro-weekly-url-pill"
+              style={{
+                fontFamily: FONT_MONO,
+                fontSize: 38,
+                fontWeight: 700,
+                color: COLOR_ACCENT,
+                backgroundColor: COLOR_ACCENT_SOFT,
+                border: '2px solid rgba(245, 158, 11, 0.45)',
+                borderRadius: 16,
+                padding: '16px 36px',
+              }}
+            >
+              {weeklyUrl}
+            </div>
+
+            {previewStories.length > 0 ? (
+              <div
+                style={{
+                  display: 'grid',
+                  gridTemplateColumns:
+                    previewStories.length > 1 ? 'repeat(2, minmax(0, 1fr))' : '1fr',
+                  gap: 14,
+                  width: '100%',
+                  maxWidth: 1240,
+                  marginTop: 12,
+                  textAlign: 'left',
+                }}
+              >
+                {previewStories.map((story) => {
+                  const badge = getSourceBadgeTheme(story.source);
+                  return (
+                    <div
+                      key={`outro-story-${story.index}`}
+                      style={{
+                        backgroundColor: 'rgba(17, 24, 39, 0.88)',
+                        border: `1px solid ${COLOR_BORDER}`,
+                        borderRadius: 12,
+                        padding: '12px 18px',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 12,
+                      }}
+                    >
+                      <span
+                        style={{
+                          fontFamily: FONT_MONO,
+                          fontSize: 13,
+                          fontWeight: 700,
+                          color: badge.textColor,
+                          backgroundColor: badge.backgroundColor,
+                          border: `1px solid ${badge.borderColor}`,
+                          borderRadius: 999,
+                          padding: '2px 10px',
+                          flexShrink: 0,
+                        }}
+                      >
+                        #{story.index} {badge.label}
+                      </span>
+                      <span
+                        style={{
+                          fontSize: 18,
+                          fontWeight: 600,
+                          color: COLOR_INK,
+                          whiteSpace: 'nowrap',
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                        }}
+                      >
+                        {story.headline_tr}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : null}
+          </div>
+
+          <p
+            style={{
+              fontSize: 26,
+              color: COLOR_INK_MUTED,
+              margin: 0,
+              textAlign: 'center',
+              lineHeight: 1.4,
+            }}
+          >
+            Kanala abone olmayı unutmayın • Canlı haber akışı için{' '}
+            <strong style={{ color: COLOR_INK }}>{cleanSiteUrl}</strong>
+          </p>
+        </div>
+      </BrowserFrame>
 
       <CaptionOverlay captions={outro.captions} frameInScene={frame} fps={fps} />
     </AbsoluteFill>
@@ -1325,6 +1816,38 @@ export const WeeklyVideo: React.FC<WeeklyVideoProps> = (props) => {
   const timeline = buildVideoTimeline(props, fps);
   const introTiming = timeline.scenes[0];
   const outroTiming = timeline.scenes[timeline.scenes.length - 1];
+
+  const storiesStartFrame =
+    timeline.scenes.length > 2
+      ? timeline.scenes[1].startFrame
+      : introTiming.startFrame + introTiming.durationInFrames;
+  const storiesTotalDurationInFrames = Math.max(
+    0,
+    outroTiming.startFrame - storiesStartFrame
+  );
+
+  const storyTransitionItems: SceneTransitionItem[] = props.stories.map(
+    (story, idx) => {
+      const sceneTiming = timeline.scenes[idx + 1];
+      const isLastStory = idx === props.stories.length - 1;
+      return {
+        id: `story-${story.index}-${story.url}`,
+        durationInFrames: sceneTiming.durationInFrames,
+        transitionAfter: isLastStory
+          ? null
+          : { durationInFrames: STORY_TRANSITION_FRAMES },
+        render: () => (
+          <StoryScene
+            story={story}
+            storyCount={props.stories.length}
+            durationInFrames={sceneTiming.durationInFrames}
+            week={props.week}
+            siteUrl={props.siteUrl}
+          />
+        ),
+      };
+    }
+  );
 
   return (
     <AbsoluteFill style={{ backgroundColor: COLOR_BG_DEEP }}>
@@ -1339,35 +1862,34 @@ export const WeeklyVideo: React.FC<WeeklyVideoProps> = (props) => {
           siteUrl={props.siteUrl}
           storyCount={props.stories.length}
           intro={props.intro}
+          stories={props.stories}
         />
       </Sequence>
 
-      {props.stories.map((story, idx) => {
-        const sceneTiming = timeline.scenes[idx + 1];
-        return (
-          <Sequence
-            key={`story-${story.index}-${story.url}`}
-            name={`Story ${story.index}`}
-            from={sceneTiming.startFrame}
-            durationInFrames={sceneTiming.durationInFrames}
-          >
-            <StoryScene
-              story={story}
-              storyCount={props.stories.length}
-              durationInFrames={sceneTiming.durationInFrames}
-              week={props.week}
-              siteUrl={props.siteUrl}
-            />
-          </Sequence>
-        );
-      })}
+      {storyTransitionItems.length > 0 && storiesTotalDurationInFrames > 0 ? (
+        <Sequence
+          name="Stories"
+          from={storiesStartFrame}
+          durationInFrames={storiesTotalDurationInFrames}
+        >
+          <StoryTransitionSeries
+            scenes={storyTransitionItems}
+            defaultTransitionFrames={STORY_TRANSITION_FRAMES}
+          />
+        </Sequence>
+      ) : null}
 
       <Sequence
         name="Outro"
         from={outroTiming.startFrame}
         durationInFrames={outroTiming.durationInFrames}
       >
-        <Outro week={props.week} siteUrl={props.siteUrl} outro={props.outro} />
+        <Outro
+          week={props.week}
+          siteUrl={props.siteUrl}
+          outro={props.outro}
+          stories={props.stories}
+        />
       </Sequence>
     </AbsoluteFill>
   );

@@ -277,9 +277,9 @@ describe('src/commands/render.ts', () => {
       expect(result.props.stories[0].imageSrc).toBe('images/1.png');
       expect(result.props.stories[1].imageSrc).toBeNull();
 
-      // Total duration: (14.4+0.6) + (54.4+0.6) + (59.4+0.6) + (12.4+0.6) = 15 + 55 + 60 + 13 = 143s = 4290 frames
-      expect(result.timeline.totalDurationSeconds).toBe(143);
-      expect(result.timeline.totalDurationInFrames).toBe(4290);
+      // Total duration: (14.4+0.6) + (54.4+0.6) + (59.4+0.6) + (12.4+0.6) = 15 + 55 + 60 + 13 = 143s (4290 frames) minus 1 story transition overlap (15 frames = 0.5s) = 142.5s (4275 frames)
+      expect(result.timeline.totalDurationSeconds).toBe(142.5);
+      expect(result.timeline.totalDurationInFrames).toBe(4275);
 
       expect(bundleComposition).toHaveBeenCalledTimes(1);
       expect(renderComposition).toHaveBeenCalledTimes(1);
