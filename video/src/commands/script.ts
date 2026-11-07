@@ -46,7 +46,10 @@ export async function runScriptCommand(
 
   const expectedUrls = translation.items.map((item) => item.url.trim());
   const pageCapturesByUrl = await loadWeekPageCapturesByUrl(paths.pagesDir, expectedUrls);
-  const responseSchema = createScriptResponseSchema(expectedUrls);
+  const responseSchema = createScriptResponseSchema(expectedUrls, {
+    pageCapturesByUrl,
+    onWarn: (msg) => stdout(`[warn] ${msg}`),
+  });
   const userPrompt = buildScriptUserPrompt(ctx.week, translation, pageCapturesByUrl);
 
   const script = await chat({

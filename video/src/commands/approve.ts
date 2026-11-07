@@ -57,7 +57,9 @@ export async function runApproveCommand(
   const paths = getWeekPaths(ctx.week, deps.outRoot);
 
   const markdown = await readText(paths.scriptMd);
-  const script = fromMarkdown(markdown);
+  const script = fromMarkdown(markdown, {
+    onWarn: (msg) => stdout(`[warn] ${msg}`),
+  });
   const wordCount = validateScriptWordBudget(script);
 
   await writeJsonAtomic(paths.scriptJson, script);

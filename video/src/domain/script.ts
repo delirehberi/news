@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { VisualCueSchema, type VisualCue } from './cues.ts';
 
 export const WORDS_MIN = 280;
 export const WORDS_MAX = 700;
@@ -12,10 +13,16 @@ const HEADLINE_HEADING_PREFIX = '### ';
 const HEADLINE_LABEL_PREFIX = 'Headline:';
 const BOLD_HEADLINE_LABEL_PREFIX = '**Headline:**';
 
+const CUE_LINE_DOUBLE_QUOTE_REGEX =
+  /^>\s*(\S+)\s+@"((?:[^"\\]|\\.)*)"(?:\s*(?:->\s*(.*?))?(?:\s*\|\s*(.+))?|\s*=>\s*(.+))?\s*$/;
+const CUE_LINE_SINGLE_QUOTE_REGEX =
+  /^>\s*(\S+)\s+@'((?:[^'\\]|\\.)*)'(?:\s*(?:->\s*(.*?))?(?:\s*\|\s*(.+))?|\s*=>\s*(.+))?\s*$/;
+
 export const ScriptSegmentSchema = z.object({
   item_url: z.string().trim().min(1, 'Story item_url must not be empty'),
   headline_tr: z.string().trim().min(1, 'Story headline_tr must not be empty'),
   narration_tr: z.string().trim().min(1, 'Story narration_tr must not be empty'),
+  visuals: z.array(VisualCueSchema).optional(),
 });
 
 export type ScriptSegment = z.infer<typeof ScriptSegmentSchema>;
@@ -27,6 +34,10 @@ export const ScriptSchema = z.object({
 });
 
 export type Script = z.infer<typeof ScriptSchema>;
+
+export interface FromMarkdownOptions {
+  onWarn?: (msg: string) => void;
+}
 
 /**
  * Counts whitespace-delimited words in a string.
@@ -77,8 +88,70 @@ export function validateScriptWordBudget(script: Script): number {
 }
 
 /**
+ * Serializes a single `VisualCue` into an editable Markdown line:
+ * e.g. `> focus @"yeni model" -> h1` or `> circle @"yüzde 40" -> p3`.
+ */
+export function formatVisualCueLine(cue: VisualCue): string {
+  const escapedAnchor = cue.anchor.trim().replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  const target = cue.target?.trim();
+  const value = cue.value?.trim();
+
+  if (target && value) {
+    return `> ${cue.kind} @"${escapedAnchor}" -> ${target} | ${value}`;
+  }
+  if (target) {
+    return `> ${cue.kind} @"${escapedAnchor}" -> ${target}`;
+  }
+  if (value) {
+    return `> ${cue.kind} @"${escapedAnchor}" => ${value}`;
+  }
+  return `> ${cue.kind} @"${escapedAnchor}"`;
+}
+
+/**
+ * Parses a single `> <kind> @"<anchor>" -> <target>` Markdown line into a validated `VisualCue`,
+ * or returns `null` if the line is malformed or fails `VisualCueSchema`.
+ */
+export function parseVisualCueLine(line: string): VisualCue | null {
+  const trimmed = line.trim();
+  const match =
+    CUE_LINE_DOUBLE_QUOTE_REGEX.exec(trimmed) ??
+    CUE_LINE_SINGLE_QUOTE_REGEX.exec(trimmed);
+
+  if (!match) {
+    return null;
+  }
+
+  const rawKind = match[1]?.trim() ?? '';
+  const rawAnchor = (match[2] ?? '')
+    .replace(/\\"/g, '"')
+    .replace(/\\'/g, "'")
+    .replace(/\\\\/g, '\\')
+    .trim();
+  const rawTarget = match[3]?.trim();
+  const rawPipeValue = match[4]?.trim();
+  const rawArrowValue = match[5]?.trim();
+  const rawValue = rawPipeValue || rawArrowValue;
+
+  const candidate: Record<string, unknown> = {
+    kind: rawKind,
+    anchor: rawAnchor,
+    ...(rawTarget ? { target: rawTarget } : {}),
+    ...(rawValue ? { value: rawValue } : {}),
+  };
+
+  const parsed = VisualCueSchema.safeParse(candidate);
+  if (!parsed.success) {
+    return null;
+  }
+
+  return parsed.data;
+}
+
+/**
  * Serializes a `Script` into an editable Markdown document using fixed
- * `## Intro`, `## Story N: <url>`, and `## Outro` headings.
+ * `## Intro`, `## Story N: <url>`, and `## Outro` headings, plus optional
+ * `> <kind> @"<anchor>" -> <target>` visual cue lines under each story.
  */
 export function toMarkdown(script: Script): string {
   const lines: string[] = [
@@ -94,6 +167,12 @@ export function toMarkdown(script: Script): string {
     lines.push(`${HEADLINE_HEADING_PREFIX}${segment.headline_tr.trim()}`);
     lines.push('');
     lines.push(segment.narration_tr.trim());
+    if (segment.visuals && segment.visuals.length > 0) {
+      lines.push('');
+      for (const cue of segment.visuals) {
+        lines.push(formatVisualCueLine(cue));
+      }
+    }
     lines.push('');
   });
 
@@ -153,7 +232,8 @@ function splitMarkdownSections(md: string): RawMarkdownSection[] {
 function parseStorySectionBody(
   storyNumber: number,
   itemUrl: string,
-  bodyLines: readonly string[]
+  bodyLines: readonly string[],
+  onWarn?: (msg: string) => void
 ): ScriptSegment {
   let startIdx = 0;
   while (startIdx < bodyLines.length && bodyLines[startIdx].trim().length === 0) {
@@ -187,10 +267,28 @@ function parseStorySectionBody(
     );
   }
 
-  const narrationTr = bodyLines
-    .slice(startIdx + 1)
-    .join('\n')
-    .trim();
+  const narrationLines: string[] = [];
+  const visuals: VisualCue[] = [];
+  const warn = onWarn ?? ((msg: string) => console.warn(msg));
+
+  for (let i = startIdx + 1; i < bodyLines.length; i++) {
+    const rawLine = bodyLines[i];
+    const trimmed = rawLine.trim();
+    if (trimmed.startsWith('>')) {
+      const parsedCue = parseVisualCueLine(trimmed);
+      if (parsedCue) {
+        visuals.push(parsedCue);
+      } else {
+        warn(
+          `Story #${storyNumber} (${itemUrl}): dropping invalid markdown visual cue line "${trimmed}".`
+        );
+      }
+    } else {
+      narrationLines.push(rawLine);
+    }
+  }
+
+  const narrationTr = narrationLines.join('\n').trim();
 
   if (!narrationTr) {
     throw new Error(
@@ -202,14 +300,17 @@ function parseStorySectionBody(
     item_url: itemUrl,
     headline_tr: headlineTr,
     narration_tr: narrationTr,
+    ...(visuals.length > 0 ? { visuals } : {}),
   };
 }
 
 /**
  * Parses an editable `script.md` string back into a validated `Script` object.
  * Requires fixed `## Intro`, sequential `## Story N: <url>` (1..N), and `## Outro` headings.
+ * Optional `> <kind> @"<anchor>" -> <target>` lines under each story are parsed into `visuals`.
+ * Invalid cue lines are dropped with a warning without failing the script.
  */
-export function fromMarkdown(md: string): Script {
+export function fromMarkdown(md: string, options?: FromMarkdownOptions): Script {
   const sections = splitMarkdownSections(md);
 
   if (sections.length === 0) {
@@ -267,7 +368,9 @@ export function fromMarkdown(md: string): Script {
       );
     }
 
-    segments.push(parseStorySectionBody(expectedStoryNum, itemUrl, section.bodyLines));
+    segments.push(
+      parseStorySectionBody(expectedStoryNum, itemUrl, section.bodyLines, options?.onWarn)
+    );
   }
 
   return {
@@ -276,4 +379,5 @@ export function fromMarkdown(md: string): Script {
     outro,
   };
 }
+
 

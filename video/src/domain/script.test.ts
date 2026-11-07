@@ -141,5 +141,98 @@ describe('src/domain/script.ts', () => {
       )
     ).toThrowError(/story narration must not be empty/);
   });
+
+  it('serializes and parses visual cues in Markdown round-trip (> focus @"..." -> h1) and preserves legacy scripts without cues', () => {
+    const base = makeBudgetScript(360);
+    const scriptWithCues: Script = {
+      ...base,
+      segments: [
+        {
+          ...base.segments[0],
+          narration_tr:
+            'Yeni model açık kaynak dünyasında yüzde 40 daha hızlı çıkarım sağlıyor. ' +
+            base.segments[0].narration_tr,
+          visuals: [
+            { kind: 'focus', anchor: 'yeni model', target: 'h1' },
+            { kind: 'circle', anchor: 'yüzde 40', target: 'p3' },
+            { kind: 'stat', anchor: 'daha hızlı', target: '%40', value: '+40%' },
+          ],
+        },
+        {
+          // Legacy / cue-less story segment in the same script
+          ...base.segments[1],
+        },
+      ],
+    };
+
+    const md = toMarkdown(scriptWithCues);
+    expect(md).toContain('> focus @"yeni model" -> h1');
+    expect(md).toContain('> circle @"yüzde 40" -> p3');
+    expect(md).toContain('> stat @"daha hızlı" -> %40 | +40%');
+
+    const roundTripped = fromMarkdown(md);
+    expect(roundTripped).toEqual(scriptWithCues);
+    expect(roundTripped.segments[0].visuals).toEqual([
+      { kind: 'focus', anchor: 'yeni model', target: 'h1' },
+      { kind: 'circle', anchor: 'yüzde 40', target: 'p3' },
+      { kind: 'stat', anchor: 'daha hızlı', target: '%40', value: '+40%' },
+    ]);
+    expect(roundTripped.segments[1].visuals).toBeUndefined();
+    expect(toMarkdown(roundTripped)).toBe(md);
+
+    // Cue lines are not counted in spoken narration word count
+    expect(countScriptWords(roundTripped)).toBe(countScriptWords({
+      ...scriptWithCues,
+      segments: scriptWithCues.segments.map(({ item_url, headline_tr, narration_tr }) => ({
+        item_url,
+        headline_tr,
+        narration_tr,
+      })),
+    }));
+  });
+
+  it('drops invalid visual cue lines in fromMarkdown with a warning and never fails the script', () => {
+    const base = makeBudgetScript(340);
+    const md = [
+      '## Intro',
+      '',
+      base.intro,
+      '',
+      `## Story 1: ${base.segments[0].item_url}`,
+      `### ${base.segments[0].headline_tr}`,
+      '',
+      base.segments[0].narration_tr,
+      '',
+      '> focus @"birinci1 birinci2" -> h1',
+      '> unknown_kind @"birinci3" -> p1',
+      '> circle @"" -> p2',
+      '> malformed line without anchor syntax',
+      '> highlight @"birinci4 birinci5" -> p3',
+      '',
+      `## Story 2: ${base.segments[1].item_url}`,
+      `### ${base.segments[1].headline_tr}`,
+      '',
+      base.segments[1].narration_tr,
+      '',
+      '> totally broken cue',
+      '',
+      '## Outro',
+      '',
+      base.outro,
+      '',
+    ].join('\n');
+
+    const warnings: string[] = [];
+    const parsed = fromMarkdown(md, { onWarn: (msg) => warnings.push(msg) });
+
+    expect(warnings).toHaveLength(4);
+    expect(parsed.segments[0].visuals).toEqual([
+      { kind: 'focus', anchor: 'birinci1 birinci2', target: 'h1' },
+      { kind: 'highlight', anchor: 'birinci4 birinci5', target: 'p3' },
+    ]);
+    // Story 2 had only an invalid cue -> dropped cleanly, leaving visuals undefined (default choreography)
+    expect(parsed.segments[1].visuals).toBeUndefined();
+  });
 });
+
 

@@ -178,5 +178,57 @@ describe('src/commands/approve.ts', () => {
     const publishedEdition = await assertEditionApproved(publishedClient, week, 'upload');
     expect(publishedEdition.status).toBe('published');
   });
+
+  it('preserves human-edited visual cues from script.md into script.json and Worker putEdition', async () => {
+    const week = '2026-W42';
+    const paths = getWeekPaths(week, tempDir);
+    const scriptWithEditedCues: Script = {
+      ...makeEditedScript(350),
+      segments: [
+        {
+          item_url: 'https://example.com/linux-kernel-rust',
+          headline_tr: 'Linux Kernel Rust Sürücüleri',
+          narration_tr:
+            'Yeni model sürücü katmanı yüzde 40 daha hızlı çalışıyor. ' +
+            generateWords(130, 'detaybir'),
+          visuals: [
+            { kind: 'focus', anchor: 'yeni model', target: 'h1' },
+            { kind: 'circle', anchor: 'yüzde 40', target: 'p3' },
+          ],
+        },
+        {
+          item_url: 'https://example.com/cloudflare-workers-sql',
+          headline_tr: 'Sıfır Gecikmeli Edge Önbellekleme',
+          narration_tr: generateWords(140, 'detayiki'),
+        },
+      ],
+    };
+
+    await writeTextAtomic(paths.scriptMd, toMarkdown(scriptWithEditedCues));
+    const workerClient = makeMockWorkerClient('approved');
+
+    const result = await runApproveCommand(
+      {
+        week,
+        env: validateEnv({ INGESTION_SECRET: 'test-secret' }),
+        signal: new AbortController().signal,
+      },
+      {
+        workerClient,
+        outRoot: tempDir,
+        stdout: () => {},
+      }
+    );
+
+    expect(result.script.segments[0].visuals).toEqual([
+      { kind: 'focus', anchor: 'yeni model', target: 'h1' },
+      { kind: 'circle', anchor: 'yüzde 40', target: 'p3' },
+    ]);
+    expect(result.script.segments[1].visuals).toBeUndefined();
+
+    const syncedScriptJson = await readJson<Script>(paths.scriptJson);
+    expect(syncedScriptJson).toEqual(scriptWithEditedCues);
+  });
 });
+
 
