@@ -10,7 +10,9 @@
   },
   "dependencies": {
     "@remotion/bundler": "^4.0.0",
+    "@remotion/paths": "^4.0.537",
     "@remotion/renderer": "^4.0.0",
+    "@remotion/transitions": "^4.0.537",
     "puppeteer-core": "^25.16.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
