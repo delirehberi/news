@@ -20,6 +20,10 @@ describe('src/cli.ts', () => {
     const parsed2 = parseCliArgs(['--week=2026-W11', 'approve']);
     expect(parsed2.command).toBe('approve');
     expect(parsed2.week).toBe('2026-W11');
+
+    const parsed3 = parseCliArgs(['capture', '--week', '2026-W45']);
+    expect(parsed3.command).toBe('capture');
+    expect(parsed3.week).toBe('2026-W45');
   });
 
   it('rejects unknown commands or malformed weeks', () => {

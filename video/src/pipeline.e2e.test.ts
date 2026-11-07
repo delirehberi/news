@@ -4,6 +4,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { parseCliArgs, type CommandContext } from './cli.ts';
 import { runApproveCommand } from './commands/approve.ts';
+import { runCaptureCommand } from './commands/capture.ts';
 import { runRenderCommand, type RemotionRendererAdapter } from './commands/render.ts';
 import { runScriptCommand } from './commands/script.ts';
 import { runSelectCommand } from './commands/select.ts';
@@ -400,7 +401,7 @@ describe('Weekly Video Pipeline End-to-End & Security Audit', () => {
       signal: new AbortController().signal,
     };
 
-    // --- STAGE 1: make video-draft (select -> translate -> script) ---
+    // --- STAGE 1: make video-draft (select -> translate -> capture -> script) ---
     const selection = await runSelectCommand(ctx, {
       workerClient,
       outRoot: tempDir,
@@ -415,6 +416,31 @@ describe('Weekly Video Pipeline End-to-End & Security Audit', () => {
       stdout,
     });
     expect(draftEdition.status).toBe('draft');
+
+    const captureResult = await runCaptureCommand(ctx, {
+      outRoot: tempDir,
+      dnsLookup: async () => [{ address: '93.184.216.34', family: 4 }],
+      browserFactory: async () => ({
+        captureUrl: async ({ url }) => ({
+          screenshotPng: new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+          extraction: {
+            pageHeight: 2400,
+            excerpt: `Captured article text for ${url}`,
+            elements: [
+              {
+                kind: 'h1',
+                tagName: 'h1',
+                text: `Title for ${url}`,
+                box: { x: 160, y: 100, width: 800, height: 60 },
+              },
+            ],
+          },
+        }),
+        close: async () => {},
+      }),
+      stdout,
+    });
+    expect(captureResult.capturedCount).toBe(2);
 
     const { wordCount: initialWordCount } = await runScriptCommand(ctx, {
       outRoot: tempDir,

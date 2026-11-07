@@ -44,6 +44,7 @@ describe('src/lib/paths.ts', () => {
     expect(paths.scriptMd).toBe('/tmp/video-out/2026-W42/script.md');
     expect(paths.audioDir).toBe('/tmp/video-out/2026-W42/audio');
     expect(paths.imagesDir).toBe('/tmp/video-out/2026-W42/images');
+    expect(paths.pagesDir).toBe('/tmp/video-out/2026-W42/pages');
     expect(paths.videoMp4).toBe('/tmp/video-out/2026-W42/video.mp4');
     expect(paths.thumbnailPng).toBe('/tmp/video-out/2026-W42/thumbnail.png');
     expect(paths.uploadJson).toBe('/tmp/video-out/2026-W42/upload.json');

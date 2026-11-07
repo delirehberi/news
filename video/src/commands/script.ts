@@ -13,6 +13,7 @@ import {
   createScriptResponseSchema,
   SCRIPT_SYSTEM_PROMPT,
 } from '../prompts/script.ts';
+import { loadWeekPageCapturesByUrl } from './capture.ts';
 import type { WeeklyTranslation } from './translate.ts';
 
 export interface ScriptCommandDeps {
@@ -22,7 +23,8 @@ export interface ScriptCommandDeps {
 }
 
 /**
- * Reads `out/<week>/translation.json`, requests a Turkish narration script from the
+ * Reads `out/<week>/translation.json` (and any captured article excerpts from
+ * `out/<week>/pages/<n>.json`), requests a Turkish narration script from the
  * AI Gateway (`chat()`) within `[WORDS_MIN, WORDS_MAX]`, and writes both
  * `out/<week>/script.json` and editable `out/<week>/script.md`.
  */
@@ -43,8 +45,9 @@ export async function runScriptCommand(
   }
 
   const expectedUrls = translation.items.map((item) => item.url.trim());
+  const pageCapturesByUrl = await loadWeekPageCapturesByUrl(paths.pagesDir, expectedUrls);
   const responseSchema = createScriptResponseSchema(expectedUrls);
-  const userPrompt = buildScriptUserPrompt(ctx.week, translation);
+  const userPrompt = buildScriptUserPrompt(ctx.week, translation, pageCapturesByUrl);
 
   const script = await chat({
     baseUrl: aiEnv.AI_GATEWAY_BASE_URL,

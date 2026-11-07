@@ -2,7 +2,7 @@
 RECLUSTER_ENDPOINT ?= https://news.emre.xyz/api/admin/recluster
 RECLUSTER_TIMEOUT_SECONDS ?= 900
 
-.PHONY: recluster recluster-dry test typecheck types setup init push-secrets worker-init db-init db-migrate db-migrate-local db-migrate-list db-migrate-create vectorize-init dev-worker dev-frontend frontend-build deploy-worker deploy video-init video-test video-typecheck video-draft video-approve video-produce video-auth
+.PHONY: recluster recluster-dry test typecheck types setup init push-secrets worker-init db-init db-migrate db-migrate-local db-migrate-list db-migrate-create vectorize-init dev-worker dev-frontend frontend-build deploy-worker deploy video-init video-test video-typecheck video-draft video-capture video-approve video-produce video-auth
 
 NVM_CMD=. ~/.nvm/nvm.sh && nvm use &&
 
@@ -134,10 +134,15 @@ video-test:
 	bash -c '$(NVM_CMD) cd video && npx vitest run'
 
 video-draft:
-	@echo "Running weekly video draft pipeline (select -> translate -> script)..."
+	@echo "Running weekly video draft pipeline (select -> translate -> capture -> script)..."
 	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts select $(if $(WEEK),--week $(WEEK),)'
 	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts translate $(if $(WEEK),--week $(WEEK),)'
+	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts capture $(if $(WEEK),--week $(WEEK),)'
 	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts script $(if $(WEEK),--week $(WEEK),)'
+
+video-capture:
+	@echo "Capturing full-page screenshots and element maps for weekly stories..."
+	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts capture $(if $(WEEK),--week $(WEEK),)'
 
 video-approve:
 	@echo "Approving weekly video script and publishing Turkish web edition..."

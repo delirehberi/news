@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import type { WeeklyTranslation } from '../commands/translate.ts';
+import type { PageCaptureMetadata } from '../domain/pageCapture.ts';
 import {
   countScriptWords,
   ScriptSchema,
@@ -73,23 +74,31 @@ export function createScriptResponseSchema(
 }
 
 /**
- * Builds the user prompt supplying the translated weekly edition for Turkish video script generation.
+ * Builds the user prompt supplying the translated weekly edition (and optional
+ * captured article excerpts from `out/<week>/pages/<n>.json`) for Turkish video script generation.
  */
 export function buildScriptUserPrompt(
   week: string,
-  translation: Pick<WeeklyTranslation, 'title_tr' | 'intro_tr' | 'items'>
+  translation: Pick<WeeklyTranslation, 'title_tr' | 'intro_tr' | 'items'>,
+  pageCapturesByUrl?: ReadonlyMap<string, Pick<PageCaptureMetadata, 'excerpt'>>
 ): string {
   const inputPayload = {
     week,
     title_tr: translation.title_tr,
     intro_tr: translation.intro_tr,
-    stories: translation.items.map((item, idx) => ({
-      index: idx + 1,
-      item_url: item.url,
-      title_tr: item.title_tr,
-      summary_tr: item.summary_tr,
-      source: item.source,
-    })),
+    stories: translation.items.map((item, idx) => {
+      const normalizedUrl = item.url.trim();
+      const capture = pageCapturesByUrl?.get(normalizedUrl);
+      const excerpt = capture?.excerpt?.trim();
+      return {
+        index: idx + 1,
+        item_url: item.url,
+        title_tr: item.title_tr,
+        summary_tr: item.summary_tr,
+        source: item.source,
+        ...(excerpt ? { excerpt } : {}),
+      };
+    }),
   };
 
   return [

@@ -52,6 +52,7 @@ export interface WeekPaths {
   scriptMd: string;
   audioDir: string;
   imagesDir: string;
+  pagesDir: string;
   videoMp4: string;
   thumbnailPng: string;
   uploadJson: string;
@@ -76,6 +77,7 @@ export function getWeekPaths(week: string, outRoot: string = DEFAULT_OUT_ROOT): 
     scriptMd: path.join(dir, 'script.md'),
     audioDir: path.join(dir, 'audio'),
     imagesDir: path.join(dir, 'images'),
+    pagesDir: path.join(dir, 'pages'),
     videoMp4: path.join(dir, 'video.mp4'),
     thumbnailPng: path.join(dir, 'thumbnail.png'),
     uploadJson: path.join(dir, 'upload.json'),

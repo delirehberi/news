@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { validateEnv, type VideoEnv } from './config/env.ts';
 import { assertEditionApproved, runApproveCommand } from './commands/approve.ts';
 import { runAuthCommand } from './commands/auth.ts';
+import { runCaptureCommand } from './commands/capture.ts';
 import { runRenderCommand } from './commands/render.ts';
 import { runScriptCommand } from './commands/script.ts';
 import { runSelectCommand } from './commands/select.ts';
@@ -16,6 +17,7 @@ import type { WorkerClient } from './lib/workerClient.ts';
 export const CLI_COMMANDS = [
   'select',
   'translate',
+  'capture',
   'script',
   'approve',
   'voice',
@@ -53,6 +55,7 @@ export function formatHelpText(): string {
     'Commands:',
     '  select      Fetch and rank weekly candidates into out/<week>/selection.json',
     '  translate   Translate selected stories into Turkish and save draft edition',
+    '  capture     Capture full-page screenshots and element maps into out/<week>/pages/',
     '  script      Generate Turkish narration script (script.json + editable script.md)',
     '  approve     Validate edited script.md and mark weekly edition as approved',
     '  voice       Synthesize ElevenLabs Turkish audio and word alignments per segment',
@@ -154,6 +157,9 @@ export const defaultCommandHandlers: Record<CliCommand, CommandHandler> = {
   },
   translate: async (ctx) => {
     await runTranslateCommand(ctx);
+  },
+  capture: async (ctx) => {
+    await runCaptureCommand(ctx);
   },
   script: async (ctx) => {
     await runScriptCommand(ctx);
