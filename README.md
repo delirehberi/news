@@ -136,14 +136,40 @@ All `video-*` targets default to the **previous ISO week in UTC** (`YYYY-Www`). 
 
 - `make video-init` — Install `video/` dependencies and initialize `video/.env` from `video/.env.example`.
 - `make video-auth` — Run the one-time loopback YouTube OAuth2 PKCE flow and print `YOUTUBE_REFRESH_TOKEN`.
-- `make video-draft [WEEK=YYYY-Www]` — Run the draft stage (`select` → `translate` → `script`), writing `video/out/<week>/selection.json`, `translation.json`, `script.json`, and editable `script.md`, and saving the edition on the Worker as `status: "draft"`.
-- `make video-approve [WEEK=YYYY-Www]` — Parse and validate `video/out/<week>/script.md` (checking required sections and the 280–700 word narration budget), update `script.json`, and promote the Worker edition to `status: "approved"` (making `/weekly/<week>` live).
+- `make video-draft [WEEK=YYYY-Www]` — Run the draft stage (`select` → `translate` → `capture` → `script`), writing `video/out/<week>/selection.json`, `translation.json`, `pages/<n>.png` + `pages/<n>.json`, `script.json`, and editable `script.md`, and saving the edition on the Worker as `status: "draft"`.
+- `make video-capture [WEEK=YYYY-Www]` — Standalone capture stage: uses headless Chromium (Playwright) to capture full-page screenshots (`pages/<n>.png`) and bounding-box element maps (`pages/<n>.json`, e.g. `h1`, `h2-1`, `p1`, `code1`, `quote1`, `img1`) for each story in `translation.json`, cached by URL SHA-256 hash. A failed or blocked capture logs a warning and falls back to the story OG image, then the branded card, without failing the run.
+- `make video-approve [WEEK=YYYY-Www]` — Parse and validate `video/out/<week>/script.md` (checking required sections, visual cues, and the 280–700 word narration budget), update `script.json`, and promote the Worker edition to `status: "approved"` (making `/weekly/<week>` live).
 - `make video-produce [WEEK=YYYY-Www]` — Run the production stage (`voice` → `render` → `upload`):
   - `voice`: Synthesizes per-segment Turkish audio (`audio/<n>.mp3`) and word/caption timings (`audio/<n>.json`), caching segments by SHA-256 `narration_hash`.
-  - `render`: Downloads story OG images (with branded card fallback) and renders `video.mp4` + `thumbnail.png` via Remotion.
+  - `render`: Resolves each story's visual mode along the fallback ladder (`page` walkthrough → OG `image` with keyword callouts → branded `card`) and renders `video.mp4` + `thumbnail.png` via Remotion.
   - `upload`: Streams `video.mp4` (resumable upload) and `thumbnail.png` to YouTube with Turkish chapters (`00:00` first) and source links, saves the video ID to `out/<week>/upload.json` and the edition, sets the thumbnail (a failure, e.g. 403 on unverified channels, only warns), and marks the edition `status: "published"` last. Re-runs never upload the video twice: they only finish the missing steps.
 - `make video-typecheck` — Run `tsc --noEmit` on the `video/` package.
 - `make video-test` — Run Vitest unit and end-to-end tests in `video/`.
+
+### Visual Cue Syntax (`script.md`)
+Each `## Story N: <url>` section in `video/out/<week>/script.md` can include optional visual cues placed between `### <headline_tr>` and the narration paragraph. Cues are synchronized to word-level TTS alignments via a verbatim Turkish anchor phrase from `narration_tr`:
+
+```markdown
+## Story 1: https://example.com/post
+### Türkçe Başlık
+> scroll @"ilk cümledeki ifade" -> h1
+> highlight @"kritik bir açık" -> p1
+> focus @"256 karakterden uzun" -> p2
+> stat @"yüzde 50 daha hızlı" -> %50
+
+İlk cümledeki ifade burada başlar ve kritik bir açık ile 256 karakterden uzun girdilerde yüzde 50 daha hızlı çalışır.
+```
+
+- **Format**: `> <kind> @"<anchor phrase>" -> <target or value>`
+- **Element-targeted cues** (target an element ID from `pages/<n>.json` such as `h1`, `h2-1`, `p1`, `code1`, `quote1`, `img1`):
+  - `scroll`: Smoothly scrolls and zooms the page camera to frame the target element.
+  - `focus`: Pans to the element and dims the surrounding page with a spotlight cutout.
+  - `highlight` / `underline` / `circle` / `arrow`: Pans to the element and draws an animated SVG annotation (`#f59e0b`).
+  - `image`: Framing cue for an inline article figure (`img1`, etc.).
+- **Overlay callout cues** (display a full-bleed callout card over the page or OG image):
+  - `stat`: Displays a prominent numeric/metric callout (`-> %50`, `-> 10x`, etc.).
+  - `quote`: Displays a pull-quote card (`-> "kısa alıntı metni"`).
+- **Validation**: During `script` and `approve`, cues whose anchor phrase does not appear in `narration_tr` or whose element ID is missing from `pages/<n>.json` are dropped with a warning rather than failing the build.
 
 ### Weekly Routine & Editorial Approval Gate
 Production steps (`voice`, `render`, `upload`) enforce a strict **approval gate**: they check the Worker edition status first and refuse to run while the edition is still in `draft`.
@@ -153,7 +179,7 @@ Production steps (`voice`, `render`, `upload`) enforce a strict **approval gate*
    make video-draft
    ```
 2. **Review and edit the Turkish narration script**:
-   Open `video/out/<week>/script.md` in your editor and adjust the `## Intro`, story `### <headline_tr>` and narration text under `## Story N: <url>`, or `## Outro` sections as needed (keeping total narration within 280–700 words).
+   Open `video/out/<week>/script.md` in your editor and adjust the `## Intro`, story `### <headline_tr>`, `> <kind> @"<anchor>" -> <target>` visual cues, and narration text under `## Story N: <url>`, or `## Outro` sections as needed (keeping total narration within 280–700 words).
 3. **Approve the script and publish the Turkish web edition**:
    ```bash
    make video-approve
