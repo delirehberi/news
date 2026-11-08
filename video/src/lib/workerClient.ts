@@ -5,10 +5,12 @@ export type WeeklyStatus = 'draft' | 'approved' | 'published';
 
 export interface WeeklyItem {
   url: string;
+  cluster_id?: string | null;
   title_tr: string;
   summary_tr: string;
   source: string;
   image_url?: string | null;
+  curator_comment?: string | null;
 }
 
 export interface WeeklyCandidateRow {
@@ -25,7 +27,16 @@ export interface WeeklyCandidateRow {
   source_count: number;
   seen_count: number;
   cluster_id: string | null;
+  curator_comment?: string | null;
   captured_at: string;
+}
+
+export interface UsedStoryIdentity {
+  week: string;
+  url: string;
+  normalized_url: string;
+  cluster_id: string | null;
+  title_tr: string;
 }
 
 export interface WeeklyEdition {
@@ -66,6 +77,7 @@ export interface WorkerClientConfig {
 
 export interface WorkerClient {
   getCandidates(week: string, signal?: AbortSignal): Promise<WeeklyCandidateRow[]>;
+  getUsedStories(week: string, signal?: AbortSignal): Promise<UsedStoryIdentity[]>;
   getEdition(week: string, signal?: AbortSignal): Promise<WeeklyEdition | null>;
   putEdition(
     week: string,
@@ -98,6 +110,19 @@ export function createWorkerClient(config: WorkerClientConfig): WorkerClient {
       assertValidWeek(week);
       const url = `${baseUrl}/api/admin/weekly/${encodeURIComponent(week)}/candidates`;
       return fetchJson<WeeklyCandidateRow[]>(url, {
+        method: 'GET',
+        headers: authHeaders,
+        signal,
+        timeoutMs: config.timeoutMs,
+        maxRetries: config.maxRetries,
+        fetchImpl: config.fetchImpl,
+      });
+    },
+
+    async getUsedStories(week: string, signal?: AbortSignal): Promise<UsedStoryIdentity[]> {
+      assertValidWeek(week);
+      const url = `${baseUrl}/api/admin/weekly/${encodeURIComponent(week)}/used-stories`;
+      return fetchJson<UsedStoryIdentity[]>(url, {
         method: 'GET',
         headers: authHeaders,
         signal,

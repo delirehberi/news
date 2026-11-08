@@ -434,6 +434,7 @@ export interface CollapsibleArticle extends ClusterMember {
   source: string;
   sources?: string[];
   source_count?: number;
+  curator_comment?: string | null;
 }
 
 /**
@@ -463,8 +464,13 @@ export function collapseClusters<T extends CollapsibleArticle>(ranked: T[]): Arr
 
     const primary = pickClusterPrimary(group)!;
     const sources = Array.from(new Set(group.flatMap(m => m.sources && m.sources.length > 0 ? m.sources : [m.source])));
+    const siblingComment = group.find(m => m.curator_comment && m.curator_comment.trim().length > 0)?.curator_comment;
+    const mergedComment = primary.curator_comment && primary.curator_comment.trim().length > 0
+      ? primary.curator_comment
+      : siblingComment;
     result.push({
       ...primary,
+      ...(mergedComment !== undefined ? { curator_comment: mergedComment } : {}),
       sources,
       source_count: Math.max(primary.source_count ?? 0, sources.length),
       related: group

@@ -41,7 +41,11 @@ import {
   isValidWeeklyEditionPayload,
   WeeklyStatus,
   WeeklyItem,
-  WeeklyEditionRow
+  WeeklyEditionRow,
+  WeeklyUsedIdentity,
+  buildWeeklyUsedIdentities,
+  findWeeklyDuplicateConflicts,
+  normalizeWeeklyUrl
 } from './weekly'
 import {
   GMAIL_MAX_LIST_RESULTS,
@@ -116,7 +120,7 @@ app.use('*', async (c, next) => {
 });
 
 // Explicit column list: never ship stored embeddings to views or API consumers.
-const ARTICLE_COLUMNS = 'id, title, url, source, created_at, is_liked, image_url, summary, follower_likes, sources, source_count, importance_score, cluster_id, seen_count, last_seen_at, expires_at';
+const ARTICLE_COLUMNS = 'id, title, url, source, created_at, is_liked, image_url, summary, follower_likes, sources, source_count, importance_score, cluster_id, seen_count, last_seen_at, expires_at, curator_comment';
 // Rows predating per-article retention fall back to the previous fixed 2-day window.
 const LIVE_ARTICLE_CONDITION = "coalesce(expires_at, datetime(created_at, '+2 days')) >= datetime('now')";
 const RSS_LIMIT = 50;
@@ -422,6 +426,47 @@ app.get('/api/articles', async (c) => {
   });
 })
 
+const CURATOR_COMMENT_MAX_LENGTH = 2000;
+
+function sanitizeCuratorComment(raw: string): string | null {
+  const normalized = raw.replace(/\r\n/g, '\n').trim();
+  if (!normalized || /^Liked article:/i.test(normalized)) {
+    return null;
+  }
+  return normalized.slice(0, CURATOR_COMMENT_MAX_LENGTH);
+}
+
+export function extractCuratorComment(
+  payloadComment: unknown,
+  eventContent: unknown,
+  candidateUrls: Array<string | null | undefined> = []
+): string | null {
+  if (typeof payloadComment === 'string') {
+    const fromPayload = sanitizeCuratorComment(payloadComment);
+    if (fromPayload) return fromPayload;
+  }
+
+  if (typeof eventContent !== 'string') {
+    return null;
+  }
+
+  let body = eventContent.replace(/\r\n/g, '\n').trim();
+  if (!body) return null;
+
+  for (const url of candidateUrls) {
+    if (!url) continue;
+    const trimmedUrl = url.trim();
+    if (trimmedUrl && body.endsWith(trimmedUrl)) {
+      body = body.slice(0, body.length - trimmedUrl.length).trim();
+    }
+  }
+
+  // Also strip any trailing standalone HTTP(S) URL line if present
+  body = body.replace(/(?:\n+|\s+)https?:\/\/\S+\s*$/i, '').trim();
+
+  return sanitizeCuratorComment(body);
+}
+
 app.post('/api/articles/:id/like', async (c) => {
   const id = c.req.param('id');
   const payload = await c.req.json();
@@ -455,14 +500,36 @@ app.post('/api/articles/:id/like', async (c) => {
     return c.json({ success: true, type: 'follower_like' });
   }
 
-  // If it is the owner, mark as liked in DB and train AI
-  await env.news_db.prepare('UPDATE articles SET is_liked = 1, follower_likes = follower_likes + 1 WHERE id = ?').bind(id).run();
+  const curatorComment = extractCuratorComment(payload.comment, event.content, [
+    article.url,
+    getOriginalPostUrl(id),
+  ]);
+
+  // If it is the owner, mark as liked in DB, persist curator_comment, and train AI
+  await env.news_db
+    .prepare(
+      'UPDATE articles SET is_liked = 1, follower_likes = follower_likes + 1, curator_comment = COALESCE(?1, curator_comment) WHERE id = ?2'
+    )
+    .bind(curatorComment, id)
+    .run();
+
+  try {
+    await env.news_db
+      .prepare(
+        'UPDATE weekly_candidates SET is_liked = 1, follower_likes = follower_likes + 1, curator_comment = COALESCE(?1, curator_comment) WHERE article_id = ?2 OR url = ?3'
+      )
+      .bind(curatorComment, id, article.url)
+      .run();
+  } catch {
+    // Ignore if weekly_candidates is not yet initialized in isolated test mocks
+  }
 
   // Scrape content and upsert to AI memory
   const details = await scrapeArticleDetails(article.url as string);
   const textToEmbed = buildEmbeddingText({
     title: article.title,
     source: article.source,
+    curatorComment,
     description: details.description,
     content: details.content
   });
@@ -475,7 +542,13 @@ app.post('/api/articles/:id/like', async (c) => {
     await env.VECTORIZE.upsert([{
       id: vectorId,
       values: embedding,
-      metadata: { source: article.source, type: 'like', url: article.url, title: article.title }
+      metadata: {
+        source: article.source,
+        type: 'like',
+        url: article.url,
+        title: article.title,
+        ...(curatorComment ? { curator_comment: curatorComment } : {})
+      }
     }]);
 
     // Update user taste profile in background
@@ -484,7 +557,7 @@ app.post('/api/articles/:id/like', async (c) => {
     console.error('Failed to embed liked article', e);
   }
 
-  return c.json({ success: true });
+  return c.json({ success: true, curator_comment: curatorComment });
 })
 
 app.post('/api/articles/:id/dislike', async (c) => {
@@ -625,10 +698,13 @@ async function scrapeContent(url: string): Promise<string> {
   return details.fullText;
 }
 
-function buildEmbeddingText(article: { title: string; source?: string; description?: string; content?: string }): string {
+export function buildEmbeddingText(article: { title: string; source?: string; description?: string; content?: string; curatorComment?: string | null }): string {
   const parts: string[] = [`Title: ${article.title.trim()}`];
   if (article.source) {
     parts.push(`Source: ${article.source}`);
+  }
+  if (article.curatorComment && article.curatorComment.trim().length > 0) {
+    parts.push(`Curator Comment: ${article.curatorComment.trim()}`);
   }
   if (article.description && article.description.trim().length > 0) {
     parts.push(`Description: ${article.description.trim()}`);
@@ -732,18 +808,23 @@ async function getUserTasteProfile(env: Bindings): Promise<string> {
   return "Topics of interest: High-signal software engineering, systems programming, distributed systems, AI engineering, database internals, open-source projects, and developer tools. Dislikes: Low-effort tutorials, generic marketing/SEO, crypto hype, and corporate PR.";
 }
 
-async function updateUserTasteProfile(env: Bindings): Promise<void> {
+export async function updateUserTasteProfile(env: Bindings): Promise<void> {
   try {
     const likedRows: any = await env.news_db.prepare(
-      "SELECT title, source FROM articles WHERE is_liked = 1 ORDER BY created_at DESC LIMIT 15"
+      "SELECT title, source, curator_comment FROM articles WHERE is_liked = 1 ORDER BY created_at DESC LIMIT 15"
     ).all();
     const likedArticles = likedRows.results || [];
 
     if (likedArticles.length === 0) return;
 
-    const likedTitles = likedArticles.map((a: any) => `- [${a.source}] ${a.title}`).join('\n');
+    const likedTitles = likedArticles.map((a: any) => {
+      const comment = typeof a.curator_comment === 'string' ? a.curator_comment.trim() : '';
+      return comment
+        ? `- [${a.source}] ${a.title} (Curator comment: ${comment})`
+        : `- [${a.source}] ${a.title}`;
+    }).join('\n');
 
-    const prompt = `Based on these recently liked tech articles by a senior software engineer:\n${likedTitles}\n\nWrite a 2-3 sentence concise description of their current reading preferences, technical focus areas, and topics they enjoy. Return ONLY the concise text summary, no introductory remarks.`;
+    const prompt = `Based on these recently liked tech articles (and any attached curator comments) by a senior software engineer:\n${likedTitles}\n\nWrite a 2-3 sentence concise description of their current reading preferences, technical focus areas, and topics they enjoy. Return ONLY the concise text summary, no introductory remarks.`;
 
     const aiRes: any = await env.AI.run('@cf/meta/llama-3.3-70b-instruct-fp8-fast', {
       messages: [
@@ -1377,6 +1458,66 @@ app.get('/api/admin/weekly/:week', async (c) => {
   });
 });
 
+/**
+ * Collects the story identities (normalized URL + stable cluster id) of every approved or published
+ * weekly edition other than `excludeWeek`. Draft editions never count as used.
+ * Edition items written before cluster ids were stored are enriched from that week's candidate snapshot.
+ */
+async function loadWeeklyUsedIdentities(db: D1Database, excludeWeek: string): Promise<WeeklyUsedIdentity[]> {
+  const editions = await db
+    .prepare("SELECT week, items_json FROM weekly_editions WHERE status IN ('approved', 'published') AND week != ? ORDER BY week")
+    .bind(excludeWeek)
+    .all<{ week: string; items_json: string }>();
+  const editionRows = editions.results || [];
+  if (editionRows.length === 0) return [];
+
+  const candidates = await db
+    .prepare("SELECT week, url, cluster_id FROM weekly_candidates WHERE cluster_id IS NOT NULL AND week IN (SELECT week FROM weekly_editions WHERE status IN ('approved', 'published') AND week != ?)")
+    .bind(excludeWeek)
+    .all<{ week: string; url: string; cluster_id: string | null }>();
+
+  return buildWeeklyUsedIdentities(editionRows, candidates.results || []);
+}
+
+/** Fills missing item cluster ids from the edition week's own candidate snapshot. */
+async function enrichWeeklyItemClusters(db: D1Database, week: string, items: WeeklyItem[]): Promise<WeeklyItem[]> {
+  if (items.every((item) => item.cluster_id)) return items;
+  const candidates = await db
+    .prepare('SELECT url, cluster_id FROM weekly_candidates WHERE week = ? AND cluster_id IS NOT NULL')
+    .bind(week)
+    .all<{ url: string; cluster_id: string | null }>();
+  const clusterByUrl = new Map<string, string>();
+  for (const candidate of candidates.results || []) {
+    const normalized = normalizeWeeklyUrl(candidate.url);
+    if (normalized && candidate.cluster_id) clusterByUrl.set(normalized, candidate.cluster_id);
+  }
+  return items.map((item) => {
+    if (item.cluster_id) return item;
+    const normalized = normalizeWeeklyUrl(item.url);
+    const clusterId = normalized ? clusterByUrl.get(normalized) : undefined;
+    return clusterId ? { ...item, cluster_id: clusterId } : item;
+  });
+}
+
+app.get('/api/admin/weekly/:week/used-stories', async (c) => {
+  const isAuth = await isAuthorizedAdmin(c);
+  if (!isAuth) {
+    return c.json({ error: 'Unauthorized', message: 'Admin authentication required.' }, 401);
+  }
+
+  const week = c.req.param('week');
+  if (!isValidIsoWeek(week)) {
+    return c.json({ error: 'Bad Request', message: 'Invalid week format. Expected YYYY-Www (e.g. 2026-W42).' }, 400);
+  }
+
+  try {
+    return c.json(await loadWeeklyUsedIdentities(c.env.news_db, week));
+  } catch (e) {
+    console.error(`Failed to load used weekly stories for ${week}`, e);
+    return c.json({ error: 'Internal Server Error', message: 'Failed to load previously used stories.' }, 500);
+  }
+});
+
 app.put('/api/admin/weekly/:week', async (c) => {
   const isAuth = await isAuthorizedAdmin(c);
   if (!isAuth) {
@@ -1412,6 +1553,37 @@ app.put('/api/admin/weekly/:week', async (c) => {
         error: 'Conflict',
         message: `Cannot transition status backwards from '${existing.status}' to '${body.status}'.`,
       }, 409);
+    }
+  }
+
+  // Authoritative cross-week guard: a story already in another approved/published edition
+  // cannot enter (or stay in) an edition that is becoming public, whatever the client selected.
+  const isPublicStatus = nextStatus === 'approved' || nextStatus === 'published';
+  const becomesPublic = isPublicStatus && (!existing || existing.status === 'draft');
+  if (isPublicStatus && (becomesPublic || body.items !== undefined)) {
+    let candidateItems: WeeklyItem[] = body.items ?? [];
+    if (body.items === undefined) {
+      try {
+        const parsed: unknown = JSON.parse(existing?.items_json || '[]');
+        candidateItems = Array.isArray(parsed) ? parsed as WeeklyItem[] : [];
+      } catch (e) {
+        console.error(`Failed to parse stored items for ${week}`, e);
+        return c.json({ error: 'Internal Server Error', message: 'Failed to validate edition items.' }, 500);
+      }
+    }
+    try {
+      const enriched = await enrichWeeklyItemClusters(c.env.news_db, week, candidateItems);
+      const conflicts = findWeeklyDuplicateConflicts(enriched, await loadWeeklyUsedIdentities(c.env.news_db, week));
+      if (conflicts.length > 0) {
+        return c.json({
+          error: 'Conflict',
+          message: `Edition ${week} repeats ${conflicts.length} story(ies) already used in another approved or published edition.`,
+          conflicts,
+        }, 409);
+      }
+    } catch (e) {
+      console.error(`Failed to validate weekly duplicates for ${week}`, e);
+      return c.json({ error: 'Internal Server Error', message: 'Failed to validate edition items.' }, 500);
     }
   }
 
@@ -1682,14 +1854,16 @@ export async function snapshotWeeklyCandidates(
       source_count,
       seen_count,
       cluster_id,
+      curator_comment,
       captured_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
     ON CONFLICT(week, url) DO UPDATE SET
       is_liked = MAX(weekly_candidates.is_liked, excluded.is_liked),
       follower_likes = MAX(weekly_candidates.follower_likes, excluded.follower_likes),
       importance_score = MAX(weekly_candidates.importance_score, excluded.importance_score),
       source_count = MAX(weekly_candidates.source_count, excluded.source_count),
       seen_count = MAX(weekly_candidates.seen_count, excluded.seen_count),
+      curator_comment = COALESCE(excluded.curator_comment, weekly_candidates.curator_comment),
       captured_at = CURRENT_TIMESTAMP
   `;
 
@@ -1707,7 +1881,8 @@ export async function snapshotWeeklyCandidates(
       article.importance_score ?? 1.0,
       article.source_count ?? 1,
       article.seen_count ?? 1,
-      article.cluster_id || null
+      article.cluster_id || null,
+      article.curator_comment || null
     );
   });
 

@@ -140,9 +140,49 @@ export const PageCaptureMetadataSchema = z.object({
   page_height: z.number().int().positive(),
   excerpt: z.string().max(CAPTURE_EXCERPT_MAX_CHARS + 50),
   elements: z.array(PageElementSchema),
+  // Absolute `og:image` / `twitter:image` URL found on the page. Optional so captures
+  // written before this field existed still parse; render uses it as the OG-image fallback.
+  og_image_url: z.string().url().nullable().optional(),
 });
 
 export type PageCaptureMetadata = z.infer<typeof PageCaptureMetadataSchema>;
+
+/** Below this much visible text a page is too thin to be an article. */
+export const MIN_ARTICLE_EXCERPT_CHARS = 120;
+
+// Phrases that identify an error, bot-check, or access-denied page instead of the article.
+const BLOCKED_PAGE_PATTERNS: readonly RegExp[] = [
+  /\b(?:401|403|404|410|429|451|500|502|503)\b/,
+  /\bforbidden\b/i,
+  /\bnot found\b/i,
+  /\baccess denied\b/i,
+  /\bjust a moment\b/i,
+  /\battention required\b/i,
+  /\bverify(?:ing)? you are (?:a )?human\b/i,
+  /\bcaptcha\b/i,
+  /\benable javascript\b/i,
+  /\btoo many requests\b/i,
+];
+
+/**
+ * Detects a capture of an error or bot-block page (e.g. "403 Forbidden", "Not found",
+ * a Cloudflare "Just a moment" check). Returns a reason string, or null for a real article.
+ * Only short pages are checked, so an article that merely mentions "404" is not rejected.
+ */
+export function detectBlockedOrErrorPage(excerpt: string): string | null {
+  const text = excerpt.replace(/\s+/g, ' ').trim();
+  if (text.length === 0) {
+    return 'page has no readable text';
+  }
+  if (text.length >= MIN_ARTICLE_EXCERPT_CHARS) {
+    return null;
+  }
+  const matched = BLOCKED_PAGE_PATTERNS.find((pattern) => pattern.test(text));
+  if (matched) {
+    return `page looks like an error or block page ("${text.slice(0, 60)}")`;
+  }
+  return null;
+}
 
 /**
  * Computes a deterministic 16-char SHA-256 hex digest of the normalized URL

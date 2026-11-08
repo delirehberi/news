@@ -49,6 +49,48 @@ function updateLikeUI(btn, countDisplay, articleId) {
   }
 }
 
+export function buildCuratorNostrContent(comment, articleTitle, shareUrl) {
+  const trimmed = typeof comment === 'string' ? comment.trim() : '';
+  if (trimmed.length > 0) {
+    return `${trimmed}\n\n${shareUrl}`;
+  }
+  return `Liked article: ${articleTitle}\n${shareUrl}`;
+}
+
+export function renderCuratorNoteOnCard(card, comment) {
+  const trimmed = typeof comment === 'string' ? comment.trim() : '';
+  if (!trimmed || !card) return;
+
+  card.classList.add('has-curator-note');
+  let noteEl = card.querySelector('.curator-note');
+  if (!noteEl) {
+    noteEl = document.createElement('div');
+    noteEl.className = 'curator-note';
+
+    const badge = document.createElement('span');
+    badge.className = 'curator-note-badge font-mono';
+    badge.textContent = 'Curator Note';
+
+    const text = document.createElement('p');
+    text.className = 'curator-note-text';
+
+    noteEl.appendChild(badge);
+    noteEl.appendChild(text);
+
+    const row = card.querySelector('.news-row');
+    if (row && row.nextSibling) {
+      card.insertBefore(noteEl, row.nextSibling);
+    } else {
+      card.appendChild(noteEl);
+    }
+  }
+
+  const textEl = noteEl.querySelector('.curator-note-text');
+  if (textEl) {
+    textEl.textContent = trimmed;
+  }
+}
+
 function attachCardListeners(card) {
   const articleId = card.getAttribute('data-id');
   if (!articleId) return;
@@ -108,6 +150,193 @@ function attachCardListeners(card) {
     }
   };
 
+  const sendAnonymousLike = async () => {
+    setLikeLoading(true);
+    try {
+      const res = await fetch(`${API_URL}/${articleId}/like`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({})
+      });
+      if (res.ok) {
+        updateLikeUI(likeBtn, countDisplay, articleId);
+      } else {
+        setLikeLoading(false);
+      }
+    } catch (e) {
+      console.error(e);
+      setLikeLoading(false);
+    }
+  };
+
+  const publishCuratorHighlight = async (rawComment, composerEl) => {
+    const comment = typeof rawComment === 'string' ? rawComment.trim() : '';
+    const shareUrl = discussLink ? discussLink : articleUrl;
+    const noteContent = buildCuratorNostrContent(comment, articleTitle, shareUrl);
+
+    let eventPayload = null;
+    try {
+      eventPayload = await window.nostr.signEvent({
+        kind: 1,
+        created_at: Math.floor(Date.now() / 1000),
+        tags: [['r', shareUrl]],
+        content: noteContent
+      });
+    } catch (e) {
+      alert('Signature cancelled.');
+      return;
+    }
+
+    if (composerEl) composerEl.remove();
+    setLikeLoading(true);
+    try {
+      const pool = new SimplePool();
+      const pubs = pool.publish(userRelays, eventPayload);
+      await Promise.any(pubs).catch(() => console.log('Some relays failed'));
+      pool.close(userRelays);
+
+      const res = await fetch(`${API_URL}/${articleId}/like`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          event: eventPayload,
+          ...(comment ? { comment } : {})
+        })
+      });
+
+      if (res.status === 403) {
+        alert('You are not my mommy! (Wrong Pubkey)');
+        setLikeLoading(false);
+        return;
+      }
+      if (res.ok) {
+        updateLikeUI(likeBtn, countDisplay, articleId);
+        if (comment) {
+          renderCuratorNoteOnCard(card, comment);
+        }
+      } else {
+        setLikeLoading(false);
+      }
+    } catch (e) {
+      console.error(e);
+      setLikeLoading(false);
+    }
+  };
+
+  const publishFollowerShare = async (composerEl) => {
+    if (composerEl) composerEl.remove();
+    try {
+      const shareUrl = discussLink ? discussLink : articleUrl;
+      const signedEvent = await window.nostr.signEvent({
+        kind: 1,
+        created_at: Math.floor(Date.now() / 1000),
+        tags: [['r', shareUrl]],
+        content: 'Check out this curated article: ' + articleTitle + '\n' + shareUrl
+      });
+
+      setLikeLoading(true);
+      const pool = new SimplePool();
+      const pubs = pool.publish(userRelays, signedEvent);
+      await Promise.any(pubs).catch(() => console.log('Some relays failed'));
+      pool.close(userRelays);
+
+      alert('Shared to Nostr!');
+
+      const res = await fetch(`${API_URL}/${articleId}/like`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ event: signedEvent })
+      });
+      if (res.ok) {
+        updateLikeUI(likeBtn, countDisplay, articleId);
+      } else {
+        setLikeLoading(false);
+      }
+    } catch (e) {
+      alert('Failed to share: ' + (e?.message || 'Error'));
+      setLikeLoading(false);
+    }
+  };
+
+  const openHighlightComposer = () => {
+    const existing = card.querySelector('.curator-comment-composer');
+    if (existing) {
+      existing.remove();
+      return;
+    }
+
+    const composer = document.createElement('div');
+    composer.className = 'curator-comment-composer';
+    composer.innerHTML = `
+      <div class="curator-composer-header">
+        <span class="curator-composer-title font-mono">Highlight &amp; Share on Nostr</span>
+        <button type="button" class="curator-composer-close" aria-label="Close highlight panel">&times;</button>
+      </div>
+      <textarea
+        class="curator-comment-input"
+        rows="2"
+        maxlength="2000"
+        placeholder="Add your thoughts or commentary on this link (optional — published as your Nostr note)..."
+      ></textarea>
+      <div class="curator-composer-actions">
+        <button type="button" class="action-btn-pill curator-publish-btn">Highlight &amp; Publish (Curator)</button>
+        <button type="button" class="action-btn-pill follower-share-btn">Share as Follower</button>
+        <button type="button" class="action-btn-pill anon-like-btn">Just Like</button>
+      </div>
+    `;
+
+    const row = card.querySelector('.news-row');
+    if (row && row.nextSibling) {
+      card.insertBefore(composer, row.nextSibling);
+    } else {
+      card.appendChild(composer);
+    }
+
+    const textarea = composer.querySelector('.curator-comment-input');
+    const publishBtn = composer.querySelector('.curator-publish-btn');
+    const followerBtn = composer.querySelector('.follower-share-btn');
+    const anonBtn = composer.querySelector('.anon-like-btn');
+    const closeBtn = composer.querySelector('.curator-composer-close');
+
+    if (textarea) {
+      textarea.focus();
+      textarea.addEventListener('keydown', (e) => {
+        if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+          e.preventDefault();
+          publishCuratorHighlight(textarea.value, composer);
+        } else if (e.key === 'Escape') {
+          e.preventDefault();
+          composer.remove();
+        }
+      });
+    }
+
+    if (publishBtn) {
+      publishBtn.addEventListener('click', () => {
+        publishCuratorHighlight(textarea ? textarea.value : '', composer);
+      });
+    }
+
+    if (followerBtn) {
+      followerBtn.addEventListener('click', () => {
+        publishFollowerShare(composer);
+      });
+    }
+
+    if (anonBtn) {
+      anonBtn.addEventListener('click', () => {
+        composer.remove();
+        sendAnonymousLike();
+      });
+    }
+
+    if (closeBtn) {
+      closeBtn.addEventListener('click', () => {
+        composer.remove();
+      });
+    }
+  };
+
   // 3. Like Button Listener
   if (likeBtn && !likeBtn.dataset.bound) {
     likeBtn.dataset.bound = 'true';
@@ -116,125 +345,12 @@ function attachCardListeners(card) {
 
       // Anonymous User
       if (!window.nostr) {
-        setLikeLoading(true);
-        try {
-          const res = await fetch(`${API_URL}/${articleId}/like`, { 
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({})
-          });
-          if (res.ok) {
-            updateLikeUI(likeBtn, countDisplay, articleId);
-          } else {
-            setLikeLoading(false);
-          }
-        } catch (e) {
-          console.error(e);
-          setLikeLoading(false);
-        }
+        await sendAnonymousLike();
         return;
       }
 
-      // Nostr User Detected
-      const isMommy = confirm("Are you my mommy?");
-      let eventPayload = null;
-
-      if (isMommy) {
-        // Owner - Sign to train AI and publish note
-        try {
-          const shareUrl = discussLink ? discussLink : articleUrl;
-          eventPayload = await window.nostr.signEvent({
-            kind: 1,
-            created_at: Math.floor(Date.now() / 1000),
-            tags: [["r", shareUrl]],
-            content: "Liked article: " + articleTitle + "\n" + shareUrl
-          });
-        } catch (e) {
-          alert("Signature cancelled.");
-          return;
-        }
-        
-        setLikeLoading(true);
-        try {
-          const pool = new SimplePool();
-          const pubs = pool.publish(userRelays, eventPayload);
-          await Promise.any(pubs).catch(() => console.log("Some relays failed"));
-          pool.close(userRelays);
-          
-          const res = await fetch(`${API_URL}/${articleId}/like`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ event: eventPayload })
-          });
-          
-          if (res.status === 403) {
-            alert("You are not my mommy! (Wrong Pubkey)");
-            setLikeLoading(false);
-            return;
-          }
-          if (res.ok) {
-            updateLikeUI(likeBtn, countDisplay, articleId);
-          } else {
-            setLikeLoading(false);
-          }
-        } catch (e) {
-          console.error(e);
-          setLikeLoading(false);
-        }
-      } else {
-        // Follower Sharing
-        const wantShare = confirm("Do you want to share this article as a note on your Nostr account?");
-        if (wantShare) {
-          try {
-            const shareUrl = discussLink ? discussLink : articleUrl;
-            const signedEvent = await window.nostr.signEvent({
-              kind: 1,
-              created_at: Math.floor(Date.now() / 1000),
-              tags: [["r", shareUrl]],
-              content: "Check out this curated article: " + articleTitle + "\n" + shareUrl
-            });
-            
-            setLikeLoading(true);
-            const pool = new SimplePool();
-            const pubs = pool.publish(userRelays, signedEvent);
-            await Promise.any(pubs).catch(() => console.log("Some relays failed"));
-            pool.close(userRelays);
-            
-            alert("Shared to Nostr!");
-            
-            const res = await fetch(`${API_URL}/${articleId}/like`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ event: signedEvent })
-            });
-            if (res.ok) {
-              updateLikeUI(likeBtn, countDisplay, articleId);
-            } else {
-              setLikeLoading(false);
-            }
-          } catch (e) {
-            alert("Failed to share: " + (e?.message || 'Error'));
-            setLikeLoading(false);
-          }
-        } else {
-          setLikeLoading(true);
-          try {
-            const res = await fetch(`${API_URL}/${articleId}/like`, { 
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({})
-            });
-            if (res.ok) {
-              updateLikeUI(likeBtn, countDisplay, articleId);
-            } else {
-              setLikeLoading(false);
-            }
-          } catch (e) { 
-            console.error(e);
-            setLikeLoading(false);
-          }
-        }
-      }
+      // Nostr User Detected: open inline highlight/comment composer
+      openHighlightComposer();
     });
   }
 

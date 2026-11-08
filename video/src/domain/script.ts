@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { VisualCueSchema, type VisualCue } from './cues.ts';
 
 export const WORDS_MIN = 280;
-export const WORDS_MAX = 700;
+export const WORDS_MAX = 2000;
 export const WORDS_PER_MINUTE = 140;
 
 const HEADING_INTRO = '## Intro';
@@ -80,7 +80,7 @@ export function validateScriptWordBudget(script: Script): number {
   if (wordCount < WORDS_MIN || wordCount > WORDS_MAX) {
     const constraint = wordCount < WORDS_MIN ? 'under minimum' : 'over maximum';
     throw new Error(
-      `Script narration word count is ${wordCount} words (${constraint}; allowed budget is ${WORDS_MIN}..${WORDS_MAX} words for 2-5 min at ~${WORDS_PER_MINUTE} wpm).`
+      `Script narration word count is ${wordCount} words (${constraint}; allowed budget is ${WORDS_MIN}..${WORDS_MAX} words for roughly 2-14 min at ~${WORDS_PER_MINUTE} wpm).`
     );
   }
 

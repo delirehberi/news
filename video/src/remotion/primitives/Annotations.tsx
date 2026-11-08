@@ -238,6 +238,23 @@ export function computeAnnotationPaths(
   };
 }
 
+/**
+ * True when a target box is a real, positive-size rectangle. Annotations are only drawn
+ * around something actually on screen, so a missing or degenerate box draws nothing.
+ */
+export function isDrawableBox(box: CueBoundingBox | null | undefined): box is CueBoundingBox {
+  return (
+    box !== null &&
+    box !== undefined &&
+    Number.isFinite(box.x) &&
+    Number.isFinite(box.y) &&
+    Number.isFinite(box.width) &&
+    Number.isFinite(box.height) &&
+    box.width > 0 &&
+    box.height > 0
+  );
+}
+
 export interface AnnotationItemProps {
   kind: AnnotationKind;
   targetBox: CueBoundingBox | null | undefined;
@@ -337,7 +354,8 @@ export const Annotations: React.FC<AnnotationsProps> = ({
     });
   }
 
-  if (items.length === 0) {
+  const drawableItems = items.filter((item) => isDrawableBox(item.targetBox));
+  if (drawableItems.length === 0) {
     return null;
   }
 
@@ -357,7 +375,7 @@ export const Annotations: React.FC<AnnotationsProps> = ({
         overflow: 'visible',
       }}
     >
-      {items.map((item, idx) => {
+      {drawableItems.map((item, idx) => {
         const itemStart = item.startFrame ?? startFrame;
         const itemEnd = item.endFrame;
         if (frame < itemStart) {

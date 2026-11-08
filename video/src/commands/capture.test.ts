@@ -12,6 +12,7 @@ import {
 import { fileExists, getWeekPaths, readJson, writeJsonAtomic } from '../lib/paths.ts';
 import {
   buildNumberedPageElements,
+  normalizeOgImageUrl,
   runCaptureCommand,
   type CaptureBrowserFactory,
   type CaptureBrowserSession,
@@ -134,6 +135,20 @@ describe('src/commands/capture.ts', () => {
     });
   });
 
+  describe('normalizeOgImageUrl', () => {
+    it('keeps absolute http(s) URLs and rejects other schemes, credentials, and oversized values', () => {
+      expect(normalizeOgImageUrl(' https://cdn.example.com/a.png ')).toBe('https://cdn.example.com/a.png');
+      expect(normalizeOgImageUrl('http://example.com/a.jpg')).toBe('http://example.com/a.jpg');
+      expect(normalizeOgImageUrl('data:image/png;base64,AAAA')).toBeNull();
+      expect(normalizeOgImageUrl('javascript:alert(1)')).toBeNull();
+      expect(normalizeOgImageUrl('https://user:pass@example.com/a.png')).toBeNull();
+      expect(normalizeOgImageUrl('/relative/path.png')).toBeNull();
+      expect(normalizeOgImageUrl(`https://example.com/${'a'.repeat(3000)}`)).toBeNull();
+      expect(normalizeOgImageUrl(null)).toBeNull();
+      expect(normalizeOgImageUrl(undefined)).toBeNull();
+    });
+  });
+
   describe('runCaptureCommand', () => {
     it('captures pages/<n>.png and pages/<n>.json on cache miss and skips browser launch on cache hit', async () => {
       const week = '2026-W42';
@@ -146,6 +161,7 @@ describe('src/commands/capture.ts', () => {
           extraction: {
             pageHeight: 3400,
             excerpt: `Main article excerpt for ${url} with detailed engineering context.`,
+            ogImageUrl: url.endsWith('story-1') ? 'https://cdn.example.com/story-1-og.png' : null,
             elements: [
               {
                 kind: 'h1',
@@ -205,6 +221,9 @@ describe('src/commands/capture.ts', () => {
       expect(meta1.viewport).toEqual({ width: 1440, height: 900, deviceScaleFactor: 1 });
       expect(meta1.elements[0]?.id).toBe('h1');
       expect(meta1.elements[1]?.id).toBe('p1');
+      expect(meta1.og_image_url).toBe('https://cdn.example.com/story-1-og.png');
+      const meta2 = await readJson<PageCaptureMetadata>(path.join(paths.pagesDir, '2.json'));
+      expect(meta2.og_image_url).toBeNull();
 
       // 2. Second run with same URLs: cache hit -> skips browser launch completely
       const secondRun = await runCaptureCommand(ctx, {
@@ -239,6 +258,71 @@ describe('src/commands/capture.ts', () => {
       expect(thirdRun.failedCount).toBe(0);
       expect(browserFactory).toHaveBeenCalledTimes(2);
       expect(captureUrlMock).toHaveBeenCalledTimes(3);
+    });
+
+    it('treats a captured 403 / not-found page as a failed capture and writes no files for it', async () => {
+      const week = '2026-W42';
+      const paths = getWeekPaths(week, tempDir);
+      await writeJsonAtomic(paths.translationJson, makeSampleTranslation(week));
+
+      const captureUrlMock = vi.fn<CaptureBrowserSession['captureUrl']>().mockImplementation(
+        async ({ url }) => ({
+          screenshotPng: FAKE_PNG_BYTES,
+          extraction: url.endsWith('story-1')
+            ? {
+                pageHeight: 900,
+                excerpt: '403 Forbidden',
+                ogImageUrl: null,
+                elements: [
+                  {
+                    kind: 'h1',
+                    tagName: 'h1',
+                    text: '403',
+                    box: { x: 0, y: 0, width: 1440, height: 291 },
+                  },
+                ],
+              }
+            : {
+                pageHeight: 2400,
+                excerpt: `Main article excerpt for ${url} with detailed engineering context.`,
+                ogImageUrl: null,
+                elements: [
+                  {
+                    kind: 'h1',
+                    tagName: 'h1',
+                    text: `Headline for ${url}`,
+                    box: { x: 160, y: 100, width: 800, height: 60 },
+                  },
+                ],
+              },
+        })
+      );
+      const browserFactory = vi.fn<CaptureBrowserFactory>().mockResolvedValue({
+        captureUrl: captureUrlMock,
+        close: vi.fn<CaptureBrowserSession['close']>().mockResolvedValue(undefined),
+      });
+
+      const logs: string[] = [];
+      const result = await runCaptureCommand(
+        {
+          week,
+          env: validateEnv({ INGESTION_SECRET: 'test-secret' }),
+          signal: new AbortController().signal,
+        },
+        {
+          outRoot: tempDir,
+          browserFactory,
+          dnsLookup: vi.fn().mockResolvedValue([{ address: '93.184.216.34', family: 4 }]),
+          stdout: (msg) => logs.push(msg),
+        }
+      );
+
+      expect(result.capturedCount).toBe(1);
+      expect(result.failedCount).toBe(1);
+      expect(await fileExists(path.join(paths.pagesDir, '1.png'))).toBe(false);
+      expect(await fileExists(path.join(paths.pagesDir, '1.json'))).toBe(false);
+      expect(await fileExists(path.join(paths.pagesDir, '2.json'))).toBe(true);
+      expect(logs.some((l) => l.includes('error or block page'))).toBe(true);
     });
 
     it('never fails the run when a story hits SSRF guard or navigation timeout (falls back to OG image)', async () => {

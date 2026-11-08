@@ -41,6 +41,7 @@ function makeEditedScript(totalWords: number = 350): Script {
 function makeMockWorkerClient(status: WeeklyEdition['status'] = 'approved'): WorkerClient {
   return {
     getCandidates: vi.fn(),
+    getUsedStories: vi.fn().mockResolvedValue([]),
     getEdition: vi.fn().mockImplementation(async (week) => ({
       week,
       status,
@@ -118,7 +119,7 @@ describe('src/commands/approve.ts', () => {
     expect(logs[0]).toContain('Approved script (360 words, 2 segment(s)) for 2026-W42');
   });
 
-  it('rejects script.md when narration word count is under 280 or over 700 and does not call putEdition', async () => {
+  it('rejects script.md when narration word count is under 280 or over 2000 and does not call putEdition', async () => {
     const week = '2026-W42';
     const paths = getWeekPaths(week, tempDir);
     const workerClient = makeMockWorkerClient('draft');
@@ -138,9 +139,9 @@ describe('src/commands/approve.ts', () => {
         outRoot: tempDir,
         stdout: () => {},
       })
-    ).rejects.toThrowError(/210 words \(under minimum; allowed budget is 280\.\.700 words/);
+    ).rejects.toThrowError(/210 words \(under minimum; allowed budget is 280\.\.2000 words/);
 
-    const overScript = makeEditedScript(735);
+    const overScript = makeEditedScript(2035);
     await writeTextAtomic(paths.scriptMd, toMarkdown(overScript));
 
     await expect(
@@ -149,7 +150,7 @@ describe('src/commands/approve.ts', () => {
         outRoot: tempDir,
         stdout: () => {},
       })
-    ).rejects.toThrowError(/735 words \(over maximum; allowed budget is 280\.\.700 words/);
+    ).rejects.toThrowError(/2035 words \(over maximum; allowed budget is 280\.\.2000 words/);
 
     expect(workerClient.putEdition).not.toHaveBeenCalled();
   });

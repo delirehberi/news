@@ -8,10 +8,16 @@ import type { Script } from '../domain/script.ts';
 import { getWeekPaths, writeBytesAtomic, writeJsonAtomic } from '../lib/paths.ts';
 import type { WeeklyEdition, WorkerClient } from '../lib/workerClient.ts';
 import {
+  assertNotAllCards,
+  countMissingPageCaptures,
+  countStoryVisualModes,
   downloadStoryImage,
+  resolveStoryImageUrl,
   runRenderCommand,
   type RemotionRendererAdapter,
+  type RenderCaptureRunner,
 } from './render.ts';
+import type { DnsLookupAllFn } from '../lib/ssrf.ts';
 
 function createTestEnv(): VideoEnv {
   return {
@@ -227,6 +233,7 @@ describe('src/commands/render.ts', () => {
 
       const workerClient: WorkerClient = {
         getCandidates: vi.fn(),
+        getUsedStories: vi.fn().mockResolvedValue([]),
         getEdition: vi.fn().mockResolvedValue(createApprovedEdition(week, 'approved')),
         putEdition: vi.fn(),
         triggerSnapshot: vi.fn(),
@@ -261,6 +268,7 @@ describe('src/commands/render.ts', () => {
       };
 
       const logs: string[] = [];
+      const captureRunner = vi.fn<RenderCaptureRunner>().mockResolvedValue(undefined);
       const result = await runRenderCommand(ctx, {
         workerClient,
         outRoot: tempDir,
@@ -269,8 +277,14 @@ describe('src/commands/render.ts', () => {
           bundleComposition,
           renderComposition,
         },
+        captureRunner,
         stdout: (msg) => logs.push(msg),
       });
+
+      // Neither story has a page capture on disk, so render runs capture once first.
+      expect(captureRunner).toHaveBeenCalledTimes(1);
+      expect(result.visualModes).toEqual({ page: 0, og: 1, card: 1 });
+      expect(logs).toContain('Story visuals for 2026-W42: page 0, og 1, card 1.');
 
       expect(result.downloadedImagesCount).toBe(1);
       expect(result.fallbackCardCount).toBe(1);
@@ -298,6 +312,7 @@ describe('src/commands/render.ts', () => {
 
       const draftWorkerClient: WorkerClient = {
         getCandidates: vi.fn(),
+        getUsedStories: vi.fn().mockResolvedValue([]),
         getEdition: vi.fn().mockResolvedValue(createApprovedEdition(week, 'draft')),
         putEdition: vi.fn(),
         triggerSnapshot: vi.fn(),
@@ -319,6 +334,7 @@ describe('src/commands/render.ts', () => {
 
       const workerClient: WorkerClient = {
         getCandidates: vi.fn(),
+        getUsedStories: vi.fn().mockResolvedValue([]),
         getEdition: vi.fn().mockResolvedValue(createApprovedEdition(week, 'approved')),
         putEdition: vi.fn(),
         triggerSnapshot: vi.fn(),
@@ -404,6 +420,7 @@ describe('src/commands/render.ts', () => {
         getEdition: vi.fn().mockResolvedValue(createApprovedEdition(week, 'approved')),
         putEdition: vi.fn(),
         triggerSnapshot: vi.fn(),
+        getUsedStories: vi.fn().mockResolvedValue([]),
       };
 
       const mockFetch = vi.fn<typeof fetch>().mockResolvedValue(
@@ -431,6 +448,7 @@ describe('src/commands/render.ts', () => {
             bundleComposition,
             renderComposition,
           },
+          captureRunner: async () => {},
           stdout: () => {},
         }
       );
@@ -454,7 +472,169 @@ describe('src/commands/render.ts', () => {
       expect(result.props.stories[1].page).toBeUndefined();
       expect(result.props.stories[1].cues).toBeUndefined();
     });
+
+    it('stops before bundling when every story would be a branded card, unless allowCards is set', async () => {
+      await seedWeekArtifacts(tempDir);
+
+      const workerClient: WorkerClient = {
+        getCandidates: vi.fn(),
+        getUsedStories: vi.fn().mockResolvedValue([]),
+        getEdition: vi.fn().mockResolvedValue(createApprovedEdition(week, 'approved')),
+        putEdition: vi.fn(),
+        triggerSnapshot: vi.fn(),
+      };
+      // Every image download fails and no page capture exists -> all stories are cards.
+      const failingFetch = vi
+        .fn<typeof fetch>()
+        .mockResolvedValue(new Response('Upstream error', { status: 502 }));
+      const bundleComposition = vi
+        .fn<RemotionRendererAdapter['bundleComposition']>()
+        .mockResolvedValue('/tmp/fake-remotion-bundle');
+      const renderComposition = vi
+        .fn<RemotionRendererAdapter['renderComposition']>()
+        .mockImplementation(async ({ videoOutputPath, thumbnailOutputPath }) => {
+          await fs.writeFile(videoOutputPath, Buffer.from('mp4'));
+          await fs.writeFile(thumbnailOutputPath, Buffer.from('png'));
+        });
+      const deps = {
+        workerClient,
+        outRoot: tempDir,
+        fetchImpl: failingFetch,
+        remotionAdapter: { bundleComposition, renderComposition },
+        captureRunner: async () => {},
+        stdout: () => {},
+      };
+
+      await expect(
+        runRenderCommand(
+          { week, env: createTestEnv(), signal: new AbortController().signal },
+          deps
+        )
+      ).rejects.toThrowError(/All 2 stories for 2026-W42 would render as branded cards/);
+      expect(bundleComposition).not.toHaveBeenCalled();
+
+      const allowed = await runRenderCommand(
+        { week, env: createTestEnv(), signal: new AbortController().signal, allowCards: true },
+        deps
+      );
+      expect(allowed.visualModes).toEqual({ page: 0, og: 0, card: 2 });
+      expect(bundleComposition).toHaveBeenCalledTimes(1);
+    });
+
+    it('keeps rendering with a warning when the capture runner throws', async () => {
+      await seedWeekArtifacts(tempDir);
+
+      const workerClient: WorkerClient = {
+        getCandidates: vi.fn(),
+        getUsedStories: vi.fn().mockResolvedValue([]),
+        getEdition: vi.fn().mockResolvedValue(createApprovedEdition(week, 'approved')),
+        putEdition: vi.fn(),
+        triggerSnapshot: vi.fn(),
+      };
+      const imageFetch = vi.fn<typeof fetch>().mockImplementation(
+        async () =>
+          new Response(new Uint8Array([0x89, 0x50, 0x4e, 0x47]), {
+            status: 200,
+            headers: { 'content-type': 'image/png' },
+          })
+      );
+      const logs: string[] = [];
+
+      const result = await runRenderCommand(
+        { week, env: createTestEnv(), signal: new AbortController().signal },
+        {
+          workerClient,
+          outRoot: tempDir,
+          fetchImpl: imageFetch,
+          remotionAdapter: {
+            bundleComposition: vi.fn().mockResolvedValue('/tmp/fake-remotion-bundle'),
+            renderComposition: vi.fn().mockResolvedValue(undefined),
+          },
+          captureRunner: async () => {
+            throw new Error('chrome not found');
+          },
+          stdout: (msg) => logs.push(msg),
+        }
+      );
+
+      expect(logs.some((l) => l.includes('[warn] Page capture failed (chrome not found)'))).toBe(true);
+      expect(result.visualModes.card).toBeLessThan(2);
+    });
+  });
+
+  describe('visual mode helpers', () => {
+    it('counts page / og / card modes and only rejects an all-card set', () => {
+      const counts = countStoryVisualModes([
+        { imageSrc: 'images/1.png' },
+        { imageSrc: null },
+        { imageSrc: '   ' },
+      ]);
+      expect(counts).toEqual({ page: 0, og: 1, card: 2 });
+
+      expect(() => assertNotAllCards(counts, '2026-W45', false)).not.toThrow();
+      expect(() => assertNotAllCards({ page: 0, og: 0, card: 3 }, '2026-W45', false)).toThrowError(
+        /--allow-cards/
+      );
+      expect(() => assertNotAllCards({ page: 0, og: 0, card: 3 }, '2026-W45', true)).not.toThrow();
+      expect(() => assertNotAllCards({ page: 0, og: 0, card: 0 }, '2026-W45', false)).not.toThrow();
+    });
+
+    it('counts stories whose page capture is missing on disk', async () => {
+      const pagesDir = path.join(tempDir, 'pages');
+      expect(
+        await countMissingPageCaptures(pagesDir, ['https://example.com/a', 'https://example.com/b'])
+      ).toBe(2);
+    });
+  });
+
+  describe('resolveStoryImageUrl', () => {
+    const publicLookup: DnsLookupAllFn = async () => [{ address: '93.184.216.34', family: 4 }];
+    const privateLookup: DnsLookupAllFn = async () => [{ address: '169.254.169.254', family: 4 }];
+
+    it('prefers the translation image_url over the captured og:image', async () => {
+      await expect(
+        resolveStoryImageUrl({
+          translatedImageUrl: 'https://cdn.example.com/og.png',
+          capturedOgImageUrl: 'https://example.com/captured.png',
+          storyIndex: 1,
+          dnsLookup: publicLookup,
+        })
+      ).resolves.toBe('https://cdn.example.com/og.png');
+    });
+
+    it('falls back to the captured og:image when it resolves to a public host', async () => {
+      await expect(
+        resolveStoryImageUrl({
+          translatedImageUrl: null,
+          capturedOgImageUrl: 'https://example.com/captured.png',
+          storyIndex: 1,
+          dnsLookup: publicLookup,
+        })
+      ).resolves.toBe('https://example.com/captured.png');
+    });
+
+    it('drops a captured og:image that points at a private or metadata address', async () => {
+      const warnings: string[] = [];
+      await expect(
+        resolveStoryImageUrl({
+          translatedImageUrl: null,
+          capturedOgImageUrl: 'https://attacker.example/meta.png',
+          storyIndex: 4,
+          dnsLookup: privateLookup,
+          onWarn: (msg) => warnings.push(msg),
+        })
+      ).resolves.toBeNull();
+      expect(warnings[0]).toMatch(/Story #4: skipping captured og:image/);
+    });
+
+    it('returns null when neither source has an image', async () => {
+      await expect(
+        resolveStoryImageUrl({
+          translatedImageUrl: null,
+          capturedOgImageUrl: null,
+          storyIndex: 1,
+        })
+      ).resolves.toBeNull();
+    });
   });
 });
-
-

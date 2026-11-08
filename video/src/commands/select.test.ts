@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { CommandContext } from '../cli.ts';
 import { validateEnv } from '../config/env.ts';
 import { readJson } from '../lib/paths.ts';
-import type { WeeklyCandidateRow, WorkerClient } from '../lib/workerClient.ts';
+import type { UsedStoryIdentity, WeeklyCandidateRow, WorkerClient } from '../lib/workerClient.ts';
 import { runSelectCommand, type WeeklySelection } from './select.ts';
 
 function makeCandidate(overrides: Partial<WeeklyCandidateRow> = {}): WeeklyCandidateRow {
@@ -28,9 +28,24 @@ function makeCandidate(overrides: Partial<WeeklyCandidateRow> = {}): WeeklyCandi
   };
 }
 
-function makeMockWorkerClient(candidates: WeeklyCandidateRow[]): WorkerClient {
+function makeUsed(overrides: Partial<UsedStoryIdentity> = {}): UsedStoryIdentity {
+  return {
+    week: '2026-W41',
+    url: 'https://example.com/old',
+    normalized_url: 'https://example.com/old',
+    cluster_id: null,
+    title_tr: 'Eski haber',
+    ...overrides,
+  };
+}
+
+function makeMockWorkerClient(
+  candidates: WeeklyCandidateRow[],
+  used: UsedStoryIdentity[] = []
+): WorkerClient {
   return {
     getCandidates: vi.fn().mockResolvedValue(candidates),
+    getUsedStories: vi.fn().mockResolvedValue(used),
     getEdition: vi.fn().mockResolvedValue(null),
     putEdition: vi.fn(),
     triggerSnapshot: vi.fn(),
@@ -134,6 +149,77 @@ describe('src/commands/select.ts', () => {
         stdout: () => {},
       })
     ).rejects.toThrowError(/No weekly candidates found for week 2026-W42/);
+  });
+  describe('cross-week deduplication', () => {
+    function makeCtx(count: string): CommandContext {
+      return {
+        week: '2026-W42',
+        env: validateEnv({ INGESTION_SECRET: 'test-secret', VIDEO_ITEM_COUNT: count }),
+        signal: new AbortController().signal,
+      };
+    }
+
+    it('excludes exact normalized URL and shared cluster matches, backfills, and reports source weeks', async () => {
+      const candidates = [
+        makeCandidate({ url: 'https://example.com/old/?utm_source=x#frag', importance_score: 9 }),
+        makeCandidate({ url: 'https://other.com/same-story', importance_score: 8, cluster_id: 'cluster-9' }),
+        makeCandidate({ url: 'https://example.com/fresh-1', importance_score: 3 }),
+        makeCandidate({ url: 'https://example.com/fresh-2', importance_score: 2 }),
+      ];
+      const used = [
+        makeUsed(),
+        makeUsed({ week: '2026-W40', url: 'https://news.com/orig', normalized_url: 'https://news.com/orig', cluster_id: 'cluster-9' }),
+      ];
+      const logs: string[] = [];
+
+      const result = await runSelectCommand(makeCtx('2'), {
+        workerClient: makeMockWorkerClient(candidates, used),
+        outRoot: tempDir,
+        stdout: (msg) => logs.push(msg),
+      });
+
+      expect(result.items.map((i) => i.url)).toEqual([
+        'https://example.com/fresh-1',
+        'https://example.com/fresh-2',
+      ]);
+      expect(result.excluded_used).toEqual([
+        { url: 'https://example.com/old/?utm_source=x#frag', prior_url: 'https://example.com/old', prior_week: '2026-W41', reason: 'normalized_url' },
+        { url: 'https://other.com/same-story', prior_url: 'https://news.com/orig', prior_week: '2026-W40', reason: 'cluster_id' },
+      ]);
+      expect(logs.join('\n')).toContain('used in 2026-W40');
+    });
+
+    it('keeps distinct follow-up stories with similar titles eligible', async () => {
+      const candidates = [
+        makeCandidate({ url: 'https://example.com/follow-up', title: 'Big Launch: Part 2', cluster_id: 'cluster-new' }),
+      ];
+      const used = [makeUsed({ url: 'https://example.com/launch', normalized_url: 'https://example.com/launch', cluster_id: 'cluster-old', title_tr: 'Big Launch' })];
+
+      const result = await runSelectCommand(makeCtx('1'), {
+        workerClient: makeMockWorkerClient(candidates, used),
+        outRoot: tempDir,
+        stdout: () => {},
+      });
+
+      expect(result.excluded_used).toEqual([]);
+      expect(result.items).toHaveLength(1);
+    });
+
+    it('fails clearly when too few unique candidates remain and writes no selection', async () => {
+      const candidates = [
+        makeCandidate({ url: 'https://example.com/old' }),
+        makeCandidate({ url: 'https://example.com/fresh' }),
+      ];
+
+      await expect(
+        runSelectCommand(makeCtx('2'), {
+          workerClient: makeMockWorkerClient(candidates, [makeUsed()]),
+          outRoot: tempDir,
+          stdout: () => {},
+        })
+      ).rejects.toThrowError(/Only 1 unique candidate\(s\) remain.*1 were excluded/);
+      await expect(fs.access(path.join(tempDir, '2026-W42', 'selection.json'))).rejects.toThrow();
+    });
   });
 });
 

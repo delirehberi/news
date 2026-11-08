@@ -1,4 +1,5 @@
 import type { CommandContext } from '../cli.ts';
+import { excludeUsedStories, type ExcludedCandidate } from '../domain/history.ts';
 import { rankWeekly, type RankedCandidate } from '../domain/rank.ts';
 import { getWeekPaths, writeJsonAtomic } from '../lib/paths.ts';
 import { createWorkerClient, type WorkerClient } from '../lib/workerClient.ts';
@@ -8,6 +9,7 @@ export interface WeeklySelection {
   selected_at: string;
   total_candidates: number;
   selected_count: number;
+  excluded_used: ExcludedCandidate[];
   items: RankedCandidate[];
 }
 
@@ -45,10 +47,23 @@ export async function runSelectCommand(
     );
   }
 
-  const ranked = rankWeekly(candidates, ctx.env.VIDEO_ITEM_COUNT);
+  // Drop stories already used in other approved/published weeks before ranking so the
+  // configured item count is backfilled from the remaining ranked candidates.
+  const used = await workerClient.getUsedStories(ctx.week, ctx.signal);
+  const { eligible, excluded } = excludeUsedStories(candidates, used);
+  for (const entry of excluded) {
+    stdout(`Excluded already-used story ${entry.url} (${entry.reason}, used in ${entry.prior_week}: ${entry.prior_url})`);
+  }
+
+  const ranked = rankWeekly(eligible, ctx.env.VIDEO_ITEM_COUNT);
   if (ranked.length === 0) {
     throw new Error(
-      `No valid ranked candidates produced for week ${ctx.week} from ${candidates.length} raw row(s).`
+      `No valid ranked candidates produced for week ${ctx.week} from ${candidates.length} raw row(s) (${excluded.length} excluded as already used).`
+    );
+  }
+  if (ranked.length < ctx.env.VIDEO_ITEM_COUNT && excluded.length > 0) {
+    throw new Error(
+      `Only ${ranked.length} unique candidate(s) remain for week ${ctx.week}, but ${ctx.env.VIDEO_ITEM_COUNT} are required; ${excluded.length} were excluded as already used in earlier editions.`
     );
   }
 
@@ -57,6 +72,7 @@ export async function runSelectCommand(
     selected_at: nowFn().toISOString(),
     total_candidates: candidates.length,
     selected_count: ranked.length,
+    excluded_used: excluded,
     items: ranked,
   };
 

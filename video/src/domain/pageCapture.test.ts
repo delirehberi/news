@@ -3,6 +3,7 @@ import {
   CAPTURE_EXCERPT_MAX_CHARS,
   cleanCaptureText,
   computeUrlHash,
+  detectBlockedOrErrorPage,
   OVERLAY_DISMISS_CSS,
   PageCaptureMetadataSchema,
   parsePageCaptureMetadata,
@@ -148,5 +149,20 @@ describe('src/domain/pageCapture.ts', () => {
     expect(OVERLAY_DISMISS_CSS).toContain('.cookie-banner');
     expect(OVERLAY_DISMISS_CSS).toContain('.newsletter-popup');
     expect(OVERLAY_DISMISS_CSS).toContain('display: none !important');
+  });
+
+  it('flags short error and bot-block pages but not real articles', () => {
+    expect(detectBlockedOrErrorPage('403 Forbidden')).toMatch(/error or block page/);
+    expect(detectBlockedOrErrorPage('Not found')).toMatch(/error or block page/);
+    expect(detectBlockedOrErrorPage('Just a moment... Checking your browser')).toMatch(
+      /error or block page/
+    );
+    expect(detectBlockedOrErrorPage('   ')).toBe('page has no readable text');
+
+    // Short but legitimate text without block phrases is kept.
+    expect(detectBlockedOrErrorPage('Rust 1.90 released with faster builds')).toBeNull();
+    // A long article that mentions "404" or "forbidden" is not rejected.
+    const article = `Our API returned 404 for forbidden routes. ${'Details about the fix. '.repeat(10)}`;
+    expect(detectBlockedOrErrorPage(article)).toBeNull();
   });
 });

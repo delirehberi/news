@@ -46,7 +46,7 @@ export async function assertEditionApproved(
 
 /**
  * Parses `out/<week>/script.md`, validates its structure and word budget
- * (`WORDS_MIN = 280`..`WORDS_MAX = 700`), updates `out/<week>/script.json`,
+ * (`WORDS_MIN = 280`..`WORDS_MAX = 2000`), updates `out/<week>/script.json`,
  * and PUTs `script` and `status: 'approved'` to the Worker Admin API (publishing `/weekly/<week>`).
  */
 export async function runApproveCommand(

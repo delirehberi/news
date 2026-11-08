@@ -16,6 +16,7 @@ export interface ChatMessage {
 export interface LlmChatOptions<T> {
   baseUrl: string;
   apiKey: string;
+  access?: { clientId: string; clientSecret: string };
   model: string;
   messages: readonly ChatMessage[];
   schema: z.ZodType<T>;
@@ -147,6 +148,11 @@ export async function chat<T>(options: LlmChatOptions<T>): Promise<T> {
     'cf-aig-authorization': `Bearer ${options.apiKey}`,
   };
 
+  if (options.access) {
+    headers['CF-Access-Client-Id'] = options.access.clientId;
+    headers['CF-Access-Client-Secret'] = options.access.clientSecret;
+  }
+
   let currentMessages: ChatMessage[] = [...options.messages];
 
   for (let validationAttempt = 0; validationAttempt <= MAX_VALIDATION_RETRIES; validationAttempt++) {
@@ -203,4 +209,3 @@ export async function chat<T>(options: LlmChatOptions<T>): Promise<T> {
 
   throw new Error('Unexpected end of LLM validation loop.');
 }
-

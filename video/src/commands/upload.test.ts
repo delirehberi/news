@@ -287,6 +287,7 @@ describe('src/commands/upload.ts', () => {
 
       const workerClient: WorkerClient = {
         getCandidates: vi.fn(),
+        getUsedStories: vi.fn().mockResolvedValue([]),
         getEdition: vi.fn().mockResolvedValue(makeApprovedEdition()),
         putEdition: vi.fn().mockImplementation(async (_week, payload) => ({
           ...makeApprovedEdition(),
@@ -384,6 +385,7 @@ describe('src/commands/upload.ts', () => {
 
       const workerClient: WorkerClient = {
         getCandidates: vi.fn(),
+        getUsedStories: vi.fn().mockResolvedValue([]),
         getEdition: vi.fn().mockResolvedValue(
           makeApprovedEdition({
             status: 'published',
@@ -474,6 +476,7 @@ describe('src/commands/upload.ts', () => {
       let current = edition;
       return {
         getCandidates: vi.fn(),
+        getUsedStories: vi.fn().mockResolvedValue([]),
         getEdition: vi.fn().mockImplementation(async () => current),
         putEdition: vi.fn().mockImplementation(async (_week, payload) => {
           current = {
@@ -653,6 +656,7 @@ describe('src/commands/upload.ts', () => {
       const controller = new AbortController();
       const workerClient: WorkerClient = {
         getCandidates: vi.fn(),
+        getUsedStories: vi.fn().mockResolvedValue([]),
         getEdition: vi.fn().mockResolvedValue(
           makeApprovedEdition({
             status: 'draft',

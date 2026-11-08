@@ -24,6 +24,8 @@ import {
 const CANARY_SECRETS = {
   INGESTION_SECRET: 'CANARY_INGESTION_SECRET_991_DO_NOT_LEAK',
   AI_GATEWAY_API_KEY: 'CANARY_AI_API_KEY_992_DO_NOT_LEAK',
+  CF_ACCESS_CLIENT_ID: 'CANARY_ACCESS_CLIENT_ID_997_DO_NOT_LEAK',
+  CF_ACCESS_CLIENT_SECRET: 'CANARY_ACCESS_CLIENT_SECRET_998_DO_NOT_LEAK',
   ELEVENLABS_API_KEY: 'CANARY_ELEVENLABS_KEY_993_DO_NOT_LEAK',
   YOUTUBE_CLIENT_SECRET: 'CANARY_YT_CLIENT_SECRET_994_DO_NOT_LEAK',
   YOUTUBE_REFRESH_TOKEN: 'CANARY_YT_REFRESH_TOKEN_995_DO_NOT_LEAK',
@@ -105,6 +107,8 @@ describe('Weekly Video Pipeline End-to-End & Security Audit', () => {
       INGESTION_SECRET: CANARY_SECRETS.INGESTION_SECRET,
       AI_GATEWAY_BASE_URL: 'https://ai.workouse.com/v1',
       AI_GATEWAY_API_KEY: CANARY_SECRETS.AI_GATEWAY_API_KEY,
+      CF_ACCESS_CLIENT_ID: CANARY_SECRETS.CF_ACCESS_CLIENT_ID,
+      CF_ACCESS_CLIENT_SECRET: CANARY_SECRETS.CF_ACCESS_CLIENT_SECRET,
       AI_MODEL: 'gpt-4o-mini',
       ELEVENLABS_API_KEY: CANARY_SECRETS.ELEVENLABS_API_KEY,
       ELEVENLABS_VOICE_ID: 'voice_tr_test',
@@ -177,6 +181,11 @@ describe('Weekly Video Pipeline End-to-End & Security Audit', () => {
       const method = (init?.method ?? 'GET').toUpperCase();
       const headers = new Headers(init?.headers);
 
+      if (!url.startsWith('https://ai.workouse.com/')) {
+        expect(headers.has('CF-Access-Client-Id')).toBe(false);
+        expect(headers.has('CF-Access-Client-Secret')).toBe(false);
+      }
+
       // 1. Worker Admin API
       if (url.startsWith('https://news.emre.xyz/api/admin/weekly/')) {
         const auth = headers.get('Authorization');
@@ -192,6 +201,14 @@ describe('Weekly Video Pipeline End-to-End & Security Audit', () => {
           }
           const rows = candidateRows.filter((r) => r.week === targetWeek);
           return new Response(JSON.stringify(rows), { status: 200 });
+        }
+
+        if (suffix.endsWith('/used-stories')) {
+          const usedWeek = decodeURIComponent(suffix.slice(0, -'/used-stories'.length));
+          if (!isValidIsoWeek(usedWeek)) {
+            return new Response(JSON.stringify({ error: 'Bad Request' }), { status: 400 });
+          }
+          return new Response(JSON.stringify([]), { status: 200 });
         }
 
         const targetWeek = decodeURIComponent(suffix);
@@ -251,6 +268,8 @@ describe('Weekly Video Pipeline End-to-End & Security Audit', () => {
 
       // 2. AI Gateway (/chat/completions)
       if (url === 'https://ai.workouse.com/v1/chat/completions') {
+        expect(headers.get('CF-Access-Client-Id')).toBe(CANARY_SECRETS.CF_ACCESS_CLIENT_ID);
+        expect(headers.get('CF-Access-Client-Secret')).toBe(CANARY_SECRETS.CF_ACCESS_CLIENT_SECRET);
         const auth = headers.get('Authorization');
         if (auth !== `Bearer ${CANARY_SECRETS.AI_GATEWAY_API_KEY}`) {
           return new Response(JSON.stringify({ error: 'Unauthorized AI key' }), { status: 401 });

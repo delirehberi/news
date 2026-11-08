@@ -2,10 +2,38 @@ export type WeeklyStatus = 'draft' | 'approved' | 'published';
 
 export interface WeeklyItem {
   url: string;
+  cluster_id?: string | null;
   title_tr: string;
   summary_tr: string;
   source: string;
   image_url?: string | null;
+  curator_comment?: string | null;
+}
+
+export interface WeeklyUsedIdentity {
+  week: string;
+  url: string;
+  normalized_url: string;
+  cluster_id: string | null;
+  title_tr: string;
+}
+
+export interface WeeklyEditionIdentitySource {
+  week: string;
+  items_json: string;
+}
+
+export interface WeeklyCandidateIdentitySource {
+  week: string;
+  url: string;
+  cluster_id: string | null;
+}
+
+export interface WeeklyDuplicateConflict {
+  current_url: string;
+  prior_url: string;
+  prior_week: string;
+  reason: 'normalized_url' | 'cluster_id';
 }
 
 export interface WeeklyEditionPayload {
@@ -31,6 +59,7 @@ export interface WeeklyCandidateRow {
   source_count: number;
   seen_count: number;
   cluster_id: string | null;
+  curator_comment?: string | null;
   captured_at: string;
 }
 
@@ -50,6 +79,96 @@ const ISO_WEEK_REGEX = /^\d{4}-W\d{2}$/;
 const MIN_ISO_WEEK = 1;
 const MAX_ISO_WEEK = 53;
 const YOUTUBE_VIDEO_ID_REGEX = /^[A-Za-z0-9_-]{1,64}$/;
+const TRACKING_QUERY_PARAMETERS = new Set([
+  'dclid',
+  'fbclid',
+  'gclid',
+  'msclkid',
+]);
+
+export function normalizeWeeklyUrl(value: string): string | null {
+  try {
+    const parsed = new URL(value.trim());
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+
+    parsed.protocol = 'https:';
+    parsed.hash = '';
+    for (const key of [...parsed.searchParams.keys()]) {
+      if (key.toLowerCase().startsWith('utm_') || TRACKING_QUERY_PARAMETERS.has(key.toLowerCase())) {
+        parsed.searchParams.delete(key);
+      }
+    }
+    parsed.searchParams.sort();
+    if (parsed.pathname !== '/') parsed.pathname = parsed.pathname.replace(/\/+$/, '');
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
+export function buildWeeklyUsedIdentities(
+  editions: WeeklyEditionIdentitySource[],
+  candidates: WeeklyCandidateIdentitySource[]
+): WeeklyUsedIdentity[] {
+  const clustersByEditionUrl = new Map<string, string>();
+  for (const candidate of candidates) {
+    const normalizedUrl = normalizeWeeklyUrl(candidate.url);
+    if (normalizedUrl && candidate.cluster_id) {
+      clustersByEditionUrl.set(`${candidate.week}\n${normalizedUrl}`, candidate.cluster_id);
+    }
+  }
+
+  const identities: WeeklyUsedIdentity[] = [];
+  for (const edition of editions) {
+    let items: unknown;
+    try {
+      items = JSON.parse(edition.items_json);
+    } catch (error) {
+      throw new Error(`Parsing weekly edition items for ${edition.week}: ${String(error)}`);
+    }
+    if (!Array.isArray(items)) {
+      throw new Error(`Parsing weekly edition items for ${edition.week}: expected an array`);
+    }
+
+    for (const item of items) {
+      if (!isValidWeeklyItem(item)) {
+        throw new Error(`Parsing weekly edition items for ${edition.week}: invalid item`);
+      }
+      const normalizedUrl = normalizeWeeklyUrl(item.url);
+      if (!normalizedUrl) continue;
+      identities.push({
+        week: edition.week,
+        url: item.url,
+        normalized_url: normalizedUrl,
+        cluster_id: item.cluster_id ?? clustersByEditionUrl.get(`${edition.week}\n${normalizedUrl}`) ?? null,
+        title_tr: item.title_tr,
+      });
+    }
+  }
+  return identities;
+}
+
+export function findWeeklyDuplicateConflicts(
+  items: WeeklyItem[],
+  usedIdentities: WeeklyUsedIdentity[]
+): WeeklyDuplicateConflict[] {
+  const conflicts: WeeklyDuplicateConflict[] = [];
+  for (const item of items) {
+    const normalizedUrl = normalizeWeeklyUrl(item.url);
+    const match = usedIdentities.find((identity) =>
+      (normalizedUrl !== null && identity.normalized_url === normalizedUrl) ||
+      (item.cluster_id !== undefined && item.cluster_id !== null && identity.cluster_id === item.cluster_id)
+    );
+    if (!match) continue;
+    conflicts.push({
+      current_url: item.url,
+      prior_url: match.url,
+      prior_week: match.week,
+      reason: normalizedUrl !== null && match.normalized_url === normalizedUrl ? 'normalized_url' : 'cluster_id',
+    });
+  }
+  return conflicts;
+}
 
 /**
  * Validates ISO 8601 week string format (e.g. 2026-W42, week 01..53).
@@ -113,11 +232,26 @@ function isValidWeeklyItem(item: unknown): item is WeeklyItem {
   if (typeof record.title_tr !== 'string') return false;
   if (typeof record.summary_tr !== 'string') return false;
   if (typeof record.source !== 'string') return false;
+  if (
+    record.cluster_id !== undefined &&
+    record.cluster_id !== null &&
+    (typeof record.cluster_id !== 'string' || record.cluster_id.trim().length === 0)
+  ) {
+    return false;
+  }
 
   if (
     record.image_url !== undefined &&
     record.image_url !== null &&
     !isValidHttpUrl(record.image_url)
+  ) {
+    return false;
+  }
+
+  if (
+    record.curator_comment !== undefined &&
+    record.curator_comment !== null &&
+    typeof record.curator_comment !== 'string'
   ) {
     return false;
   }

@@ -11,10 +11,11 @@ Yazım ve Dil Kuralları:
 1. Doğal ve Gazeteci Tonu: Birebir (kelimesi kelimesine) çeviri yapma. Haberin özünü, bağlamını ve neden önemli olduğunu sade, akıcı ve profesyonel bir Türkçe haber diliyle aktar.
 2. Teknik Terimler: Türkçe teknoloji yazımında yaygın olarak İngilizce bırakılan teknik terimleri, kısaltmaları ve özel ürün/mimari adlarını (ör. open source, LLM, runtime, cloud, kernel, benchmark, framework, API, SDK, container, GPU, inference, serverless, pull request, commit, zero-day, webhook vb.) zorlama Türkçe karşılıklarla bozmadan İngilizce olarak koru.
 3. Özet Uzunluğu: Her haber için \`summary_tr\` alanı tam olarak 2 veya 3 cümleden oluşmalıdır. İlk cümle gelişmenin ne olduğunu, takip eden cümle(ler) ise teknik/sektörel etkisini veya önemli detayını açıklamalıdır.
-4. Bülten Başlığı ve Giriş:
+4. Küratör Yorumu (\`curator_comment\`): Eğer bir haberde \`curator_comment\` alanı varsa, küratörün o link hakkındaki kişisel notunu, vurgusunu veya teknik perspektifini \`summary_tr\` içinde doğal biçimde yansıt.
+5. Bülten Başlığı ve Giriş:
    - \`title_tr\`: Haftanın öne çıkan temalarını yansıtan çarpıcı ve editoryal bir Türkçe başlık.
    - \`intro_tr\`: Haftanın genel gündemini özetleyen 2–3 cümlelik akıcı bir giriş paragrafı.
-5. Çıktı Formatı: Yanıtın SADECE geçerli bir JSON nesnesi olmalıdır. Girdideki her haberin \`url\` değerini birebir koru ve sırasını değiştirme.`;
+6. Çıktı Formatı: Yanıtın SADECE geçerli bir JSON nesnesi olmalıdır. Girdideki her haberin \`url\` değerini birebir koru ve sırasını değiştirme.`;
 
 export const TranslatedStoryItemSchema = z.object({
   url: z.string().trim().min(1, 'Story url must not be empty'),
@@ -71,17 +72,26 @@ export function createTranslationResponseSchema(
  */
 export function buildTranslateUserPrompt(
   week: string,
-  candidates: readonly Pick<RankedCandidate, 'url' | 'title' | 'source' | 'summary'>[]
+  candidates: readonly (Pick<RankedCandidate, 'url' | 'title' | 'source' | 'summary'> & {
+    curator_comment?: string | null;
+  })[]
 ): string {
   const inputPayload = {
     week,
-    stories: candidates.map((c, index) => ({
-      index: index + 1,
-      url: c.url,
-      title: c.title,
-      source: c.source ?? 'unknown',
-      summary: c.summary ?? '',
-    })),
+    stories: candidates.map((c, index) => {
+      const curatorComment =
+        typeof c.curator_comment === 'string' && c.curator_comment.trim().length > 0
+          ? c.curator_comment.trim()
+          : undefined;
+      return {
+        index: index + 1,
+        url: c.url,
+        title: c.title,
+        source: c.source ?? 'unknown',
+        summary: c.summary ?? '',
+        ...(curatorComment ? { curator_comment: curatorComment } : {}),
+      };
+    }),
   };
 
   return [

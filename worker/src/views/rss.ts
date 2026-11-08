@@ -21,7 +21,13 @@ export function generateRssFeed(articles: ArticleModel[], siteUrl: string = 'htt
       : new Date().toUTCString();
     
     const permalink = `${siteUrl}/article/${article.id}`;
-    const description = article.summary || article.title;
+    const baseDescription = article.summary || article.title;
+    const curatorComment = typeof article.curator_comment === 'string' && article.curator_comment.trim().length > 0
+      ? article.curator_comment.trim()
+      : null;
+    const description = curatorComment
+      ? `Curator note: ${curatorComment}\n\n${baseDescription}`
+      : baseDescription;
     const enclosure = article.image_url
       ? `<enclosure url="${escapeXml(article.image_url)}" type="image/jpeg" length="0" />`
       : '';

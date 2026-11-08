@@ -72,12 +72,12 @@ describe('src/domain/script.ts', () => {
   it('rejects scripts under WORDS_MIN and over WORDS_MAX with exact word counts in the error', () => {
     const underScript = makeBudgetScript(WORDS_MIN - 15); // 265 words
     expect(() => validateScriptWordBudget(underScript)).toThrowError(
-      /265 words \(under minimum; allowed budget is 280\.\.700 words/
+      /265 words \(under minimum; allowed budget is 280\.\.2000 words/
     );
 
-    const overScript = makeBudgetScript(WORDS_MAX + 42); // 742 words
+    const overScript = makeBudgetScript(WORDS_MAX + 42); // 2042 words
     expect(() => validateScriptWordBudget(overScript)).toThrowError(
-      /742 words \(over maximum; allowed budget is 280\.\.700 words/
+      /2042 words \(over maximum; allowed budget is 280\.\.2000 words/
     );
   });
 

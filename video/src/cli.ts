@@ -31,6 +31,7 @@ export type CliCommand = (typeof CLI_COMMANDS)[number];
 export interface ParsedCliArgs {
   help: boolean;
   mock?: boolean;
+  allowCards?: boolean;
   command?: CliCommand;
   week: string;
 }
@@ -40,6 +41,8 @@ export interface CommandContext {
   env: VideoEnv;
   signal: AbortSignal;
   mock?: boolean;
+  /** Lets `render` proceed even when every story would be a plain branded card. */
+  allowCards?: boolean;
 }
 
 export type CommandHandler = (ctx: CommandContext) => Promise<void>;
@@ -66,12 +69,13 @@ export function formatHelpText(): string {
     'Options:',
     '  --week <YYYY-Www>  Target ISO week (defaults to previous ISO week in UTC)',
     '  --mock             Use deterministic mock synthesis in voice command',
+    '  --allow-cards      Let render proceed when no story has a screenshot or image',
     '  -h, --help         Show this help message',
   ].join('\n');
 }
 
 /**
- * Parses CLI arguments (`<command>`, `--week <YYYY-Www>`, `--mock`, `--help` / `-h`).
+ * Parses CLI arguments (`<command>`, `--week <YYYY-Www>`, `--mock`, `--allow-cards`, `--help` / `-h`).
  * Defaults `week` to `previousIsoWeek(now)`.
  */
 export function parseCliArgs(
@@ -80,6 +84,7 @@ export function parseCliArgs(
 ): ParsedCliArgs {
   let help = false;
   let mock = false;
+  let allowCards = false;
   let command: CliCommand | undefined;
   let week: string | undefined;
 
@@ -92,6 +97,11 @@ export function parseCliArgs(
 
     if (arg === '--mock') {
       mock = true;
+      continue;
+    }
+
+    if (arg === '--allow-cards') {
+      allowCards = true;
       continue;
     }
 
@@ -137,6 +147,7 @@ export function parseCliArgs(
   return {
     help,
     ...(mock ? { mock: true } : {}),
+    ...(allowCards ? { allowCards: true } : {}),
     command,
     week: resolvedWeek,
   };
@@ -225,6 +236,7 @@ export async function runCli(options: RunCliOptions): Promise<void> {
     env,
     signal: options.signal,
     ...(parsed.mock ? { mock: true } : {}),
+    ...(parsed.allowCards ? { allowCards: true } : {}),
   });
 }
 

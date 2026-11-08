@@ -1177,20 +1177,22 @@ export function defaultChoreography(
         height: Math.min(viewportHeight, pageHeight),
       },
     },
+    // A stage whose box was synthesized (no matching captured element) only moves the
+    // camera (`scroll`): a spotlight or highlighter on an invented region would mark empty space.
     {
-      kind: 'focus',
+      kind: h1El ? 'focus' : 'scroll',
       anchor: h1El?.text || 'h1',
       target: h1El?.id ?? 'h1',
       box: h1Box,
     },
     {
-      kind: 'highlight',
+      kind: ledeEl && ledeEl.box.y >= h1Box.y ? 'highlight' : 'scroll',
       anchor: ledeEl?.text || 'lede',
       target: ledeEl?.id ?? 'p1',
       box: ledeBox,
     },
     {
-      kind: 'focus',
+      kind: figureEl && figureEl.box.y >= ledeBox.y ? 'focus' : 'scroll',
       anchor: figureEl?.text || 'figure',
       target: figureEl?.id ?? 'fig1',
       box: figureBox,

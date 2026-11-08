@@ -6,6 +6,22 @@ RECLUSTER_TIMEOUT_SECONDS ?= 900
 
 NVM_CMD=. ~/.nvm/nvm.sh && nvm use &&
 
+.PHONY: prepare approve cron-install weekly-check
+
+prepare:
+	bash scripts/weekly.sh prepare $(WEEK)
+
+approve:
+	bash scripts/weekly.sh approve
+
+cron-install:
+	bash scripts/weekly-cron.sh
+
+weekly-check:
+	bash -n scripts/weekly.sh
+	bash -n scripts/weekly-cron.sh
+	bash -c '$(NVM_CMD) cd video && npx vitest run src/weekly-job.test.ts'
+
 setup:
 	@echo "Setting up Node environment and installing global dependencies..."
 	bash -c '$(NVM_CMD) npm install -g wrangler'
@@ -149,12 +165,12 @@ video-approve:
 	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts approve $(if $(WEEK),--week $(WEEK),)'
 
 video-produce:
-	@echo "Running weekly video production pipeline (voice -> render -> upload)..."
+	@echo "Running weekly video production pipeline (voice -> capture -> render -> upload)..."
 	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts voice $(if $(WEEK),--week $(WEEK),)'
+	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts capture $(if $(WEEK),--week $(WEEK),)'
 	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts render $(if $(WEEK),--week $(WEEK),)'
 	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts upload $(if $(WEEK),--week $(WEEK),)'
 
 video-auth:
 	@echo "Running YouTube OAuth2 PKCE loopback flow..."
 	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts auth'
-

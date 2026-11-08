@@ -131,7 +131,7 @@ describe('src/commands/script.ts', () => {
     expect(logs[0]).toContain('Generated script (340 words, 2 segment(s))');
   });
 
-  it('retries once when the initial LLM script output is outside the [280, 700] word budget', async () => {
+  it('retries once when the initial LLM script output is outside the [280, 2000] word budget', async () => {
     const week = '2026-W42';
     const paths = getWeekPaths(week, tempDir);
     await writeJsonAtomic(paths.translationJson, makeSampleTranslation(week));
@@ -202,7 +202,55 @@ describe('src/commands/script.ts', () => {
       messages: Array<{ role: string; content: string }>;
     };
     expect(secondCallBody.messages[3].content).toContain(
-      'Total narration word count is 90 words, which is outside the required budget of 280..700 words.'
+      'Total narration word count is 90 words, which is outside the required budget of 280..2000 words.'
+    );
+  });
+
+  it('passes curator_comment into the video script user prompt when present on translated items', async () => {
+    const week = '2026-W42';
+    const paths = getWeekPaths(week, tempDir);
+    const sampleTranslation = makeSampleTranslation(week);
+    sampleTranslation.items[0].curator_comment = 'Bu mimari değişiklik özellikle düşük gecikmeli sistemler için dönüm noktası.';
+    await writeJsonAtomic(paths.translationJson, sampleTranslation);
+
+    const validScript: Script = {
+      intro: generateWords(45, 'acilis'),
+      segments: [
+        {
+          item_url: 'https://example.com/linux-kernel-rust',
+          headline_tr: 'Linux Kernel Rust Soyutlamaları',
+          narration_tr: generateWords(130, 'haberbir'),
+        },
+        {
+          item_url: 'https://example.com/cloudflare-workers-sql',
+          headline_tr: 'Edge Önbellekleme Stratejileri',
+          narration_tr: generateWords(130, 'haberiki'),
+        },
+      ],
+      outro: generateWords(35, 'kapanis'),
+    };
+
+    const mockFetch = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(makeOpenAiChatResponse(validScript));
+
+    const env = validateEnv({
+      INGESTION_SECRET: 'test-secret',
+      AI_GATEWAY_BASE_URL: 'https://ai.workouse.com/v1',
+      AI_GATEWAY_API_KEY: 'ai-key-123',
+      AI_MODEL: 'gpt-4o-mini',
+    });
+
+    await runScriptCommand(
+      { week, env, signal: new AbortController().signal },
+      { outRoot: tempDir, stdout: () => {}, fetchImpl: mockFetch }
+    );
+
+    const callBody = JSON.parse(String(mockFetch.mock.calls[0][1]?.body)) as {
+      messages: Array<{ role: string; content: string }>;
+    };
+    expect(callBody.messages[1].content).toContain(
+      'Bu mimari değişiklik özellikle düşük gecikmeli sistemler için dönüm noktası.'
     );
   });
 

@@ -14,7 +14,8 @@ CREATE TABLE articles (
     is_liked BOOLEAN DEFAULT 0,
     image_url TEXT,
     summary TEXT,
-    follower_likes INTEGER DEFAULT 0
+    follower_likes INTEGER DEFAULT 0,
+    curator_comment TEXT
 );
 
 CREATE TABLE user_preferences (

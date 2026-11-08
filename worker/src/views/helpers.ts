@@ -16,6 +16,7 @@ export interface ArticleModel {
   image_url?: string | null;
   summary?: string | null;
   follower_likes?: number;
+  curator_comment?: string | null;
   hot_score?: number;
   seen_count?: number;
   last_seen_at?: string | null;

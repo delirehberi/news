@@ -18,9 +18,12 @@ export const ArticleCard: FC<ArticleCardProps> = ({ article, index, initialOpen 
   const domain = getDomain(article.url);
   const isFirst = index === 0;
   const seenCount = article.seen_count || 1;
+  const curatorComment = typeof article.curator_comment === 'string' && article.curator_comment.trim().length > 0
+    ? article.curator_comment.trim()
+    : null;
 
   return (
-    <article class="news-item" data-id={article.id} data-created-at={article.created_at || ''}>
+    <article class={`news-item ${curatorComment ? 'has-curator-note' : ''}`.trim()} data-id={article.id} data-created-at={article.created_at || ''}>
       {/* 1. HackerNews-like Compact Title Row */}
       <div class="news-row">
         {/* Left: Source badge + Title + Domain */}
@@ -139,6 +142,14 @@ export const ArticleCard: FC<ArticleCardProps> = ({ article, index, initialOpen 
           </button>
         </div>
       </div>
+
+      {/* Curator Note Callout (visible on feed and permalink when present) */}
+      {curatorComment && (
+        <div class="curator-note">
+          <span class="curator-note-badge font-mono">Curator Note</span>
+          <p class="curator-note-text">{curatorComment}</p>
+        </div>
+      )}
 
       {/* 2. Collapsible Accordion Drawer */}
       <div

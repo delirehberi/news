@@ -37,6 +37,7 @@ function makeSampleSelection(week: string = '2026-W42'): WeeklySelection {
     selected_at: '2026-10-19T12:00:00.000Z',
     total_candidates: 5,
     selected_count: 2,
+    excluded_used: [],
     items: [
       {
         week,
@@ -79,6 +80,7 @@ function makeSampleSelection(week: string = '2026-W42'): WeeklySelection {
 function makeMockWorkerClient(): WorkerClient {
   return {
     getCandidates: vi.fn(),
+    getUsedStories: vi.fn().mockResolvedValue([]),
     getEdition: vi.fn(),
     putEdition: vi.fn().mockImplementation(async (week, payload) => {
       const edition: WeeklyEdition = {
@@ -176,6 +178,7 @@ describe('src/commands/translate.ts', () => {
         summary_tr: validLlmOutput.items[0].summary_tr,
         source: 'hackernews',
         image_url: 'https://example.com/kernel.png',
+        cluster_id: 'c1',
       },
       {
         url: 'https://example.com/cloudflare-workers-sql',
@@ -183,6 +186,7 @@ describe('src/commands/translate.ts', () => {
         summary_tr: validLlmOutput.items[1].summary_tr,
         source: 'lobsters',
         image_url: null,
+        cluster_id: null,
       },
     ]);
 
@@ -320,6 +324,58 @@ describe('src/commands/translate.ts', () => {
         }
       )
     ).rejects.toThrowError(/Failed to read JSON file/);
+  });
+
+  it('includes curator_comment in the translation prompt and preserves it on translated WeeklyItem', async () => {
+    const week = '2026-W42';
+    const paths = getWeekPaths(week, tempDir);
+    const selection = makeSampleSelection(week);
+    selection.items[0].curator_comment = 'Harika bir Rust kernel soyutlama örneği, özellikle DMA güvenliği açısından kritik.';
+    await writeJsonAtomic(paths.selectionJson, selection);
+
+    const validLlmOutput = {
+      title_tr: 'Linux Kernel Rust Desteği',
+      intro_tr: 'Bu hafta Linux kernel içindeki Rust entegrasyonu öne çıktı. Önemli gelişmeleri derledik.',
+      items: [
+        {
+          url: 'https://example.com/linux-kernel-rust',
+          title_tr: 'Linux Kernel PCI Sürücüleri İçin Rust Soyutlamaları',
+          summary_tr: 'Mainline Linux kernel sürümüne PCI sürücüleri için yeni Rust soyutlamaları eklendi. Özellikle DMA güvenliği açısından kritik bir adım.',
+        },
+        {
+          url: 'https://example.com/cloudflare-workers-sql',
+          title_tr: 'Edge Önbellekleme',
+          summary_tr: 'Modern serverless runtime mimarileri incelendi. Küresel API yanıt süreleri düşüyor.',
+        },
+      ],
+    };
+
+    const mockFetch = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(makeOpenAiChatResponse(validLlmOutput));
+    const workerClient = makeMockWorkerClient();
+    const env = validateEnv({
+      INGESTION_SECRET: 'test-secret',
+      AI_GATEWAY_BASE_URL: 'https://ai.workouse.com/v1',
+      AI_GATEWAY_API_KEY: 'ai-key-123',
+      AI_MODEL: 'gpt-4o-mini',
+    });
+
+    const { translation } = await runTranslateCommand(
+      { week, env, signal: new AbortController().signal },
+      { workerClient, outRoot: tempDir, stdout: () => {}, fetchImpl: mockFetch }
+    );
+
+    const callBody = JSON.parse(String(mockFetch.mock.calls[0][1]?.body)) as {
+      messages: Array<{ role: string; content: string }>;
+    };
+    expect(callBody.messages[1].content).toContain(
+      'Harika bir Rust kernel soyutlama örneği, özellikle DMA güvenliği açısından kritik.'
+    );
+    expect(translation.items[0].curator_comment).toBe(
+      'Harika bir Rust kernel soyutlama örneği, özellikle DMA güvenliği açısından kritik.'
+    );
+    expect(translation.items[1].curator_comment).toBeUndefined();
   });
 });
 

@@ -80,6 +80,8 @@ describe('src/lib/llm.ts', () => {
     const headers = calledInit?.headers as Record<string, string>;
     expect(headers.Authorization).toBe('Bearer gateway-secret-key');
     expect(headers['cf-aig-authorization']).toBe('Bearer gateway-secret-key');
+    expect(headers['CF-Access-Client-Id']).toBeUndefined();
+    expect(headers['CF-Access-Client-Secret']).toBeUndefined();
 
     const sentBody = JSON.parse(String(calledInit?.body)) as Record<string, unknown>;
     expect(sentBody.model).toBe('gpt-4o-mini');
@@ -88,6 +90,32 @@ describe('src/lib/llm.ts', () => {
       { role: 'system', content: 'You are a Turkish editor.' },
       { role: 'user', content: 'Translate this week.' },
     ]);
+  });
+
+  it('sends separate Access service-token headers on validation retries', async () => {
+    const mockFetch = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(makeOpenAiResponse('{}'))
+      .mockResolvedValueOnce(makeOpenAiResponse(JSON.stringify({ title_tr: 'Özet', count: 1 })));
+
+    await chat({
+      baseUrl: 'https://ai.workouse.com',
+      apiKey: 'test-gateway-key',
+      access: { clientId: 'test-access-client', clientSecret: 'test-access-secret' },
+      model: 'dynamic/audit',
+      messages: [{ role: 'user', content: 'Produce JSON' }],
+      schema: SampleSchema,
+      fetchImpl: mockFetch,
+    });
+
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    for (const [, request] of mockFetch.mock.calls) {
+      const headers = new Headers(request?.headers);
+      expect(headers.get('CF-Access-Client-Id')).toBe('test-access-client');
+      expect(headers.get('CF-Access-Client-Secret')).toBe('test-access-secret');
+      expect(headers.get('Authorization')).toBe('Bearer test-gateway-key');
+      expect(headers.get('cf-aig-authorization')).toBe('Bearer test-gateway-key');
+      expect(String(request?.body)).not.toContain('test-access-secret');
+    }
   });
 
   it('retries once when Zod validation fails and includes the validation error in the retry prompt', async () => {
@@ -173,4 +201,3 @@ describe('src/lib/llm.ts', () => {
     expect(mockFetch).toHaveBeenCalledTimes(2);
   });
 });
-

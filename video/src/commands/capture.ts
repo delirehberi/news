@@ -14,6 +14,7 @@ import {
   CAPTURE_VIEWPORT_WIDTH,
   cleanCaptureText,
   computeUrlHash,
+  detectBlockedOrErrorPage,
   OVERLAY_DISMISS_CSS,
   PageCaptureMetadataSchema,
   type PageCaptureMetadata,
@@ -38,6 +39,7 @@ import type { WeeklyTranslation } from './translate.ts';
 export const DEFAULT_NAVIGATION_TIMEOUT_MS = 25_000;
 export const DEFAULT_MAX_PAGE_BYTES = 15 * 1024 * 1024;
 export const DEFAULT_SETTLE_DELAY_MS = 350;
+const HTTP_ERROR_STATUS_MIN = 400;
 
 export interface RawExtractedElement {
   kind: PageElementKind;
@@ -55,6 +57,8 @@ export interface RawDomExtraction {
   pageHeight: number;
   excerpt: string;
   elements: RawExtractedElement[];
+  /** Absolute `og:image` / `twitter:image` URL, or null when the page has none. */
+  ogImageUrl?: string | null;
 }
 
 export interface CaptureBrowserSession {
@@ -78,6 +82,32 @@ export interface CaptureBrowserSession {
 export type CaptureBrowserFactory = (options: {
   signal: AbortSignal;
 }) => Promise<CaptureBrowserSession>;
+
+const OG_IMAGE_URL_MAX_LENGTH = 2048;
+
+/**
+ * Validates an `og:image` URL extracted from page DOM: keeps only absolute http(s) URLs
+ * without embedded credentials and within a sane length; returns null otherwise.
+ */
+export function normalizeOgImageUrl(raw: string | null | undefined): string | null {
+  const trimmed = raw?.trim() ?? '';
+  if (!trimmed || trimmed.length > OG_IMAGE_URL_MAX_LENGTH) {
+    return null;
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    return null;
+  }
+  if (parsed.username || parsed.password) {
+    return null;
+  }
+  return parsed.toString();
+}
 
 /**
  * Assigns stable, sequential per-kind IDs (`h1`, `h2_1`, `p1`, `fig1`, `code1`, `quote1`, `table1`)
@@ -338,10 +368,38 @@ function extractPageDomInBrowser(params: {
 
   const pageHeight = Math.min(params.maxHeightPx, Math.max(1, Math.round(docHeight)));
 
+  // Social preview image, resolved to an absolute http(s) URL. This function is serialized
+  // into the page by `page.evaluate`, so the selector list must stay inline.
+  let ogImageUrl: string | null = null;
+  const ogImageSelectors = [
+    'meta[property="og:image:secure_url"]',
+    'meta[property="og:image"]',
+    'meta[name="og:image"]',
+    'meta[name="twitter:image"]',
+    'meta[property="twitter:image"]',
+  ];
+  for (const selector of ogImageSelectors) {
+    const content = document.querySelector<HTMLMetaElement>(selector)?.content?.trim() ?? '';
+    if (!content) {
+      continue;
+    }
+    try {
+      const resolved = new URL(content, window.location.href);
+      if (resolved.protocol === 'http:' || resolved.protocol === 'https:') {
+        ogImageUrl = resolved.toString();
+        break;
+      }
+    } catch {
+      // Malformed meta content: try the next selector.
+      continue;
+    }
+  }
+
   return {
     pageHeight,
     excerpt,
     elements,
+    ogImageUrl,
   };
 }
 
@@ -483,13 +541,18 @@ export const defaultCaptureBrowserFactory: CaptureBrowserFactory = async ({ sign
           }
         });
 
-        await page.goto(url, {
+        const navigationResponse = await page.goto(url, {
           waitUntil: 'networkidle2',
           timeout: navigationTimeoutMs,
         });
 
         if (ssrfBlockedReason) {
           throw new Error(ssrfBlockedReason);
+        }
+        // An error status means we got an error or bot-block page, not the article.
+        const navigationStatus = navigationResponse?.status() ?? 0;
+        if (navigationStatus >= HTTP_ERROR_STATUS_MIN) {
+          throw new Error(`Page responded with HTTP ${navigationStatus}`);
         }
         if (byteLimitExceededReason) {
           throw new Error(byteLimitExceededReason);
@@ -699,6 +762,11 @@ export async function captureStoryPage(
       throw new Error('Captured screenshot PNG buffer is empty');
     }
 
+    const blockedReason = detectBlockedOrErrorPage(extraction.excerpt);
+    if (blockedReason) {
+      throw new Error(blockedReason);
+    }
+
     const elements = buildNumberedPageElements(extraction.elements, maxHeightPx);
     const metadata: PageCaptureMetadata = {
       index: storyIndex,
@@ -714,6 +782,7 @@ export async function captureStoryPage(
       page_height: Math.min(maxHeightPx, Math.max(1, Math.round(extraction.pageHeight))),
       excerpt: cleanCaptureText(extraction.excerpt, CAPTURE_EXCERPT_MAX_CHARS),
       elements,
+      og_image_url: normalizeOgImageUrl(extraction.ogImageUrl),
     };
 
     const validatedMetadata = PageCaptureMetadataSchema.parse(metadata);

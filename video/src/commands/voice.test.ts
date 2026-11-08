@@ -90,6 +90,7 @@ describe('src/commands/voice.ts', () => {
 
     const workerClient: WorkerClient = {
       getCandidates: vi.fn(),
+      getUsedStories: vi.fn().mockResolvedValue([]),
       getEdition: vi.fn().mockResolvedValue(buildApprovedEdition(week, script)),
       putEdition: vi.fn(),
       triggerSnapshot: vi.fn(),
@@ -183,6 +184,7 @@ describe('src/commands/voice.ts', () => {
 
     const workerClient: WorkerClient = {
       getCandidates: vi.fn(),
+      getUsedStories: vi.fn().mockResolvedValue([]),
       getEdition: vi.fn().mockResolvedValue(buildApprovedEdition(week, script)),
       putEdition: vi.fn(),
       triggerSnapshot: vi.fn(),
@@ -226,6 +228,7 @@ describe('src/commands/voice.ts', () => {
 
     const draftWorkerClient: WorkerClient = {
       getCandidates: vi.fn(),
+      getUsedStories: vi.fn().mockResolvedValue([]),
       getEdition: vi.fn().mockResolvedValue({
         ...buildApprovedEdition(week, script),
         status: 'draft',

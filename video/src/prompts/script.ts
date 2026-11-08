@@ -65,12 +65,12 @@ export interface ScriptResponseSchemaOptions {
 }
 
 export const SCRIPT_SYSTEM_PROMPT = `Sen news.emre.xyz haftalık YouTube teknoloji ve gündem bülteninin baş metin yazarı, sunucusu ve görsel yönetmenisisin.
-Görevin, Türkçeye çevrilmiş haftalık haber bülteninden 2 ila 5 dakikalık (yaklaşık ${WORDS_PER_MINUTE} kelime/dakika hızında okunacak) akıcı, doğal ve dinamik bir Türkçe seslendirme metni (video script) ve her haber için ekran koreografisi (\`visuals\`) üretmektir.
+Görevin, Türkçeye çevrilmiş haftalık haber bülteninden haber sayısına göre 2 ila 14 dakikalık (yaklaşık ${WORDS_PER_MINUTE} kelime/dakika hızında okunacak) akıcı, doğal ve dinamik bir Türkçe seslendirme metni (video script) ve her haber için ekran koreografisi (\`visuals\`) üretmektir.
 
 Yazım, Seslendirme, Görsel Yönetmenlik ve Kelime Bütçesi Kuralları:
 1. Kelime Bütçesi (ZORUNLU):
-   - \`intro\`, tüm \`segments[].narration_tr\` ve \`outro\` alanlarındaki toplam kelime sayısı EN AZ ${WORDS_MIN} ve EN FAZLA ${WORDS_MAX} kelime olmalıdır (ideal hedef: 380–520 kelime).
-   - Ne çok kısa (280 kelimenin altı) ne de çok uzun (700 kelimenin üstü) yazma.
+   - \`intro\`, tüm \`segments[].narration_tr\` ve \`outro\` alanlarındaki toplam kelime sayısı EN AZ ${WORDS_MIN} ve EN FAZLA ${WORDS_MAX} kelime olmalıdır (ideal hedef: haber başına yaklaşık 70 kelime + intro ve outro; 6 haberde 380–520, 20 haberde 1300–1700 kelime).
+   - Ne çok kısa (280 kelimenin altı) ne de çok uzun (2000 kelimenin üstü) yazma.
 2. Doğal Konuşma ve Sunum Dili:
    - Metin sesli okunacaktır (ElevenLabs TTS). Yazı dili yerine kulağa doğal gelen, net, enerjik ve profesyonel bir yayıncı/sunucu Türkçesi kullan.
    - Çok uzun, karmaşık veya iç içe geçmiş yan cümlelerden kaçın; nefes payı bırakan akıcı cümleler kur.
@@ -81,7 +81,7 @@ Yazım, Seslendirme, Görsel Yönetmenlik ve Kelime Bütçesi Kuralları:
    - \`segments\`: Girdideki her haber için sırayı bozmadan bir segment üret:
      - \`item_url\`: Haberin girdideki orijinal URL'si (birebir aynı olmalı).
      - \`headline_tr\`: Video ekranında kart başlığı olarak görünecek kısa, vurucu Türkçe başlık.
-     - \`narration_tr\`: Haberin ne olduğunu ve neden önemli olduğunu anlatan seslendirme metni (haber başına yaklaşık 55–85 kelime).
+     - \`narration_tr\`: Haberin ne olduğunu ve neden önemli olduğunu anlatan seslendirme metni (haber başına yaklaşık 55–85 kelime). Eğer haberde \`curator_comment\` (küratörün yorumu/notu) varsa bu bakış açısını anlatıma doğal biçimde dahil et.
      - \`visuals\`: Haberin seslendirmesi sırasında ekranda tetiklenecek ${MIN_VISUAL_CUES_PER_SEGMENT} ila ${MAX_VISUAL_CUES_PER_SEGMENT} adet görsel ipucu (\`VisualCue\`). Her ipucu şu alanları içerir:
        - \`kind\`: \`"scroll" | "focus" | "highlight" | "circle" | "underline" | "arrow" | "stat" | "quote" | "image"\`
        - \`anchor\`: \`narration_tr\` metninde BİREBİR geçen kısa ifade (2–6 kelime, ör. \`"yeni model"\`, \`"yüzde 40"\`).
@@ -502,12 +502,17 @@ export function buildScriptUserPrompt(
             }))
           : undefined;
 
+      const curatorComment =
+        typeof item.curator_comment === 'string' && item.curator_comment.trim().length > 0
+          ? item.curator_comment.trim()
+          : undefined;
       return {
         index: idx + 1,
         item_url: item.url,
         title_tr: item.title_tr,
         summary_tr: item.summary_tr,
         source: item.source,
+        ...(curatorComment ? { curator_comment: curatorComment } : {}),
         ...(excerpt ? { excerpt } : {}),
         ...(elements ? { elements } : {}),
       };

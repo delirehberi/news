@@ -7,7 +7,7 @@ export const DEFAULT_ELEVENLABS_MODEL_ID = 'eleven_multilingual_v2';
 export const DEFAULT_YOUTUBE_PRIVACY = 'private' as const;
 export const DEFAULT_VIDEO_ITEM_COUNT = 6;
 export const MIN_VIDEO_ITEM_COUNT = 1;
-export const MAX_VIDEO_ITEM_COUNT = 15;
+export const MAX_VIDEO_ITEM_COUNT = 20;
 
 export const YouTubePrivacySchema = z.enum(['private', 'unlisted', 'public']);
 export type YouTubePrivacy = z.infer<typeof YouTubePrivacySchema>;
@@ -38,6 +38,8 @@ export const VideoEnvSchema = z.object({
   AI_GATEWAY_BASE_URL: OptionalUrlString,
   AI_GATEWAY_API_KEY: OptionalNonEmptyString,
   AI_MODEL: OptionalNonEmptyString,
+  CF_ACCESS_CLIENT_ID: OptionalNonEmptyString,
+  CF_ACCESS_CLIENT_SECRET: OptionalNonEmptyString,
   ELEVENLABS_API_KEY: OptionalNonEmptyString,
   ELEVENLABS_VOICE_ID: OptionalNonEmptyString,
   ELEVENLABS_MODEL_ID: OptionalNonEmptyString.default(DEFAULT_ELEVENLABS_MODEL_ID),
@@ -71,11 +73,18 @@ export const VideoEnvSchema = z.object({
 
 export type VideoEnv = z.infer<typeof VideoEnvSchema>;
 
+function hasCompleteAccessCredentials(env: VideoEnv): boolean {
+  return Boolean(env.CF_ACCESS_CLIENT_ID) === Boolean(env.CF_ACCESS_CLIENT_SECRET);
+}
+
+const ACCESS_CREDENTIAL_PAIR_MESSAGE =
+  'CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET must be set together';
+
 export const AiEnvSchema = VideoEnvSchema.extend({
   AI_GATEWAY_BASE_URL: UrlString,
   AI_GATEWAY_API_KEY: NonEmptyString,
   AI_MODEL: NonEmptyString,
-});
+}).refine(hasCompleteAccessCredentials, { message: ACCESS_CREDENTIAL_PAIR_MESSAGE });
 
 export type AiEnv = z.infer<typeof AiEnvSchema>;
 
@@ -112,7 +121,7 @@ export const FullVideoEnvSchema = VideoEnvSchema.extend({
   YOUTUBE_CLIENT_ID: NonEmptyString,
   YOUTUBE_CLIENT_SECRET: NonEmptyString,
   YOUTUBE_REFRESH_TOKEN: NonEmptyString,
-});
+}).refine(hasCompleteAccessCredentials, { message: ACCESS_CREDENTIAL_PAIR_MESSAGE });
 
 export type FullVideoEnv = z.infer<typeof FullVideoEnvSchema>;
 
@@ -275,4 +284,3 @@ export function validateFullEnv(
   }
   return parsed.data;
 }
-

@@ -4,6 +4,9 @@ import {
   canTransitionStatus,
   isValidWeeklyEditionPayload,
   WeeklyEditionPayload,
+  normalizeWeeklyUrl,
+  buildWeeklyUsedIdentities,
+  findWeeklyDuplicateConflicts,
 } from './weekly';
 
 describe('isValidIsoWeek', () => {
@@ -227,6 +230,12 @@ describe('Weekly Admin API Endpoints', () => {
           if (query.includes('FROM articles')) {
             return { results: articlesTable };
           }
+          if (query.includes('weekly_candidates') && query.includes('week IN (SELECT week FROM weekly_editions')) {
+            const usedWeeks = Array.from(editionsTable.values())
+              .filter((e) => (e.status === 'approved' || e.status === 'published') && e.week !== params[0])
+              .map((e) => e.week);
+            return { results: candidatesTable.filter((c) => c.cluster_id && usedWeeks.includes(c.week)) };
+          }
           if (query.includes('weekly_candidates')) {
             const week = params[0];
             const rows = candidatesTable.filter((c) => c.week === week);
@@ -236,6 +245,9 @@ describe('Weekly Admin API Endpoints', () => {
             let editions = Array.from(editionsTable.values());
             if (query.includes("status IN ('approved', 'published')")) {
               editions = editions.filter((e) => e.status === 'approved' || e.status === 'published');
+            }
+            if (query.includes('week != ?')) {
+              editions = editions.filter((e) => e.week !== params[0]);
             }
             editions.sort((a, b) => b.week.localeCompare(a.week));
             return { results: editions };
@@ -315,7 +327,8 @@ describe('Weekly Admin API Endpoints', () => {
             importance_score,
             source_count,
             seen_count,
-            cluster_id
+            cluster_id,
+            curator_comment
           ] = stmt.params;
 
           const existing = candidatesTable.find((c) => c.week === week && c.url === url);
@@ -325,6 +338,7 @@ describe('Weekly Admin API Endpoints', () => {
             existing.importance_score = Math.max(existing.importance_score, importance_score);
             existing.source_count = Math.max(existing.source_count, source_count);
             existing.seen_count = Math.max(existing.seen_count, seen_count);
+            existing.curator_comment = curator_comment ?? existing.curator_comment ?? null;
           } else {
             candidatesTable.push({
               week,
@@ -339,7 +353,8 @@ describe('Weekly Admin API Endpoints', () => {
               importance_score,
               source_count,
               seen_count,
-              cluster_id
+              cluster_id,
+              curator_comment: curator_comment ?? null
             });
           }
         }
@@ -560,6 +575,146 @@ describe('Weekly Admin API Endpoints', () => {
     expect(backwardRes.status).toBe(409);
     const json = (await backwardRes.json()) as any;
     expect(json.error).toBe('Conflict');
+  });
+
+  describe('cross-week duplicate guard', () => {
+    const PRIOR_WEEK = '2026-W41';
+    const putEdition = (week: string, body: Record<string, unknown>) =>
+      app.request(
+        `https://news.emre.xyz/api/admin/weekly/${week}`,
+        {
+          method: 'PUT',
+          headers: { Authorization: `Bearer ${SECRET}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        },
+        env
+      );
+    const makeItem = (url: string, extra: Record<string, unknown> = {}) => ({
+      url,
+      title_tr: 'Başlık',
+      summary_tr: 'Özet',
+      source: 'hn',
+      ...extra,
+    });
+    const seedEdition = (week: string, status: string, items: unknown[]) =>
+      editionsTable.set(week, {
+        week,
+        status,
+        title_tr: null,
+        intro_tr: null,
+        items_json: JSON.stringify(items),
+        script_json: null,
+        youtube_video_id: null,
+        published_at: null,
+      });
+
+    it.each(['approved', 'published'])('rejects an exact normalized URL already in a %s edition', async (priorStatus) => {
+      seedEdition(PRIOR_WEEK, priorStatus, [makeItem('https://example.com/story')]);
+      const res = await putEdition('2026-W42', {
+        status: 'approved',
+        items: [makeItem('http://example.com/story/?utm_source=x#top')],
+      });
+      expect(res.status).toBe(409);
+      const json = (await res.json()) as any;
+      expect(json.conflicts).toEqual([
+        {
+          current_url: 'http://example.com/story/?utm_source=x#top',
+          prior_url: 'https://example.com/story',
+          prior_week: PRIOR_WEEK,
+          reason: 'normalized_url',
+        },
+      ]);
+      expect(editionsTable.has('2026-W42')).toBe(false);
+    });
+
+    it('rejects a different URL that shares a stored item cluster id', async () => {
+      seedEdition(PRIOR_WEEK, 'published', [makeItem('https://a.com/one', { cluster_id: 'cluster-7' })]);
+      const res = await putEdition('2026-W42', {
+        status: 'approved',
+        items: [makeItem('https://b.com/two', { cluster_id: 'cluster-7' })],
+      });
+      expect(res.status).toBe(409);
+      expect(((await res.json()) as any).conflicts[0].reason).toBe('cluster_id');
+    });
+
+    it('derives cluster ids from candidate snapshots for legacy items and incoming items', async () => {
+      seedEdition(PRIOR_WEEK, 'approved', [makeItem('https://a.com/one')]);
+      candidatesTable.push(
+        { week: PRIOR_WEEK, url: 'https://a.com/one', cluster_id: 'cluster-3' },
+        { week: '2026-W42', url: 'https://b.com/two', cluster_id: 'cluster-3' }
+      );
+      const res = await putEdition('2026-W42', { status: 'approved', items: [makeItem('https://b.com/two')] });
+      expect(res.status).toBe(409);
+    });
+
+    it('allows distinct follow-up stories with similar titles', async () => {
+      seedEdition(PRIOR_WEEK, 'published', [makeItem('https://a.com/launch', { cluster_id: 'cluster-1' })]);
+      const res = await putEdition('2026-W42', {
+        status: 'approved',
+        items: [makeItem('https://a.com/launch-part-2', { cluster_id: 'cluster-2', title_tr: 'Başlık' })],
+      });
+      expect(res.status).toBe(200);
+    });
+
+    it('ignores draft editions when checking history', async () => {
+      seedEdition(PRIOR_WEEK, 'draft', [makeItem('https://example.com/story')]);
+      const res = await putEdition('2026-W42', { status: 'approved', items: [makeItem('https://example.com/story')] });
+      expect(res.status).toBe(200);
+    });
+
+    it('allows saving duplicates while the edition stays a draft', async () => {
+      seedEdition(PRIOR_WEEK, 'published', [makeItem('https://example.com/story')]);
+      const res = await putEdition('2026-W42', { status: 'draft', items: [makeItem('https://example.com/story')] });
+      expect(res.status).toBe(200);
+    });
+
+    it('blocks advancing a draft whose stored items repeat history (no items in payload)', async () => {
+      seedEdition(PRIOR_WEEK, 'published', [makeItem('https://example.com/story')]);
+      seedEdition('2026-W42', 'draft', [makeItem('https://example.com/story')]);
+      const res = await putEdition('2026-W42', { status: 'approved' });
+      expect(res.status).toBe(409);
+      expect(editionsTable.get('2026-W42').status).toBe('draft');
+    });
+
+    it('blocks reintroducing a historical story into an already approved edition', async () => {
+      seedEdition(PRIOR_WEEK, 'published', [makeItem('https://example.com/story')]);
+      seedEdition('2026-W42', 'approved', [makeItem('https://example.com/fresh')]);
+      const res = await putEdition('2026-W42', { items: [makeItem('https://example.com/story')] });
+      expect(res.status).toBe(409);
+    });
+
+    it('does not re-validate an approved edition on metadata-only updates and ignores its own week', async () => {
+      seedEdition('2026-W42', 'approved', [makeItem('https://example.com/story')]);
+      const res = await putEdition('2026-W42', { status: 'published', youtube_video_id: 'abc123' });
+      expect(res.status).toBe(200);
+      const same = await putEdition('2026-W42', { status: 'published', items: [makeItem('https://example.com/story')] });
+      expect(same.status).toBe(200);
+    });
+
+    it('requires admin auth and a valid week for the used-stories endpoint', async () => {
+      const unauth = await app.request('https://news.emre.xyz/api/admin/weekly/2026-W42/used-stories', {}, env);
+      expect(unauth.status).toBe(401);
+      const bad = await app.request(
+        'https://news.emre.xyz/api/admin/weekly/nope/used-stories',
+        { headers: { Authorization: `Bearer ${SECRET}` } },
+        env
+      );
+      expect(bad.status).toBe(400);
+    });
+
+    it('lists only approved/published identities from other weeks', async () => {
+      seedEdition(PRIOR_WEEK, 'published', [makeItem('https://example.com/story/')]);
+      seedEdition('2026-W40', 'draft', [makeItem('https://example.com/draft')]);
+      seedEdition('2026-W42', 'approved', [makeItem('https://example.com/self')]);
+      const res = await app.request(
+        'https://news.emre.xyz/api/admin/weekly/2026-W42/used-stories',
+        { headers: { Authorization: `Bearer ${SECRET}` } },
+        env
+      );
+      expect(res.status).toBe(200);
+      const json = (await res.json()) as any[];
+      expect(json.map((i) => [i.week, i.normalized_url])).toEqual([[PRIOR_WEEK, 'https://example.com/story']]);
+    });
   });
 
   describe('POST /api/admin/weekly/snapshot', () => {
@@ -897,4 +1052,363 @@ describe('Public Turkish Weekly SSR Pages', () => {
 
 
 
+
+
+describe('weekly story identity helpers', () => {
+  const item = (url: string, cluster_id?: string | null) => ({
+    url,
+    cluster_id,
+    title_tr: 't',
+    summary_tr: 's',
+    source: 'hn',
+  });
+
+  it('normalizes scheme, tracking params, fragments, query order and trailing slashes', () => {
+    expect(normalizeWeeklyUrl(' http://Example.com/a/?b=2&utm_medium=x&a=1&gclid=z#f ')).toBe('https://example.com/a?a=1&b=2');
+    expect(normalizeWeeklyUrl('https://example.com/')).toBe('https://example.com/');
+  });
+
+  it('rejects non-http and malformed URLs', () => {
+    expect(normalizeWeeklyUrl('javascript:alert(1)')).toBeNull();
+    expect(normalizeWeeklyUrl('not a url')).toBeNull();
+  });
+
+  it('throws contextual errors for corrupt stored edition items', () => {
+    expect(() => buildWeeklyUsedIdentities([{ week: '2026-W41', items_json: '{' }], [])).toThrow(/2026-W41/);
+    expect(() => buildWeeklyUsedIdentities([{ week: '2026-W41', items_json: '{}' }], [])).toThrow(/expected an array/);
+    expect(() => buildWeeklyUsedIdentities([{ week: '2026-W41', items_json: '[{"url":"x"}]' }], [])).toThrow(/invalid item/);
+  });
+
+  it('matches by URL first, then by cluster, and ignores items without identity overlap', () => {
+    const used = buildWeeklyUsedIdentities(
+      [{ week: '2026-W41', items_json: JSON.stringify([item('https://a.com/1', 'c1')]) }],
+      []
+    );
+    const conflicts = findWeeklyDuplicateConflicts(
+      [item('https://a.com/1/', 'c9'), item('https://b.com/2', 'c1'), item('https://c.com/3', 'c3'), item('https://d.com/4')],
+      used
+    );
+    expect(conflicts.map((c) => c.reason)).toEqual(['normalized_url', 'cluster_id']);
+  });
+});
+
+import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools';
+import { extractCuratorComment, buildEmbeddingText, snapshotWeeklyCandidates } from './index';
+import { generateRssFeed } from './views/rss';
+
+describe('Curator Comments, Nostr Highlight Flow, SSR & RSS Rendering', () => {
+  it('extracts curator comment from explicit payload or Nostr event content and ignores generic Liked prefix', () => {
+    expect(
+      extractCuratorComment(
+        'Great deep-dive into zero-copy IO.',
+        'Liked article: Foo\nhttps://example.com/a',
+        ['https://example.com/a']
+      )
+    ).toBe('Great deep-dive into zero-copy IO.');
+
+    expect(
+      extractCuratorComment(
+        undefined,
+        'Crucial read on SQLite WAL internals.\n\nhttps://news.ycombinator.com/item?id=42',
+        ['https://example.com/sqlite', 'https://news.ycombinator.com/item?id=42']
+      )
+    ).toBe('Crucial read on SQLite WAL internals.');
+
+    expect(
+      extractCuratorComment(
+        '',
+        'Liked article: Some Story\nhttps://example.com/story',
+        ['https://example.com/story']
+      )
+    ).toBeNull();
+  });
+
+  it('includes curatorComment in buildEmbeddingText when provided', () => {
+    const text = buildEmbeddingText({
+      title: 'Rust Kernel Abstractions',
+      source: 'hackernews',
+      curatorComment: 'Clean PCI driver safety model.',
+      description: 'Kernel update',
+    });
+    expect(text).toContain('Curator Comment: Clean PCI driver safety model.');
+  });
+
+  it('persists curator_comment on POST /api/articles/:id/like for authorized curator and updates AI taste profile', async () => {
+    const curatorSk = generateSecretKey();
+    const curatorPubkey = getPublicKey(curatorSk);
+    const followerSk = generateSecretKey();
+
+    const storedArticle: any = {
+      id: 'hn-777',
+      title: 'Deterministic Simulation Testing in Production',
+      url: 'https://example.com/dst',
+      source: 'hackernews',
+      summary: 'How deterministic simulation catches distributed bugs.',
+      is_liked: 0,
+      follower_likes: 2,
+      curator_comment: null,
+      created_at: new Date().toISOString(),
+      expires_at: '2099-01-01 00:00:00',
+    };
+    const storedCandidate: any = {
+      week: '2026-W45',
+      url: 'https://example.com/dst',
+      article_id: 'hn-777',
+      title: storedArticle.title,
+      source: 'hackernews',
+      is_liked: 0,
+      follower_likes: 2,
+      curator_comment: null,
+    };
+
+    const embeddedTexts: string[] = [];
+    const tastePrompts: string[] = [];
+    let savedTasteProfile: string | null = null;
+
+    const mockDb: any = {
+      prepare(query: string) {
+        const runner = (params: any[] = []) => ({
+          async first() {
+            if (query.includes('FROM articles WHERE id = ?')) {
+              return params[0] === storedArticle.id ? storedArticle : null;
+            }
+            if (query.includes('MAX(created_at)')) {
+              return { last_curated_at: storedArticle.created_at };
+            }
+            return null;
+          },
+          async all() {
+            if (query.includes('WHERE is_liked = 1')) {
+              return { results: storedArticle.is_liked ? [storedArticle] : [] };
+            }
+            if (query.includes('FROM articles')) {
+              return { results: [storedArticle] };
+            }
+            return { results: [] };
+          },
+          async run() {
+            if (query.includes('UPDATE articles SET is_liked = 1')) {
+              const [comment] = params;
+              storedArticle.is_liked = 1;
+              storedArticle.follower_likes += 1;
+              storedArticle.curator_comment = comment ?? storedArticle.curator_comment;
+            } else if (query.includes('UPDATE weekly_candidates SET is_liked = 1')) {
+              const [comment] = params;
+              storedCandidate.is_liked = 1;
+              storedCandidate.follower_likes += 1;
+              storedCandidate.curator_comment = comment ?? storedCandidate.curator_comment;
+            } else if (query.includes('UPDATE articles SET follower_likes = follower_likes + 1')) {
+              storedArticle.follower_likes += 1;
+            } else if (query.includes("INSERT INTO user_preferences (key, value")) {
+              savedTasteProfile = params[0];
+            }
+            return { success: true };
+          },
+        });
+        return {
+          ...runner([]),
+          bind(...params: any[]) {
+            return runner(params);
+          },
+        };
+      },
+      async batch(statements: any[]) {
+        return statements;
+      },
+    };
+
+    const env: any = {
+      news_db: mockDb,
+      AUTHORIZED_NOSTR_PUBKEY: curatorPubkey,
+      USE_EMRE_THEME: 'false',
+      AI: {
+        async run(model: string, input: any) {
+          if (model.includes('bge-base')) {
+            embeddedTexts.push(...(input.text || []));
+            return { data: [[0.1, 0.2, 0.3]] };
+          }
+          if (input?.messages) {
+            const userMsg = input.messages.find((m: any) => m.role === 'user')?.content || '';
+            tastePrompts.push(userMsg);
+          }
+          return { response: 'Prefers deterministic systems and simulation testing.' };
+        },
+      },
+      VECTORIZE: {
+        async upsert() {
+          return { mutationId: 'm1' };
+        },
+      },
+    };
+
+    // 1. Follower like increments follower_likes without setting curator_comment
+    const followerEvent = finalizeEvent(
+      {
+        kind: 1,
+        created_at: Math.floor(Date.now() / 1000),
+        tags: [['r', 'https://news.ycombinator.com/item?id=777']],
+        content: 'Check out this curated article: Deterministic Simulation Testing in Production\nhttps://news.ycombinator.com/item?id=777',
+      },
+      followerSk
+    );
+    const followerRes = await app.request(
+      'https://news.emre.xyz/api/articles/hn-777/like',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ event: followerEvent }),
+      },
+      env
+    );
+    expect(followerRes.status).toBe(200);
+    expect(storedArticle.is_liked).toBe(0);
+    expect(storedArticle.follower_likes).toBe(3);
+    expect(storedArticle.curator_comment).toBeNull();
+
+    // 2. Curator highlight with commentary persists curator_comment and trains AI
+    const curatorNote = 'FoundationDB-style deterministic testing should be standard for stateful edge services.';
+    const curatorEvent = finalizeEvent(
+      {
+        kind: 1,
+        created_at: Math.floor(Date.now() / 1000),
+        tags: [['r', 'https://news.ycombinator.com/item?id=777']],
+        content: `${curatorNote}\n\nhttps://news.ycombinator.com/item?id=777`,
+      },
+      curatorSk
+    );
+
+    const curatorRes = await app.request(
+      'https://news.emre.xyz/api/articles/hn-777/like',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ event: curatorEvent }),
+      },
+      env
+    );
+    expect(curatorRes.status).toBe(200);
+    const curatorJson = (await curatorRes.json()) as any;
+    expect(curatorJson.success).toBe(true);
+    expect(curatorJson.curator_comment).toBe(curatorNote);
+    expect(storedArticle.is_liked).toBe(1);
+    expect(storedArticle.follower_likes).toBe(4);
+    expect(storedArticle.curator_comment).toBe(curatorNote);
+    expect(storedCandidate.curator_comment).toBe(curatorNote);
+    expect(embeddedTexts[0]).toContain(`Curator Comment: ${curatorNote}`);
+    expect(tastePrompts[0]).toContain(curatorNote);
+    expect(savedTasteProfile).toContain('deterministic systems');
+
+    // 3. SSR Home Feed and Article Permalink render .curator-note callout
+    const feedRes = await app.request('https://news.emre.xyz/', {}, env);
+    expect(feedRes.status).toBe(200);
+    const feedHtml = await feedRes.text();
+    expect(feedHtml).toContain('curator-note');
+    expect(feedHtml).toContain('Curator Note');
+    expect(feedHtml).toContain(curatorNote);
+
+    const detailRes = await app.request('https://news.emre.xyz/article/hn-777', {}, env);
+    expect(detailRes.status).toBe(200);
+    const detailHtml = await detailRes.text();
+    expect(detailHtml).toContain('curator-note');
+    expect(detailHtml).toContain(curatorNote);
+
+    // 4. RSS feed includes curator note in item description
+    const rssXml = generateRssFeed([storedArticle], 'https://news.emre.xyz');
+    expect(rssXml).toContain(`Curator note: ${curatorNote}`);
+    expect(rssXml).toContain(storedArticle.summary);
+  });
+
+  it('propagates curator_comment into weekly_candidates during snapshotWeeklyCandidates and preserves via COALESCE', async () => {
+    const candidatesTable: any[] = [];
+    let liveArticles: any[] = [
+      {
+        id: 'hn-501',
+        url: 'https://example.com/curated-link',
+        title: 'Curated Link With Note',
+        source: 'hackernews',
+        summary: 'Summary text',
+        is_liked: 1,
+        follower_likes: 3,
+        importance_score: 3.2,
+        source_count: 2,
+        seen_count: 2,
+        cluster_id: null,
+        curator_comment: 'Must-read architecture postmortem.',
+        created_at: new Date().toISOString(),
+        last_seen_at: new Date().toISOString(),
+        expires_at: '2099-01-01 00:00:00',
+      },
+    ];
+
+    const mockDb: any = {
+      prepare(query: string) {
+        return {
+          bind(...params: any[]) {
+            return {
+              query,
+              params,
+              async all() {
+                return { results: liveArticles };
+              },
+            };
+          },
+          async all() {
+            return { results: liveArticles };
+          },
+        };
+      },
+      async batch(statements: any[]) {
+        for (const stmt of statements) {
+          const [
+            week,
+            url,
+            article_id,
+            title,
+            source,
+            summary,
+            image_url,
+            is_liked,
+            follower_likes,
+            importance_score,
+            source_count,
+            seen_count,
+            cluster_id,
+            curator_comment,
+          ] = stmt.params;
+          const existing = candidatesTable.find((c) => c.week === week && c.url === url);
+          if (existing) {
+            existing.curator_comment = curator_comment ?? existing.curator_comment ?? null;
+          } else {
+            candidatesTable.push({
+              week,
+              url,
+              article_id,
+              title,
+              source,
+              summary,
+              image_url,
+              is_liked,
+              follower_likes,
+              importance_score,
+              source_count,
+              seen_count,
+              cluster_id,
+              curator_comment,
+            });
+          }
+        }
+        return [];
+      },
+    };
+
+    await snapshotWeeklyCandidates({ news_db: mockDb } as any, new Date('2026-10-18T03:00:00Z'));
+    expect(candidatesTable).toHaveLength(1);
+    expect(candidatesTable[0].curator_comment).toBe('Must-read architecture postmortem.');
+
+    // Re-snapshot when live row has null curator_comment preserves existing stored comment
+    liveArticles[0] = { ...liveArticles[0], curator_comment: null };
+    await snapshotWeeklyCandidates({ news_db: mockDb } as any, new Date('2026-10-18T03:00:00Z'));
+    expect(candidatesTable[0].curator_comment).toBe('Must-read architecture postmortem.');
+  });
+});
 

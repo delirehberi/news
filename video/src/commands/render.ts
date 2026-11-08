@@ -17,10 +17,12 @@ import {
   CaptionChunkSchema,
   DEFAULT_SITE_URL,
   extractHostname,
+  resolveStoryFallbackMode,
   StorySceneCueSchema,
   THUMBNAIL_FRAME,
   VIDEO_FPS,
   WEEKLY_VIDEO_COMPOSITION_ID,
+  type StoryFallbackMode,
   type StorySceneCue,
   type StorySceneItem,
   type VideoTimeline,
@@ -38,8 +40,9 @@ import {
   type WeeklyItem,
   type WorkerClient,
 } from '../lib/workerClient.ts';
+import { assertSafeHttpUrl, type DnsLookupAllFn } from '../lib/ssrf.ts';
 import { assertEditionApproved } from './approve.ts';
-import { loadCachedPageCapture } from './capture.ts';
+import { loadCachedPageCapture, runCaptureCommand } from './capture.ts';
 import { buildVoiceSegments } from './voice.ts';
 
 export const IMAGE_DOWNLOAD_TIMEOUT_MS = 15_000;
@@ -266,6 +269,61 @@ export async function loadStoryPageCapture(options: {
   }
 }
 
+/**
+ * Counts stories whose `pages/<n>.png` + `<n>.json` capture is missing or stale for its URL.
+ */
+export async function countMissingPageCaptures(
+  pagesDir: string,
+  storyUrls: readonly string[]
+): Promise<number> {
+  let missing = 0;
+  for (let i = 0; i < storyUrls.length; i++) {
+    const capture = await loadStoryPageCapture({
+      pagesDir,
+      storyIndex: i + 1,
+      url: storyUrls[i],
+    });
+    if (!capture) {
+      missing++;
+    }
+  }
+  return missing;
+}
+
+/**
+ * Picks the story image URL: the translation's `image_url` first, then the `og:image`
+ * found during page capture. The captured URL comes from third-party page markup, so it
+ * must pass the SSRF guard (public http(s) host only) before render downloads it.
+ */
+export async function resolveStoryImageUrl(options: {
+  translatedImageUrl: string | null;
+  capturedOgImageUrl: string | null;
+  storyIndex: number;
+  dnsLookup?: DnsLookupAllFn;
+  onWarn?: (msg: string) => void;
+}): Promise<string | null> {
+  const translated = options.translatedImageUrl?.trim() ?? '';
+  if (translated) {
+    return translated;
+  }
+
+  const captured = options.capturedOgImageUrl?.trim() ?? '';
+  if (!captured) {
+    return null;
+  }
+
+  try {
+    const safe = await assertSafeHttpUrl(captured, { dnsLookup: options.dnsLookup });
+    return safe.toString();
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    options.onWarn?.(
+      `Story #${options.storyIndex}: skipping captured og:image "${captured}" (${reason}).`
+    );
+    return null;
+  }
+}
+
 function extractOptionalSegmentCues(rawSegment: unknown): StorySceneCue[] | undefined {
   if (!rawSegment || typeof rawSegment !== 'object') {
     return undefined;
@@ -408,6 +466,9 @@ const defaultRemotionAdapter: RemotionRendererAdapter = {
   },
 };
 
+/** Runs the `capture` stage for the week; injected in tests to avoid launching Chrome. */
+export type RenderCaptureRunner = (ctx: CommandContext) => Promise<void>;
+
 export interface RenderCommandDeps {
   workerClient?: WorkerClient;
   outRoot?: string;
@@ -416,6 +477,51 @@ export interface RenderCommandDeps {
   imageTimeoutMs?: number;
   entryPoint?: string;
   remotionAdapter?: RemotionRendererAdapter;
+  /** Defaults to `runCaptureCommand`; called only when some story has no page capture. */
+  captureRunner?: RenderCaptureRunner;
+  /** DNS resolver for the SSRF check on capture-derived `og:image` URLs. */
+  dnsLookup?: DnsLookupAllFn;
+}
+
+export interface StoryVisualModeCounts {
+  page: number;
+  og: number;
+  card: number;
+}
+
+/**
+ * Counts which visual each story will use (`page` screenshot, `og` image, branded `card`).
+ */
+export function countStoryVisualModes(
+  stories: ReadonlyArray<Pick<StorySceneItem, 'page' | 'imageSrc'>>
+): StoryVisualModeCounts {
+  const counts: StoryVisualModeCounts = { page: 0, og: 0, card: 0 };
+  for (const story of stories) {
+    const mode: StoryFallbackMode = resolveStoryFallbackMode(story);
+    counts[mode]++;
+  }
+  return counts;
+}
+
+/**
+ * Throws when every story would render as a plain branded card (no screenshot, no image),
+ * unless explicitly allowed. A video made only of cards is almost always a broken pipeline
+ * (capture never ran or every fetch failed), so it must not reach upload silently.
+ */
+export function assertNotAllCards(
+  counts: StoryVisualModeCounts,
+  week: string,
+  allowCards: boolean
+): void {
+  const total = counts.page + counts.og + counts.card;
+  if (allowCards || total === 0 || counts.card < total) {
+    return;
+  }
+  throw new Error(
+    `All ${total} stories for ${week} would render as branded cards (no page screenshots and no images). ` +
+      `Run "capture" for the week (make video-capture WEEK=${week}) and check its warnings, ` +
+      'or pass --allow-cards to render anyway.'
+  );
 }
 
 export interface RenderCommandResult {
@@ -426,6 +532,7 @@ export interface RenderCommandResult {
   downloadedImagesCount: number;
   fallbackCardCount: number;
   pageCapturesCount: number;
+  visualModes: StoryVisualModeCounts;
 }
 
 /**
@@ -492,6 +599,32 @@ export async function runRenderCommand(
     });
   }
 
+  const missingCaptureCount = await countMissingPageCaptures(
+    paths.pagesDir,
+    script.segments.map((segment) => segment.item_url.trim())
+  );
+  if (missingCaptureCount > 0) {
+    stdout(
+      `${missingCaptureCount} of ${script.segments.length} story page capture(s) missing in ${paths.pagesDir}; running capture first...`
+    );
+    const captureRunner: RenderCaptureRunner =
+      deps.captureRunner ??
+      (async (captureCtx) => {
+        await runCaptureCommand(captureCtx, { outRoot: deps.outRoot, stdout });
+      });
+    try {
+      await captureRunner(ctx);
+    } catch (err) {
+      if (ctx.signal.aborted) {
+        throw ctx.signal.reason ?? err;
+      }
+      const reason = err instanceof Error ? err.message : String(err);
+      stdout(
+        `[warn] Page capture failed (${reason}); stories without a capture will use the OG image or the branded card.`
+      );
+    }
+  }
+
   const stories: StorySceneItem[] = [];
   let downloadedImagesCount = 0;
   let fallbackCardCount = 0;
@@ -514,22 +647,29 @@ export async function runRenderCommand(
       );
     }
 
-    const [imageSrc, pageCapture] = await Promise.all([
-      downloadStoryImage({
-        imageUrl: translatedItem?.image_url ?? null,
-        storyIndex,
-        imagesDir: paths.imagesDir,
-        signal: ctx.signal,
-        timeoutMs: deps.imageTimeoutMs,
-        fetchImpl: deps.fetchImpl,
-        onWarn: (msg) => stdout(`[warn] ${msg}`),
-      }),
-      loadStoryPageCapture({
-        pagesDir: paths.pagesDir,
-        storyIndex,
-        url: storyUrl,
-      }),
-    ]);
+    const pageCapture = await loadStoryPageCapture({
+      pagesDir: paths.pagesDir,
+      storyIndex,
+      url: storyUrl,
+    });
+
+    const imageUrl = await resolveStoryImageUrl({
+      translatedImageUrl: translatedItem?.image_url ?? null,
+      capturedOgImageUrl: pageCapture?.og_image_url ?? null,
+      storyIndex,
+      dnsLookup: deps.dnsLookup,
+      onWarn: (msg) => stdout(`[warn] ${msg}`),
+    });
+
+    const imageSrc = await downloadStoryImage({
+      imageUrl,
+      storyIndex,
+      imagesDir: paths.imagesDir,
+      signal: ctx.signal,
+      timeoutMs: deps.imageTimeoutMs,
+      fetchImpl: deps.fetchImpl,
+      onWarn: (msg) => stdout(`[warn] ${msg}`),
+    });
 
     if (imageSrc) {
       downloadedImagesCount++;
@@ -558,6 +698,12 @@ export async function runRenderCommand(
       ...(segmentCues ? { cues: segmentCues } : {}),
     });
   }
+
+  const visualModes = countStoryVisualModes(stories);
+  stdout(
+    `Story visuals for ${ctx.week}: page ${visualModes.page}, og ${visualModes.og}, card ${visualModes.card}.`
+  );
+  assertNotAllCards(visualModes, ctx.week, ctx.allowCards === true);
 
   const introAudio = audioSegments.get(0);
   const outroAudio = audioSegments.get(script.segments.length + 1);
@@ -621,7 +767,7 @@ export async function runRenderCommand(
   }
 
   stdout(
-    `Completed render for ${ctx.week}: ${paths.videoMp4} (${timeline.totalDurationSeconds.toFixed(1)}s) & ${paths.thumbnailPng} (${pageCapturesCount} page capture(s), ${downloadedImagesCount} image(s), ${fallbackCardCount} fallback card(s)).`
+    `Completed render for ${ctx.week}: ${paths.videoMp4} (${timeline.totalDurationSeconds.toFixed(1)}s) & ${paths.thumbnailPng} (visuals: page ${visualModes.page}, og ${visualModes.og}, card ${visualModes.card}; ${downloadedImagesCount} image(s) downloaded).`
   );
 
   return {
@@ -632,6 +778,7 @@ export async function runRenderCommand(
     downloadedImagesCount,
     fallbackCardCount,
     pageCapturesCount,
+    visualModes,
   };
 }
 

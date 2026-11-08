@@ -61,12 +61,19 @@ function buildWeeklyItems(
         ? candidate.source.trim()
         : DEFAULT_SOURCE_FALLBACK;
 
+    const curatorComment =
+      typeof candidate.curator_comment === 'string' && candidate.curator_comment.trim().length > 0
+        ? candidate.curator_comment.trim()
+        : undefined;
+
     return {
       url: normalizedUrl,
+      cluster_id: candidate.cluster_id?.trim() || null,
       title_tr: match.title_tr,
       summary_tr: match.summary_tr,
       source,
       image_url: candidate.image_url ?? null,
+      ...(curatorComment ? { curator_comment: curatorComment } : {}),
     };
   });
 }
@@ -100,6 +107,9 @@ export async function runTranslateCommand(
   const llmOutput = await chat({
     baseUrl: aiEnv.AI_GATEWAY_BASE_URL,
     apiKey: aiEnv.AI_GATEWAY_API_KEY,
+    access: aiEnv.CF_ACCESS_CLIENT_ID && aiEnv.CF_ACCESS_CLIENT_SECRET
+      ? { clientId: aiEnv.CF_ACCESS_CLIENT_ID, clientSecret: aiEnv.CF_ACCESS_CLIENT_SECRET }
+      : undefined,
     model: aiEnv.AI_MODEL,
     messages: [
       { role: 'system', content: TRANSLATE_SYSTEM_PROMPT },
@@ -146,4 +156,3 @@ export async function runTranslateCommand(
 
   return { translation, edition };
 }
-

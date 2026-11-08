@@ -4,6 +4,7 @@ export {
   buildHandDrawnCirclePath,
   buildHandDrawnUnderlinePath,
   computeAnnotationPaths,
+  isDrawableBox,
   type AnnotationItemProps,
   type AnnotationKind,
   type AnnotationsProps,

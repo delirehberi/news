@@ -40,7 +40,9 @@ import {
 import {
   Annotations,
   BrowserFrame,
+  computePageCameraTransform,
   Highlighter,
+  isDrawableBox,
   PageCamera,
   QuoteCallout,
   Spotlight,
@@ -315,13 +317,17 @@ export function buildStoryWalkthroughPlan(
 
     const resolvedCues: ResolvedCue[] = timedCues.map((rc, idx) => {
       const explicitBox = rawCues[idx]?.box ?? null;
+      // Only an explicit target may place a cue on the page. Fuzzy-matching the Turkish
+      // anchor phrase against English page text produced loose boxes on unrelated regions.
       const matchedBox =
         explicitBox ??
-        resolveCueTarget(rc.target ?? rc.anchor, {
-          elements,
-          page_height: pageHeight,
-          viewport: { width: viewportWidth, height: viewportHeight },
-        });
+        (rc.target
+          ? resolveCueTarget(rc.target, {
+              elements,
+              page_height: pageHeight,
+              viewport: { width: viewportWidth, height: viewportHeight },
+            })
+          : null);
       return {
         ...rc,
         value: rawCues[idx]?.value ?? rc.value,
@@ -342,7 +348,11 @@ export function buildStoryWalkthroughPlan(
 
     return {
       track,
-      cues: resolvedCues,
+      cues: dropOffscreenOverlayCues(resolvedCues, track, {
+        viewportWidth,
+        viewportHeight,
+        pageHeight,
+      }),
       page,
     };
   }
@@ -369,16 +379,82 @@ export function buildStoryWalkthroughPlan(
   };
 }
 
+/** Cue kinds drawn on top of the page screenshot; they need a box that is on screen. */
+const PAGE_OVERLAY_CUE_KINDS: ReadonlySet<string> = new Set([
+  'focus',
+  'image',
+  'highlight',
+  'circle',
+  'underline',
+  'arrow',
+]);
+/** Frames after a cue starts at which its target must be on screen (camera has settled). */
+export const CUE_VISIBILITY_CHECK_OFFSET_FRAMES = 15;
+/** Minimum share of the target box that must lie inside the visible camera window. */
+export const CUE_MIN_VISIBLE_RATIO = 0.6;
+
+/**
+ * Returns the share (0..1) of `box` inside the page region the camera shows at `frame`.
+ */
+export function computeBoxVisibleRatio(
+  track: CameraTrack,
+  box: CueBoundingBox,
+  frame: number,
+  viewport: { viewportWidth: number; viewportHeight: number; pageHeight: number }
+): number {
+  if (!isDrawableBox(box)) {
+    return 0;
+  }
+  const transform = computePageCameraTransform(track, frame, viewport);
+  const scale = transform.scale > 0 ? transform.scale : 1;
+  const left = -transform.translateX / scale;
+  const top = -transform.translateY / scale;
+  const right = left + viewport.viewportWidth / scale;
+  const bottom = top + viewport.viewportHeight / scale;
+
+  const overlapWidth = Math.max(0, Math.min(right, box.x + box.width) - Math.max(left, box.x));
+  const overlapHeight = Math.max(0, Math.min(bottom, box.y + box.height) - Math.max(top, box.y));
+  return (overlapWidth * overlapHeight) / (box.width * box.height);
+}
+
+/**
+ * Clears the box of overlay cues (spotlight, highlighter, circle, underline, arrow) whose
+ * target is missing or mostly off screen when the cue fires, so nothing is drawn on empty
+ * space. Camera-only and callout cues (`scroll`, `stat`, `quote`) pass through unchanged.
+ */
+export function dropOffscreenOverlayCues(
+  cues: readonly ResolvedCue[],
+  track: CameraTrack,
+  viewport: { viewportWidth: number; viewportHeight: number; pageHeight: number }
+): ResolvedCue[] {
+  return cues.map((cue) => {
+    if (!PAGE_OVERLAY_CUE_KINDS.has(cue.kind)) {
+      return cue;
+    }
+    if (!isDrawableBox(cue.box)) {
+      return { ...cue, box: null };
+    }
+    const checkFrame = Math.min(
+      cue.startFrame + CUE_VISIBILITY_CHECK_OFFSET_FRAMES,
+      Math.max(cue.startFrame, cue.endFrame - 1)
+    );
+    const ratio = computeBoxVisibleRatio(track, cue.box, checkFrame, viewport);
+    return ratio >= CUE_MIN_VISIBLE_RATIO ? cue : { ...cue, box: null };
+  });
+}
+
 /**
  * Builds deterministic bounding boxes and hand-drawn annotations for headline keywords
- * when a story falls back to the OG image stage (`og` mode).
+ * when a story falls back to the OG image or branded card stage. The returned boxes are
+ * the exact chip positions `KeywordChipLayer` renders, so each annotation lands on its chip.
  */
 export function buildOgKeywordAnnotations(
   headline: string,
   durationInFrames: number,
   storyIndex: number = 1,
   canvasWidth: number = 1440,
-  canvasHeight: number = 900
+  canvasHeight: number = 900,
+  layout?: { baseY?: number; align?: 'center' | 'left'; startX?: number }
 ): Array<{
   keyword: string;
   box: CueBoundingBox;
@@ -389,22 +465,24 @@ export function buildOgKeywordAnnotations(
     return [];
   }
 
-  const kinds: Array<'circle' | 'underline' | 'arrow'> = [
-    'circle',
-    'underline',
-    'arrow',
-  ];
+  // Arrows need a meaningful origin; around a chip only a circle or underline reads well.
+  const kinds: Array<'circle' | 'underline'> = ['circle', 'underline'];
 
   const count = keywords.length;
-  const totalWidth = Math.min(canvasWidth - 160, count * 280 + (count - 1) * 32);
-  const startX = Math.max(80, Math.round((canvasWidth - totalWidth) / 2));
-  const pillWidth = Math.max(180, Math.floor((totalWidth - (count - 1) * 32) / count));
+  const gap = 32;
+  const totalWidth = Math.min(canvasWidth - 160, count * 280 + (count - 1) * gap);
+  const align = layout?.align ?? 'center';
+  const startX =
+    layout?.startX ??
+    (align === 'left' ? 0 : Math.max(80, Math.round((canvasWidth - totalWidth) / 2)));
+  const pillWidth = Math.max(180, Math.floor((totalWidth - (count - 1) * gap) / count));
   const pillHeight = 64;
-  const baseY = Math.round(canvasHeight * 0.24);
+  const baseY = layout?.baseY ?? Math.round(canvasHeight * 0.24);
+  const staggerY = layout?.baseY !== undefined ? 0 : 18;
 
   return keywords.map((keyword, idx) => {
-    const x = startX + idx * (pillWidth + 32);
-    const y = baseY + (idx % 2 === 1 ? 18 : 0);
+    const x = startX + idx * (pillWidth + gap);
+    const y = baseY + (idx % 2 === 1 ? staggerY : 0);
     const box: CueBoundingBox = {
       x,
       y,
@@ -873,6 +951,98 @@ export const Intro: React.FC<IntroProps> = ({
   );
 };
 
+const OG_KEYWORD_CANVAS_WIDTH = 1440;
+const OG_KEYWORD_CANVAS_HEIGHT = 900;
+const CARD_CHIP_ROW_WIDTH = 1280;
+const CARD_CHIP_ROW_HEIGHT = 96;
+const CARD_CHIP_ROW_PADDING_X = 8;
+const CARD_CHIP_ROW_PADDING_Y = 16;
+const KEYWORD_CHIP_FADE_FRAMES = 6;
+
+interface KeywordChipLayerProps {
+  items: ReadonlyArray<{ keyword: string; box: CueBoundingBox; annotation: AnnotationItemProps }>;
+  frame: number;
+  storyIndex: number;
+  width: number;
+  height: number;
+  fontSize: number;
+  prefix?: string;
+}
+
+/**
+ * Renders keyword chips at the exact boxes from `buildOgKeywordAnnotations` and draws each
+ * chip's annotation in the same fixed-size coordinate space, so a circle or underline always
+ * sits on its chip instead of on empty space.
+ */
+const KeywordChipLayer: React.FC<KeywordChipLayerProps> = ({
+  items,
+  frame,
+  storyIndex,
+  width,
+  height,
+  fontSize,
+  prefix = '',
+}) => (
+  <div
+    data-component="keyword-chip-layer"
+    style={{ position: 'absolute', left: 0, top: 0, width, height, pointerEvents: 'none' }}
+  >
+    {items.map((item, idx) => {
+      const chipStart = item.annotation.startFrame ?? 0;
+      const chipOpacity = interpolate(
+        frame,
+        [chipStart - KEYWORD_CHIP_FADE_FRAMES, chipStart + KEYWORD_CHIP_FADE_FRAMES],
+        [0, 1],
+        { extrapolateLeft: 'clamp', extrapolateRight: 'clamp' }
+      );
+      return (
+        <div
+          key={`${item.keyword}-${idx}`}
+          data-keyword-chip={item.keyword}
+          style={{
+            position: 'absolute',
+            left: item.box.x,
+            top: item.box.y,
+            width: item.box.width,
+            height: item.box.height,
+            backgroundColor: 'rgba(15, 23, 42, 0.86)',
+            border: '1px solid rgba(248, 250, 252, 0.28)',
+            borderRadius: 14,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: '0 18px',
+            boxSizing: 'border-box',
+            boxShadow: '0 16px 36px rgba(0, 0, 0, 0.5)',
+            opacity: chipOpacity,
+          }}
+        >
+          <span
+            style={{
+              fontFamily: FONT_MONO,
+              fontSize,
+              fontWeight: 700,
+              color: COLOR_INK,
+              whiteSpace: 'nowrap',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+            }}
+          >
+            {prefix}
+            {item.keyword}
+          </span>
+        </div>
+      );
+    })}
+    <Annotations
+      annotations={items.map((k) => k.annotation)}
+      storyIndex={storyIndex}
+      canvasWidth={width}
+      canvasHeight={height}
+    />
+  </div>
+);
+
 interface BrandedFallbackCardProps {
   story: StorySceneItem;
   storyCount: number;
@@ -897,13 +1067,13 @@ export const BrandedFallbackCard: React.FC<BrandedFallbackCardProps> = ({
 }) => {
   const badge = getSourceBadgeTheme(story.source);
   const domain = story.domain || extractHostname(story.url) || siteUrl;
-  const keywords = extractHeadlineKeywords(story.headline_tr, 3);
-  const keywordAnnotations = buildOgKeywordAnnotations(
+  const keywordItems = buildOgKeywordAnnotations(
     story.headline_tr,
     durationInFrames,
     story.index,
-    1440,
-    820
+    CARD_CHIP_ROW_WIDTH,
+    CARD_CHIP_ROW_HEIGHT,
+    { baseY: CARD_CHIP_ROW_PADDING_Y, align: 'left', startX: CARD_CHIP_ROW_PADDING_X }
   );
 
   return (
@@ -991,45 +1161,28 @@ export const BrandedFallbackCard: React.FC<BrandedFallbackCardProps> = ({
           {story.headline_tr}
         </div>
 
-        {keywords.length > 0 ? (
+        {keywordItems.length > 0 ? (
+          // Fixed-size layer: chips and their annotations share one pixel coordinate space.
           <div
             style={{
-              display: 'flex',
-              flexWrap: 'wrap',
-              gap: 16,
+              position: 'relative',
+              width: CARD_CHIP_ROW_WIDTH,
+              height: CARD_CHIP_ROW_HEIGHT,
               marginTop: 8,
             }}
           >
-            {keywords.map((kw, idx) => (
-              <span
-                key={`${kw}-${idx}`}
-                style={{
-                  fontFamily: FONT_MONO,
-                  fontSize: 22,
-                  fontWeight: 600,
-                  color: COLOR_INK,
-                  backgroundColor: 'rgba(15, 23, 42, 0.85)',
-                  border: `1px solid ${COLOR_BORDER}`,
-                  borderRadius: 12,
-                  padding: '10px 22px',
-                }}
-              >
-                #{kw}
-              </span>
-            ))}
+            <KeywordChipLayer
+              items={keywordItems}
+              frame={frame}
+              storyIndex={story.index}
+              width={CARD_CHIP_ROW_WIDTH}
+              height={CARD_CHIP_ROW_HEIGHT}
+              fontSize={22}
+              prefix="#"
+            />
           </div>
         ) : null}
       </div>
-
-      {/* Subtle hand-drawn annotations on fallback card */}
-      {keywordAnnotations.length > 0 && frame >= 0 ? (
-        <Annotations
-          annotations={keywordAnnotations.map((k) => k.annotation)}
-          storyIndex={story.index}
-          canvasWidth={1440}
-          canvasHeight={820}
-        />
-      ) : null}
 
       <div
         style={{
@@ -1267,8 +1420,8 @@ const OgFallbackStage: React.FC<OgFallbackStageProps> = ({
         story.headline_tr,
         durationInFrames,
         story.index,
-        1440,
-        900
+        OG_KEYWORD_CANVAS_WIDTH,
+        OG_KEYWORD_CANVAS_HEIGHT
       ),
     [story.headline_tr, durationInFrames, story.index]
   );
@@ -1319,60 +1472,13 @@ const OgFallbackStage: React.FC<OgFallbackStageProps> = ({
             pointerEvents: 'none',
           }}
         >
-          {keywordItems.map((item, idx) => {
-            const pillOpacity = interpolate(
-              frame,
-              [
-                (item.annotation.startFrame ?? 12) - 6,
-                (item.annotation.startFrame ?? 12) + 6,
-              ],
-              [0, 1],
-              { extrapolateLeft: 'clamp', extrapolateRight: 'clamp' }
-            );
-            return (
-              <div
-                key={`${item.keyword}-${idx}`}
-                data-og-keyword={item.keyword}
-                style={{
-                  position: 'absolute',
-                  left: item.box.x,
-                  top: item.box.y,
-                  width: item.box.width,
-                  height: item.box.height,
-                  backgroundColor: 'rgba(15, 23, 42, 0.86)',
-                  border: '1px solid rgba(248, 250, 252, 0.28)',
-                  borderRadius: 14,
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  padding: '0 18px',
-                  boxSizing: 'border-box',
-                  boxShadow: '0 16px 36px rgba(0, 0, 0, 0.5)',
-                  opacity: pillOpacity,
-                }}
-              >
-                <span
-                  style={{
-                    fontFamily: FONT_MONO,
-                    fontSize: 24,
-                    fontWeight: 700,
-                    color: COLOR_INK,
-                    whiteSpace: 'nowrap',
-                    overflow: 'hidden',
-                    textOverflow: 'ellipsis',
-                  }}
-                >
-                  {item.keyword}
-                </span>
-              </div>
-            );
-          })}
-
-          <Annotations
-            annotations={keywordItems.map((k) => k.annotation)}
+          <KeywordChipLayer
+            items={keywordItems}
+            frame={frame}
             storyIndex={story.index}
-            canvasWidth={1440}
-            canvasHeight={900}
+            width={OG_KEYWORD_CANVAS_WIDTH}
+            height={OG_KEYWORD_CANVAS_HEIGHT}
+            fontSize={24}
           />
         </div>
       ) : null}

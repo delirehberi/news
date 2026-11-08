@@ -55,6 +55,9 @@ export async function runScriptCommand(
   const script = await chat({
     baseUrl: aiEnv.AI_GATEWAY_BASE_URL,
     apiKey: aiEnv.AI_GATEWAY_API_KEY,
+    access: aiEnv.CF_ACCESS_CLIENT_ID && aiEnv.CF_ACCESS_CLIENT_SECRET
+      ? { clientId: aiEnv.CF_ACCESS_CLIENT_ID, clientSecret: aiEnv.CF_ACCESS_CLIENT_SECRET }
+      : undefined,
     model: aiEnv.AI_MODEL,
     messages: [
       { role: 'system', content: SCRIPT_SYSTEM_PROMPT },
@@ -77,4 +80,3 @@ export async function runScriptCommand(
 
   return { script, markdown, wordCount };
 }
-

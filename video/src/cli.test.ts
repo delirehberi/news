@@ -77,6 +77,7 @@ describe('src/cli.ts', () => {
 
     const draftWorkerClient: WorkerClient = {
       getCandidates: vi.fn(),
+      getUsedStories: vi.fn().mockResolvedValue([]),
       getEdition: vi.fn().mockResolvedValue({
         week: '2026-W42',
         status: 'draft',

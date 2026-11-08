@@ -8,11 +8,50 @@ import {
   DEFAULT_VIDEO_ITEM_COUNT,
   DEFAULT_YOUTUBE_PRIVACY,
   parseDotEnvContent,
+  requireAiEnv,
   validateEnv,
   validateFullEnv,
 } from './env.ts';
 
 describe('src/config/env.ts', () => {
+  const aiConfig = {
+    INGESTION_SECRET: 'test-secret',
+    AI_GATEWAY_BASE_URL: 'https://ai.workouse.com',
+    AI_GATEWAY_API_KEY: 'test-gateway-key',
+    AI_MODEL: 'dynamic/audit',
+  };
+
+  it('preserves and trims optional Access service-token credentials', () => {
+    const env = requireAiEnv(validateEnv({
+      ...aiConfig,
+      CF_ACCESS_CLIENT_ID: ' test-access-client ',
+      CF_ACCESS_CLIENT_SECRET: ' test-access-secret ',
+    }));
+
+    expect(env.CF_ACCESS_CLIENT_ID).toBe('test-access-client');
+    expect(env.CF_ACCESS_CLIENT_SECRET).toBe('test-access-secret');
+  });
+
+  it.each([
+    { CF_ACCESS_CLIENT_ID: 'test-access-client' },
+    { CF_ACCESS_CLIENT_SECRET: 'test-access-secret' },
+    { CF_ACCESS_CLIENT_ID: 'test-access-client', CF_ACCESS_CLIENT_SECRET: ' ' },
+  ])('rejects incomplete Access credentials without disclosing their values', (credentials) => {
+    expect(() => requireAiEnv(validateEnv({ ...aiConfig, ...credentials })))
+      .toThrow('CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET must be set together');
+  });
+
+  it('allows AI endpoints without Access service-token authentication', () => {
+    const env = requireAiEnv(validateEnv({
+      ...aiConfig,
+      CF_ACCESS_CLIENT_ID: ' ',
+      CF_ACCESS_CLIENT_SECRET: '',
+    }));
+
+    expect(env.CF_ACCESS_CLIENT_ID).toBeUndefined();
+    expect(env.CF_ACCESS_CLIENT_SECRET).toBeUndefined();
+  });
+
   it('parses minimal required variables and applies defaults', () => {
     const env = validateEnv({
       INGESTION_SECRET: 'secret-token-123',
@@ -36,6 +75,22 @@ describe('src/config/env.ts', () => {
     expect(env.NEWS_API_BASE_URL).toBe('http://localhost:8787');
     expect(env.YOUTUBE_PRIVACY).toBe('unlisted');
     expect(env.VIDEO_ITEM_COUNT).toBe(7);
+  });
+
+  it('accepts the maximum weekly item count of 20', () => {
+    const env = validateEnv({
+      INGESTION_SECRET: 'test-secret',
+      VIDEO_ITEM_COUNT: '20',
+    });
+
+    expect(env.VIDEO_ITEM_COUNT).toBe(20);
+  });
+
+  it('rejects weekly item counts above 20', () => {
+    expect(() => validateEnv({
+      INGESTION_SECRET: 'test-secret',
+      VIDEO_ITEM_COUNT: '21',
+    })).toThrow('VIDEO_ITEM_COUNT must be at most 20');
   });
 
   it('fails fast with clear error messages when required variables are missing or invalid', () => {
@@ -109,4 +164,3 @@ describe('src/config/env.ts', () => {
     }
   });
 });
-
