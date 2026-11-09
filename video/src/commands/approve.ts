@@ -25,7 +25,7 @@ export interface ApproveCommandDeps {
 export async function assertEditionApproved(
   workerClient: WorkerClient,
   week: string,
-  stepName: 'voice' | 'render' | 'upload',
+  stepName: 'voice' | 'render' | 'upload' | 'shorts',
   signal?: AbortSignal
 ): Promise<WeeklyEdition> {
   const edition = await workerClient.getEdition(week, signal);

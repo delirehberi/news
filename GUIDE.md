@@ -310,3 +310,73 @@ make video-produce WEEK="$WEEK"
 ```
 
 Review the uploaded video in YouTube Studio and make it public when ready. Use the staged path instead when you want to review the local MP4 before upload.
+
+## Weekly Shorts and Instagram Reels
+
+After the full weekly edition is approved and its YouTube upload has produced
+`video/out/<week>/upload.json`, draft the vertical companion videos:
+
+```sh
+make shorts-draft WEEK=2026-W45
+# Edit video/out/2026-W45/shorts/shorts.md, retaining its headings and field labels.
+make shorts-produce WEEK=2026-W45
+```
+
+The CLI uses `video/out/` as its output root. Generated drafts contain a 5–9-word
+Turkish hook, three 12–16-word topic mentions, and a fixed CTA appended by code.
+Edited topic lines may contain 1–24 words to allow brief additions or shorter
+wording. Keep them near 15 words: the final 36-second duration limit still applies.
+The editable document controls titles, hooks, topic lines, captions, and hashtags;
+it cannot replace the CTA. Drafting refuses to overwrite an existing Markdown
+file: move it aside explicitly to generate a fresh draft.
+
+Only stories in both the approved edition and its approved narration qualify.
+URL aliases and shared story clusters count once. The output count is
+`min(4, floor(eligible / 3))`: nine eligible stories yield three shorts, twelve
+or more yield four, three to eight yield one or two. Fewer than three fail.
+Production revalidates edited story URLs and rejects duplicates or unapproved
+stories. It checks `upload.json` before requesting ElevenLabs audio.
+
+Outputs live in `video/out/<week>/shorts/`: `1.mp4` through `4.mp4` as applicable,
+`1-cover.png` through `4-cover.png`, and `posting.md`. One 1080×1920, 30 fps MP4
+serves both platforms. Mobile page captures use a 430px viewport at 3× with a
+2400 CSS-pixel height cap and fall back to the story image, then a source card.
+Narration timestamps drive the scene changes. The end card stays at least six
+seconds, the total duration is at least 31 seconds, and anything over 36 seconds
+fails with an instruction to shorten the script. Audio caches include narration,
+voice, model, and mock mode; editing spoken lines invalidates cached narration.
+
+Look and sound: captions show four words at a time and highlight the word being
+spoken, driven by the aligned word timings. A code-drawn robot presenter lip-syncs
+to the same timings (mouth shape follows the vowel being spoken) over an animated
+background whose colour changes per section. A quiet looping music bed
+(`video/assets/music/bed.mp3`, about 12% volume, ducked to 6% under speech, faded
+in and out) is mixed under the narration. The bed is synthesized with ffmpeg only
+(96 BPM, Am–F–C–G), so there are no licensing concerns; regenerate or tweak it with
+`make shorts-music` (edit `video/scripts/generate-music.sh`). To use your own
+track, replace `bed.mp3` with a licensed file. Without the file, shorts render
+without music and print a warning.
+
+For an explicit silent mock render, use `make shorts-produce WEEK=2026-W45 MOCK=1`.
+This writes to the same shorts directory and labels the posting notes as mock.
+Run production again without `MOCK=1` before posting. There is no auto-upload,
+Worker write, database change, or cron integration in this workflow.
+
+`posting.md` includes the full `youtu.be` link from `upload.json`, titles,
+platform captions, hashtags, and suggested Monday/Wednesday/Friday/Sunday dates
+in the week after the edition. Choose the posting time manually.
+
+YouTube confirms that Shorts description/comment URLs are not clickable. In
+YouTube Studio, open Content, select the uploaded Short, set **Related video**
+to the full weekly video, and save. This requires advanced feature access and a
+public or unlisted full video. On Instagram, put the full-video link in the
+profile's Links section and direct viewers to the bio. Caption links have been
+tested for some Meta Verified accounts; do not assume availability for Reels.
+Use the PNG for the Instagram cover; select an opening frame in YouTube's mobile
+Shorts flow where supported.
+
+Sources checked 2026-11-09:
+
+- [YouTube link behavior](https://support.google.com/youtube/answer/13748639)
+- [YouTube Related video](https://support.google.com/youtube/answer/14075157)
+- [Instagram's limited caption-link test](https://www.socialmediatoday.com/news/instagram-tests-links-in-post-captions-for-paying-users/814763/)

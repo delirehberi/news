@@ -134,7 +134,7 @@ export function buildVoiceSegments(script: Script): VoiceSegmentSpec[] {
   return segments;
 }
 
-async function loadCachedSegmentMetadata(
+export async function loadCachedSegmentMetadata(
   mp3Path: string,
   jsonPath: string,
   spec: VoiceSegmentSpec,

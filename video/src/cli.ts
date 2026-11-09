@@ -11,6 +11,11 @@ import { runSelectCommand } from './commands/select.ts';
 import { runTranslateCommand } from './commands/translate.ts';
 import { runUploadCommand } from './commands/upload.ts';
 import { runVoiceCommand } from './commands/voice.ts';
+import { runShortsScriptCommand } from './commands/shorts-script.ts';
+import { runShortsCaptureCommand } from './commands/shorts-capture.ts';
+import { runShortsVoiceCommand } from './commands/shorts-voice.ts';
+import { runShortsRenderCommand } from './commands/shorts-render.ts';
+import { runShortsPostingCommand } from './commands/shorts-posting.ts';
 import { isValidIsoWeek, previousIsoWeek } from './lib/paths.ts';
 import type { WorkerClient } from './lib/workerClient.ts';
 
@@ -24,6 +29,7 @@ export const CLI_COMMANDS = [
   'render',
   'upload',
   'auth',
+  'shorts-script', 'shorts-capture', 'shorts-voice', 'shorts-render', 'shorts-posting',
 ] as const;
 
 export type CliCommand = (typeof CLI_COMMANDS)[number];
@@ -65,6 +71,11 @@ export function formatHelpText(): string {
     '  render      Bundle Remotion composition and render video.mp4 + thumbnail.png',
     '  upload      Upload rendered video and thumbnail to YouTube and publish edition',
     '  auth        Run one-time loopback YouTube PKCE OAuth flow',
+    '  shorts-script   Draft editable shorts.md from an approved weekly edition',
+    '  shorts-capture  Capture selected article pages at mobile width and 3x scale',
+    '  shorts-voice    Synthesize each short with fixed CTA (requires upload.json)',
+    '  shorts-render   Render vertical MP4s and covers (use --mock for mock voice)',
+    '  shorts-posting  Write manual posting notes with the full-video link',
     '',
     'Options:',
     '  --week <YYYY-Www>  Target ISO week (defaults to previous ISO week in UTC)',
@@ -163,6 +174,11 @@ export function isProductionGatedCommand(
 }
 
 export const defaultCommandHandlers: Record<CliCommand, CommandHandler> = {
+  'shorts-script': async (ctx) => { await runShortsScriptCommand(ctx); },
+  'shorts-capture': async (ctx) => { await runShortsCaptureCommand(ctx); },
+  'shorts-voice': async (ctx) => { await runShortsVoiceCommand(ctx); },
+  'shorts-render': async (ctx) => { await runShortsRenderCommand(ctx); },
+  'shorts-posting': async (ctx) => { await runShortsPostingCommand(ctx); },
   select: async (ctx) => {
     await runSelectCommand(ctx);
   },
@@ -288,5 +304,4 @@ const isMain =
 if (isMain) {
   runMain();
 }
-
 

@@ -133,3 +133,7 @@ describe('src/cli.ts', () => {
   });
 });
 
+
+it.each(['shorts-script', 'shorts-capture', 'shorts-voice', 'shorts-render', 'shorts-posting'])('parses %s and explicit mock mode', (command) => {
+  expect(parseCliArgs([command, '--week', '2026-W45', '--mock'])).toMatchObject({ command, week: '2026-W45', mock: true });
+});

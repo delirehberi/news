@@ -174,3 +174,19 @@ video-produce:
 video-auth:
 	@echo "Running YouTube OAuth2 PKCE loopback flow..."
 	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts auth'
+
+.PHONY: shorts-draft shorts-produce shorts-music
+# MOCK=1 explicitly generates silent verification audio; regenerate without it before posting.
+SHORTS_FLAGS = $(if $(WEEK),--week $(WEEK),) $(if $(filter 1,$(MOCK)),--mock,)
+shorts-draft:
+	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts shorts-script $(SHORTS_FLAGS)'
+
+shorts-produce:
+	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts shorts-voice $(SHORTS_FLAGS)'
+	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts shorts-capture $(SHORTS_FLAGS)'
+	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts shorts-render $(SHORTS_FLAGS)'
+	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts shorts-posting $(SHORTS_FLAGS)'
+
+# Regenerates the royalty-free background bed (ffmpeg only) used under shorts narration.
+shorts-music:
+	bash video/scripts/generate-music.sh video/assets/music/bed.mp3

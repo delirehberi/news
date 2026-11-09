@@ -694,6 +694,7 @@ export interface CaptureStoryPageOptions {
   navigationTimeoutMs?: number;
   maxPageBytes?: number;
   maxHeightPx?: number;
+  viewport?: { width: number; height: number; deviceScaleFactor: number };
   now?: () => Date;
   onWarn?: (msg: string) => void;
 }
@@ -723,6 +724,7 @@ export async function captureStoryPage(
     navigationTimeoutMs = DEFAULT_NAVIGATION_TIMEOUT_MS,
     maxPageBytes = DEFAULT_MAX_PAGE_BYTES,
     maxHeightPx = CAPTURE_MAX_HEIGHT_PX,
+    viewport = { width: CAPTURE_VIEWPORT_WIDTH, height: CAPTURE_VIEWPORT_HEIGHT, deviceScaleFactor: CAPTURE_DEVICE_SCALE_FACTOR },
     now = () => new Date(),
     onWarn,
   } = options;
@@ -733,7 +735,7 @@ export async function captureStoryPage(
 
   const normalizedUrl = url.trim();
   const cached = await loadCachedPageCapture(pagesDir, storyIndex, normalizedUrl);
-  if (cached) {
+  if (cached && cached.viewport.width === viewport.width && cached.viewport.height === viewport.height && cached.viewport.deviceScaleFactor === viewport.deviceScaleFactor && cached.page_height <= maxHeightPx) {
     return {
       status: 'cached',
       metadata: cached,
@@ -748,9 +750,9 @@ export async function captureStoryPage(
 
     const { screenshotPng, extraction } = await session.captureUrl({
       url: validatedUrl.toString(),
-      viewportWidth: CAPTURE_VIEWPORT_WIDTH,
-      viewportHeight: CAPTURE_VIEWPORT_HEIGHT,
-      deviceScaleFactor: CAPTURE_DEVICE_SCALE_FACTOR,
+      viewportWidth: viewport.width,
+      viewportHeight: viewport.height,
+      deviceScaleFactor: viewport.deviceScaleFactor,
       maxHeightPx,
       navigationTimeoutMs,
       maxPageBytes,
@@ -773,12 +775,8 @@ export async function captureStoryPage(
       url: normalizedUrl,
       url_hash: computeUrlHash(normalizedUrl),
       captured_at: now().toISOString(),
-      screenshot_path: `pages/${storyIndex}.png`,
-      viewport: {
-        width: CAPTURE_VIEWPORT_WIDTH,
-        height: CAPTURE_VIEWPORT_HEIGHT,
-        deviceScaleFactor: CAPTURE_DEVICE_SCALE_FACTOR,
-      },
+      screenshot_path: `${path.basename(pagesDir)}/${storyIndex}.png`,
+      viewport,
       page_height: Math.min(maxHeightPx, Math.max(1, Math.round(extraction.pageHeight))),
       excerpt: cleanCaptureText(extraction.excerpt, CAPTURE_EXCERPT_MAX_CHARS),
       elements,

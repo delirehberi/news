@@ -11,9 +11,24 @@ import {
   type WeeklyVideoProps,
 } from '../domain/timeline.ts';
 import { WeeklyVideo } from './WeeklyVideo.tsx';
+import { WeeklyShort } from './WeeklyShort.tsx';
+import { DEFAULT_WEEKLY_SHORT_PROPS, WeeklyShortPropsSchema } from '../domain/shortComposition.ts';
+import { SHORT_COMPOSITION_ID, SHORT_FPS, SHORT_HEIGHT, SHORT_WIDTH } from '../domain/shorts.ts';
 
 export const RemotionRoot: React.FC = () => {
   return (
+    <>
+    <Composition
+      id={SHORT_COMPOSITION_ID}
+      component={WeeklyShort}
+      schema={WeeklyShortPropsSchema}
+      defaultProps={DEFAULT_WEEKLY_SHORT_PROPS}
+      width={SHORT_WIDTH}
+      height={SHORT_HEIGHT}
+      fps={SHORT_FPS}
+      durationInFrames={SHORT_FPS}
+      calculateMetadata={({ props }) => ({ durationInFrames: props.timing.durationInFrames })}
+    />
     <Composition
       id={WEEKLY_VIDEO_COMPOSITION_ID}
       component={WeeklyVideo}
@@ -37,6 +52,7 @@ export const RemotionRoot: React.FC = () => {
         };
       }}
     />
+    </>
   );
 };
 
@@ -49,4 +65,3 @@ export {
   VIDEO_WIDTH,
   WEEKLY_VIDEO_COMPOSITION_ID,
 };
-
