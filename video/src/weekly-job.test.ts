@@ -133,3 +133,89 @@ if [[ "$1" == -l ]]; then cat "$WEEKLY_TEST_CRONTAB"; else cp "$1" "$WEEKLY_TEST
     expect(cron).not.toContain(' approve');
   });
 });
+
+const makefilePath = fileURLToPath(new URL('../../Makefile', import.meta.url));
+const repoRoot = path.dirname(makefilePath);
+
+describe('Makefile weekly video target week validation', () => {
+  function runMake(args: string[], extraEnv: Record<string, string | undefined> = {}) {
+    const env = { ...process.env, ...extraEnv };
+    delete env.MAKEFLAGS;
+    delete env.MFLAGS;
+    delete env.MAKELEVEL;
+    if (!('WEEK' in extraEnv)) {
+      delete env.WEEK;
+    }
+    return spawnSync('make', ['--no-print-directory', '-C', repoRoot, '-f', makefilePath, ...args], {
+      encoding: 'utf8',
+      env,
+    });
+  }
+
+  it('retains the previous-week default when WEEK is omitted', () => {
+    for (const target of ['video-draft', 'video-capture', 'video-approve', 'video-produce', 'shorts-draft', 'shorts-produce']) {
+      const res = runMake(['-n', target]);
+      expect(res.status, `${target} failed: ${res.stderr}`).toBe(0);
+      expect(res.stdout).toContain('src/cli.ts');
+      expect(res.stdout).not.toContain('--week');
+    }
+  });
+
+  it('passes explicit WEEK=YYYY-Www to CLI and weekly scripts', () => {
+    for (const target of ['video-draft', 'video-capture', 'video-approve', 'video-produce', 'shorts-draft', 'shorts-produce']) {
+      const res = runMake(['-n', target, 'WEEK=2026-W44']);
+      expect(res.status, `${target} failed: ${res.stderr}`).toBe(0);
+      expect(res.stdout).toContain('--week 2026-W44');
+    }
+
+    const prepRes = runMake(['-n', 'prepare', 'WEEK=2026-W44']);
+    expect(prepRes.status).toBe(0);
+    expect(prepRes.stdout).toContain('bash scripts/weekly.sh prepare 2026-W44');
+
+    const appRes = runMake(['-n', 'approve', 'WEEK=2026-W44']);
+    expect(appRes.status).toBe(0);
+    expect(appRes.stdout).toContain('bash scripts/weekly.sh approve 2026-W44');
+  });
+
+  it('fails fast with a clear WEEK=YYYY-Www instruction when given a positional week argument', () => {
+    for (const [target, arg] of [
+      ['video-draft', '2026-44'],
+      ['video-draft', '2026-W44'],
+      ['video-capture', '2026-W44'],
+      ['video-approve', '2026-W44'],
+      ['video-produce', '2026-W44'],
+      ['shorts-draft', '2026-W44'],
+      ['shorts-produce', '2026-W44'],
+      ['prepare', '2026-W44'],
+      ['approve', '2026-W44'],
+    ] as const) {
+      const res = runMake([target, arg]);
+      expect(res.status).not.toBe(0);
+      expect(res.stdout).toBe('');
+      expect(res.stderr).toContain(`Unexpected positional argument(s) "${arg}"`);
+      expect(res.stderr).toContain(`WEEK=YYYY-Www (e.g. make ${target} WEEK=2026-W44)`);
+    }
+  });
+
+  it('fails fast when WEEK is malformed or contains shell metacharacters', () => {
+    for (const badWeek of [
+      '2026-44',
+      '2026-W4',
+      '2026-W00',
+      '2026-W54',
+      '26-W44',
+      '2026-w44',
+      '-2026-W44',
+      '2026-W44-',
+      '2026-W44 extra',
+      '../other',
+      '2026-W44; echo injected',
+    ]) {
+      const res = runMake(['video-draft', `WEEK=${badWeek}`]);
+      expect(res.status, `Expected WEEK=${badWeek} to fail`).not.toBe(0);
+      expect(res.stdout).toBe('');
+      expect(res.stderr).toContain('Expected WEEK=YYYY-Www');
+    }
+  });
+});
+

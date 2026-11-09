@@ -132,7 +132,7 @@ The `video/` package is a standalone Node.js (v22+ native TypeScript) CLI and Re
 | `VIDEO_ITEM_COUNT` | `select` | `6` | Number of top stories selected per weekly edition (`1`–`15`). |
 
 ### Makefile Targets
-All `video-*` targets default to the **previous ISO week in UTC** (`YYYY-Www`). Pass `WEEK=2026-W42` to target a specific week:
+All `video-*` and `shorts-*` targets default to the **previous ISO week in UTC** (`YYYY-Www`) when `WEEK` is omitted. Pass `WEEK=2026-W42` as a Make variable assignment (`WEEK=YYYY-Www`) to target a specific week; positional week arguments (such as `make video-draft 2026-44`) or malformed `WEEK` values are rejected immediately before running any pipeline stage:
 
 - `make video-init` — Install `video/` dependencies and initialize `video/.env` from `video/.env.example`.
 - `make video-auth` — Run the one-time loopback YouTube OAuth2 PKCE flow and print `YOUTUBE_REFRESH_TOKEN`.
@@ -144,6 +144,9 @@ All `video-*` targets default to the **previous ISO week in UTC** (`YYYY-Www`). 
   - `capture`: Captures any story page that is missing or stale (cached ones are skipped).
   - `render`: Runs `capture` itself if any story page is still missing, then resolves each story's visual mode along the fallback ladder (`page` walkthrough → OG `image` with keyword callouts → branded `card`). The OG image is the translation's `image_url`, or else the captured `og_image_url` (checked against the SSRF guard). It prints `Story visuals for <week>: page N, og M, card K` and **stops before rendering if every story would be a branded card**; pass `--allow-cards` to `cli.ts render` to override. Then it renders `video.mp4` + `thumbnail.png` via Remotion.
   - `upload`: Streams `video.mp4` (resumable upload) and `thumbnail.png` to YouTube with Turkish chapters (`00:00` first) and source links, saves the video ID to `out/<week>/upload.json` and the edition, sets the thumbnail (a failure, e.g. 403 on unverified channels, only warns), and marks the edition `status: "published"` last. Re-runs never upload the video twice: they only finish the missing steps.
+- `make shorts-draft [WEEK=YYYY-Www]` — Draft editable vertical companion `video/out/<week>/shorts/shorts.md` from an approved weekly edition.
+- `make shorts-produce [WEEK=YYYY-Www] [MOCK=1]` — Synthesize, capture, render (`1.mp4`..`4.mp4` + covers), and write posting notes (`posting.md`) for weekly vertical shorts.
+- `make weekly-check` — Validate `scripts/weekly.sh`, `scripts/weekly-cron.sh`, and run weekly Make/cron regression tests.
 - `make video-typecheck` — Run `tsc --noEmit` on the `video/` package.
 - `make video-test` — Run Vitest unit and end-to-end tests in `video/`.
 

@@ -145,7 +145,9 @@ export function parseCliArgs(
       continue;
     }
 
-    throw new Error(`Unexpected positional argument "${arg}".`);
+    throw new Error(
+      `Unexpected positional argument "${arg}". Pass the target ISO week with --week YYYY-Www (or WEEK=YYYY-Www via Make).`
+    );
   }
 
   const resolvedWeek = week ?? previousIsoWeek(now);

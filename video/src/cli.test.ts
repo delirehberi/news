@@ -26,8 +26,11 @@ describe('src/cli.ts', () => {
     expect(parsed3.week).toBe('2026-W45');
   });
 
-  it('rejects unknown commands or malformed weeks', () => {
+  it('rejects unknown commands, positional weeks, or malformed weeks', () => {
     expect(() => parseCliArgs(['unknown-cmd'])).toThrowError(/Unknown command/);
+    expect(() => parseCliArgs(['select', '2026-W44'])).toThrowError(
+      /Unexpected positional argument "2026-W44"\. Pass the target ISO week with --week YYYY-Www/
+    );
     expect(() => parseCliArgs(['select', '--week', '2026-10'])).toThrowError(
       /Invalid --week value/
     );

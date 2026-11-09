@@ -130,7 +130,7 @@ Use one explicit ISO week throughout the run:
 export WEEK=2026-W42
 ```
 
-Replace this example with your target week. Without `WEEK`, the CLI defaults to the previous ISO week in UTC, not the current week.
+Replace this example with your target week. Without `WEEK`, the `video-*` and `shorts-*` Make targets default to the previous ISO week in UTC, not the current week. Always pass an explicit week as `WEEK=YYYY-Www` (for example `make video-draft WEEK=2026-W42` or with `WEEK` exported); positional arguments such as `make video-draft 2026-44` or malformed `WEEK` values fail immediately at the Make boundary before running any stage.
 
 The Worker snapshots live stories daily at 03:00 UTC when its scheduled trigger runs. It captures the top 30 candidates plus liked articles. Regular snapshots matter because live articles can expire before the end of a week.
 

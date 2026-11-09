@@ -8,11 +8,35 @@ NVM_CMD=. ~/.nvm/nvm.sh && nvm use &&
 
 .PHONY: prepare approve cron-install weekly-check
 
+WEEKLY_GOALS := prepare approve video-draft video-capture video-approve video-produce shorts-draft shorts-produce
+VALID_ISO_WEEKS := W01 W02 W03 W04 W05 W06 W07 W08 W09 \
+  W10 W11 W12 W13 W14 W15 W16 W17 W18 W19 \
+  W20 W21 W22 W23 W24 W25 W26 W27 W28 W29 \
+  W30 W31 W32 W33 W34 W35 W36 W37 W38 W39 \
+  W40 W41 W42 W43 W44 W45 W46 W47 W48 W49 \
+  W50 W51 W52 W53
+WEEK_TRIMMED := $(strip $(value WEEK))
+ifneq ($(filter $(WEEKLY_GOALS),$(MAKECMDGOALS)),)
+EXTRA_WEEKLY_GOALS := $(filter-out $(WEEKLY_GOALS),$(MAKECMDGOALS))
+ifneq ($(EXTRA_WEEKLY_GOALS),)
+$(error Unexpected positional argument(s) "$(EXTRA_WEEKLY_GOALS)". Pass the target ISO week with WEEK=YYYY-Www (e.g. make $(firstword $(filter $(WEEKLY_GOALS),$(MAKECMDGOALS))) WEEK=2026-W44))
+endif
+ifneq ($(WEEK_TRIMMED),)
+WEEK_PARTS := $(subst -, ,$(WEEK_TRIMMED))
+WEEK_YEAR_DIGITS := $(strip $(subst 0,,$(subst 1,,$(subst 2,,$(subst 3,,$(subst 4,,$(subst 5,,$(subst 6,,$(subst 7,,$(subst 8,,$(subst 9,,$(word 1,$(WEEK_PARTS)))))))))))))
+ifneq ($(words $(value WEEK))|$(words $(WEEK_PARTS))|$(WEEK_YEAR_DIGITS)|$(words $(subst 0,0 ,$(subst 1,1 ,$(subst 2,2 ,$(subst 3,3 ,$(subst 4,4 ,$(subst 5,5 ,$(subst 6,6 ,$(subst 7,7 ,$(subst 8,8 ,$(subst 9,9 ,$(word 1,$(WEEK_PARTS)))))))))))))|$(filter $(word 2,$(WEEK_PARTS)),$(VALID_ISO_WEEKS))|$(word 1,$(WEEK_PARTS))-$(word 2,$(WEEK_PARTS)),1|2||4|$(word 2,$(WEEK_PARTS))|$(WEEK_TRIMMED))
+$(error Invalid WEEK="$(value WEEK)". Expected WEEK=YYYY-Www (e.g. WEEK=2026-W44))
+endif
+endif
+endif
+
+WEEK_FLAG = $(if $(WEEK_TRIMMED),--week $(WEEK_TRIMMED),)
+
 prepare:
-	bash scripts/weekly.sh prepare $(WEEK)
+	bash scripts/weekly.sh prepare $(WEEK_TRIMMED)
 
 approve:
-	bash scripts/weekly.sh approve
+	bash scripts/weekly.sh approve $(WEEK_TRIMMED)
 
 cron-install:
 	bash scripts/weekly-cron.sh
@@ -151,25 +175,25 @@ video-test:
 
 video-draft:
 	@echo "Running weekly video draft pipeline (select -> translate -> capture -> script)..."
-	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts select $(if $(WEEK),--week $(WEEK),)'
-	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts translate $(if $(WEEK),--week $(WEEK),)'
-	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts capture $(if $(WEEK),--week $(WEEK),)'
-	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts script $(if $(WEEK),--week $(WEEK),)'
+	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts select $(WEEK_FLAG)'
+	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts translate $(WEEK_FLAG)'
+	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts capture $(WEEK_FLAG)'
+	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts script $(WEEK_FLAG)'
 
 video-capture:
 	@echo "Capturing full-page screenshots and element maps for weekly stories..."
-	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts capture $(if $(WEEK),--week $(WEEK),)'
+	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts capture $(WEEK_FLAG)'
 
 video-approve:
 	@echo "Approving weekly video script and publishing Turkish web edition..."
-	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts approve $(if $(WEEK),--week $(WEEK),)'
+	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts approve $(WEEK_FLAG)'
 
 video-produce:
 	@echo "Running weekly video production pipeline (voice -> capture -> render -> upload)..."
-	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts voice $(if $(WEEK),--week $(WEEK),)'
-	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts capture $(if $(WEEK),--week $(WEEK),)'
-	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts render $(if $(WEEK),--week $(WEEK),)'
-	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts upload $(if $(WEEK),--week $(WEEK),)'
+	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts voice $(WEEK_FLAG)'
+	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts capture $(WEEK_FLAG)'
+	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts render $(WEEK_FLAG)'
+	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts upload $(WEEK_FLAG)'
 
 video-auth:
 	@echo "Running YouTube OAuth2 PKCE loopback flow..."
@@ -177,7 +201,7 @@ video-auth:
 
 .PHONY: shorts-draft shorts-produce shorts-music
 # MOCK=1 explicitly generates silent verification audio; regenerate without it before posting.
-SHORTS_FLAGS = $(if $(WEEK),--week $(WEEK),) $(if $(filter 1,$(MOCK)),--mock,)
+SHORTS_FLAGS = $(WEEK_FLAG) $(if $(filter 1,$(MOCK)),--mock,)
 shorts-draft:
 	bash -c '$(NVM_CMD) cd video && node --experimental-strip-types src/cli.ts shorts-script $(SHORTS_FLAGS)'
 
