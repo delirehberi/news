@@ -4,18 +4,56 @@ import {
   validateScriptWordBudget,
   type Script,
 } from '../domain/script.ts';
-import { getWeekPaths, readText, writeJsonAtomic } from '../lib/paths.ts';
+import { getWeekPaths, readJson, readText, writeJsonAtomic } from '../lib/paths.ts';
 import {
   createWorkerClient,
   type WeeklyEdition,
   type WorkerClient,
 } from '../lib/workerClient.ts';
+import type { WeeklyTranslation } from './translate.ts';
 
 export interface ApproveCommandDeps {
   workerClient?: WorkerClient;
   outRoot?: string;
   stdout?: (msg: string) => void;
   fetchImpl?: typeof fetch;
+}
+
+function isHttpUrl(value: string): boolean {
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+export function validateScriptSegmentUrls(
+  script: Script,
+  translation: Pick<WeeklyTranslation, 'items'>
+): void {
+  const allowedUrls = new Set(
+    translation.items
+      .map((item) => (typeof item?.url === 'string' ? item.url.trim() : ''))
+      .filter((url) => url.length > 0)
+  );
+
+  for (let i = 0; i < script.segments.length; i++) {
+    const storyNumber = i + 1;
+    const rawUrl = script.segments[i].item_url.trim();
+
+    if (!isHttpUrl(rawUrl)) {
+      throw new Error(
+        `Invalid story URL in Story ${storyNumber}: "${rawUrl}" is not a valid http(s) URL.`
+      );
+    }
+
+    if (!allowedUrls.has(rawUrl)) {
+      throw new Error(
+        `Unknown story URL in Story ${storyNumber}: "${rawUrl}" does not match any story in translation.json (${Array.from(allowedUrls).join(', ')}).`
+      );
+    }
+  }
 }
 
 /**
@@ -45,9 +83,10 @@ export async function assertEditionApproved(
 }
 
 /**
- * Parses `out/<week>/script.md`, validates its structure and word budget
- * (`WORDS_MIN = 280`..`WORDS_MAX = 2000`), updates `out/<week>/script.json`,
- * and PUTs `script` and `status: 'approved'` to the Worker Admin API (publishing `/weekly/<week>`).
+ * Parses `out/<week>/script.md`, validates its structure, word budget
+ * (`WORDS_MIN = 280`..`WORDS_MAX = 2000`), and story URLs against `out/<week>/translation.json`,
+ * updates `out/<week>/script.json`, and PUTs `script` and `status: 'approved'` to the Worker Admin API
+ * (publishing `/weekly/<week>`).
  */
 export async function runApproveCommand(
   ctx: CommandContext,
@@ -56,11 +95,19 @@ export async function runApproveCommand(
   const stdout = deps.stdout ?? ((msg: string) => console.log(msg));
   const paths = getWeekPaths(ctx.week, deps.outRoot);
 
+  const translation = await readJson<WeeklyTranslation>(paths.translationJson);
+  if (!translation || !Array.isArray(translation.items) || translation.items.length === 0) {
+    throw new Error(
+      `No translated items found in ${paths.translationJson} for week ${ctx.week}. Run "translate" first.`
+    );
+  }
+
   const markdown = await readText(paths.scriptMd);
   const script = fromMarkdown(markdown, {
     onWarn: (msg) => stdout(`[warn] ${msg}`),
   });
   const wordCount = validateScriptWordBudget(script);
+  validateScriptSegmentUrls(script, translation);
 
   await writeJsonAtomic(paths.scriptJson, script);
 

@@ -5,12 +5,40 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { CommandContext } from '../cli.ts';
 import { validateEnv } from '../config/env.ts';
 import { toMarkdown, type Script } from '../domain/script.ts';
-import { getWeekPaths, readJson, writeTextAtomic } from '../lib/paths.ts';
+import { getWeekPaths, readJson, writeJsonAtomic, writeTextAtomic } from '../lib/paths.ts';
 import type { WeeklyEdition, WorkerClient } from '../lib/workerClient.ts';
 import { assertEditionApproved, runApproveCommand } from './approve.ts';
+import type { WeeklyTranslation } from './translate.ts';
 
 function generateWords(count: number, prefix: string = 'kelime'): string {
   return Array.from({ length: count }, (_, idx) => `${prefix}${idx + 1}`).join(' ');
+}
+
+function makeTranslation(week: string = '2026-W42'): WeeklyTranslation {
+  return {
+    week,
+    translated_at: '2026-10-20T15:00:00.000Z',
+    title_tr: 'Haftalık Teknoloji Özeti',
+    intro_tr: 'Giriş özeti',
+    items: [
+      {
+        url: 'https://example.com/linux-kernel-rust',
+        cluster_id: 'c1',
+        title_tr: 'Linux Kernel Rust Sürücüleri',
+        summary_tr: 'Özet bir.',
+        source: 'hackernews',
+        image_url: null,
+      },
+      {
+        url: 'https://example.com/cloudflare-workers-sql',
+        cluster_id: 'c2',
+        title_tr: 'Sıfır Gecikmeli Edge Önbellekleme',
+        summary_tr: 'Özet iki.',
+        source: 'lobsters',
+        image_url: null,
+      },
+    ],
+  };
 }
 
 function makeEditedScript(totalWords: number = 350): Script {
@@ -82,6 +110,7 @@ describe('src/commands/approve.ts', () => {
   it('parses edited script.md, updates script.json, and PUTs script with status: approved', async () => {
     const week = '2026-W42';
     const paths = getWeekPaths(week, tempDir);
+    await writeJsonAtomic(paths.translationJson, makeTranslation(week));
     const editedScript = makeEditedScript(360);
     await writeTextAtomic(paths.scriptMd, toMarkdown(editedScript));
 
@@ -119,9 +148,124 @@ describe('src/commands/approve.ts', () => {
     expect(logs[0]).toContain('Approved script (360 words, 2 segment(s)) for 2026-W42');
   });
 
+  it('allows reordered stories when all URLs appear in translation.items', async () => {
+    const week = '2026-W42';
+    const paths = getWeekPaths(week, tempDir);
+    await writeJsonAtomic(paths.translationJson, makeTranslation(week));
+    const base = makeEditedScript(360);
+    const reorderedScript: Script = {
+      ...base,
+      segments: [base.segments[1], base.segments[0]],
+    };
+    await writeTextAtomic(paths.scriptMd, toMarkdown(reorderedScript));
+
+    const workerClient = makeMockWorkerClient('approved');
+    const ctx: CommandContext = {
+      week,
+      env: validateEnv({ INGESTION_SECRET: 'test-secret' }),
+      signal: new AbortController().signal,
+    };
+
+    const result = await runApproveCommand(ctx, {
+      workerClient,
+      outRoot: tempDir,
+      stdout: () => {},
+    });
+
+    expect(result.script).toEqual(reorderedScript);
+    expect(workerClient.putEdition).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects script.md with an unknown or malformed story URL and does not call putEdition', async () => {
+    const week = '2026-W42';
+    const paths = getWeekPaths(week, tempDir);
+    await writeJsonAtomic(paths.translationJson, makeTranslation(week));
+    const workerClient = makeMockWorkerClient('draft');
+
+    const ctx: CommandContext = {
+      week,
+      env: validateEnv({ INGESTION_SECRET: 'test-secret' }),
+      signal: new AbortController().signal,
+    };
+
+    const base = makeEditedScript(360);
+
+    // 1. Unknown URL (typo in story URL)
+    const unknownUrlScript: Script = {
+      ...base,
+      segments: [
+        base.segments[0],
+        {
+          ...base.segments[1],
+          item_url: 'https://example.com/cloudflare-workers-typo',
+        },
+      ],
+    };
+    await writeTextAtomic(paths.scriptMd, toMarkdown(unknownUrlScript));
+
+    await expect(
+      runApproveCommand(ctx, {
+        workerClient,
+        outRoot: tempDir,
+        stdout: () => {},
+      })
+    ).rejects.toThrowError(
+      /Unknown story URL in Story 2: "https:\/\/example\.com\/cloudflare-workers-typo" does not match any story in translation\.json/
+    );
+
+    // 2. Malformed URL (non-URL token)
+    const malformedUrlScript: Script = {
+      ...base,
+      segments: [
+        {
+          ...base.segments[0],
+          item_url: 'not-a-valid-url',
+        },
+        base.segments[1],
+      ],
+    };
+    await writeTextAtomic(paths.scriptMd, toMarkdown(malformedUrlScript));
+
+    await expect(
+      runApproveCommand(ctx, {
+        workerClient,
+        outRoot: tempDir,
+        stdout: () => {},
+      })
+    ).rejects.toThrowError(
+      /Invalid story URL in Story 1: "not-a-valid-url" is not a valid http\(s\) URL/
+    );
+
+    // 3. Non-http(s) URL scheme
+    const ftpUrlScript: Script = {
+      ...base,
+      segments: [
+        {
+          ...base.segments[0],
+          item_url: 'ftp://example.com/linux-kernel-rust',
+        },
+        base.segments[1],
+      ],
+    };
+    await writeTextAtomic(paths.scriptMd, toMarkdown(ftpUrlScript));
+
+    await expect(
+      runApproveCommand(ctx, {
+        workerClient,
+        outRoot: tempDir,
+        stdout: () => {},
+      })
+    ).rejects.toThrowError(
+      /Invalid story URL in Story 1: "ftp:\/\/example\.com\/linux-kernel-rust" is not a valid http\(s\) URL/
+    );
+
+    expect(workerClient.putEdition).not.toHaveBeenCalled();
+  });
+
   it('rejects script.md when narration word count is under 280 or over 2000 and does not call putEdition', async () => {
     const week = '2026-W42';
     const paths = getWeekPaths(week, tempDir);
+    await writeJsonAtomic(paths.translationJson, makeTranslation(week));
     const workerClient = makeMockWorkerClient('draft');
 
     const underScript = makeEditedScript(210);
@@ -183,6 +327,7 @@ describe('src/commands/approve.ts', () => {
   it('preserves human-edited visual cues from script.md into script.json and Worker putEdition', async () => {
     const week = '2026-W42';
     const paths = getWeekPaths(week, tempDir);
+    await writeJsonAtomic(paths.translationJson, makeTranslation(week));
     const scriptWithEditedCues: Script = {
       ...makeEditedScript(350),
       segments: [
