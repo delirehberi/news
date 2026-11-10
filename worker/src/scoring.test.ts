@@ -3,6 +3,7 @@ import {
   calculateImportanceScore,
   rescoreWithSignals,
   computeExpiresAt,
+  isArticleLive,
   cosineSimilarity,
   parseSources,
   parseEmbedding,
@@ -104,6 +105,38 @@ describe('computeExpiresAt', () => {
     const earlier = toSqliteDateTime(new Date(NOW.getTime() - DAY_MS));
     expect(daysFromNow(computeExpiresAt(['hackernews'], 1, NOW, earlier))).toBe(RETENTION_DAYS.default);
     expect(daysFromNow(computeExpiresAt(['hackernews'], 1, NOW, 'garbage'))).toBe(RETENTION_DAYS.default);
+  });
+
+  it('anchors retention to createdAt so late re-sightings do not extend past the max window from creation', () => {
+    const createdAt = '2026-10-31 10:00:24';
+    const initialHotExpiry = '2026-11-07 10:00:24';
+    const lateResightNow = new Date('2026-11-07T22:00:05Z');
+    expect(
+      computeExpiresAt(['hackernews', 'lobsters', 'stackernews'], 16.04, lateResightNow, initialHotExpiry, createdAt)
+    ).toBe('2026-11-07 10:00:24');
+  });
+
+  it('promotes a regular article to hot retention anchored to createdAt when a second source arrives', () => {
+    const createdAt = '2026-10-31 10:00:24';
+    const initialDefaultExpiry = '2026-11-02 10:00:24';
+    const secondSourceNow = new Date('2026-11-01T14:00:00Z');
+    expect(
+      computeExpiresAt(['hackernews', 'lobsters'], 2.5, secondSourceNow, initialDefaultExpiry, createdAt)
+    ).toBe('2026-11-07 10:00:24');
+  });
+});
+
+describe('isArticleLive', () => {
+  it('returns true while expires_at is at or after now and false once expired', () => {
+    const row = { created_at: '2026-10-31 10:00:24', expires_at: '2026-11-07 10:00:24' };
+    expect(isArticleLive(row, new Date('2026-11-07T10:00:24Z'))).toBe(true);
+    expect(isArticleLive(row, new Date('2026-11-07T22:00:05Z'))).toBe(false);
+  });
+
+  it('falls back to created_at + 2 days when expires_at is missing', () => {
+    const row = { created_at: '2026-10-15 12:00:00', expires_at: null };
+    expect(isArticleLive(row, new Date('2026-10-17T11:59:59Z'))).toBe(true);
+    expect(isArticleLive(row, new Date('2026-10-17T12:00:01Z'))).toBe(false);
   });
 });
 
@@ -465,6 +498,15 @@ describe('collapseClusters', () => {
   it('leaves a single live member of a cluster as a normal entry', () => {
     const collapsed = collapseClusters([article('a', '2026-10-21 01:00:00', 'cluster-a', 'hackernews')]);
     expect(collapsed).toEqual([{ ...article('a', '2026-10-21 01:00:00', 'cluster-a', 'hackernews'), related: [] }]);
+  });
+
+  it('propagates is_liked when any member of a cluster is liked', () => {
+    const primary = { ...article('lobsters-1', '2026-10-21 01:00:00', 'cluster-php', 'lobsters'), is_liked: 0 };
+    const likedSibling = { ...article('hn-1', '2026-10-21 05:00:00', 'cluster-php', 'hackernews'), is_liked: 1 };
+    const collapsed = collapseClusters([likedSibling, primary]);
+    expect(collapsed).toHaveLength(1);
+    expect(collapsed[0].id).toBe('lobsters-1');
+    expect(collapsed[0].is_liked).toBe(1);
   });
 
   it('returns an empty list for empty input', () => {

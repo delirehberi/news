@@ -18,12 +18,18 @@ export const ArticleCard: FC<ArticleCardProps> = ({ article, index, initialOpen 
   const domain = getDomain(article.url);
   const isFirst = index === 0;
   const seenCount = article.seen_count || 1;
+  const isLiked = Boolean(article.is_liked);
   const curatorComment = typeof article.curator_comment === 'string' && article.curator_comment.trim().length > 0
     ? article.curator_comment.trim()
     : null;
 
   return (
-    <article class={`news-item ${curatorComment ? 'has-curator-note' : ''}`.trim()} data-id={article.id} data-created-at={article.created_at || ''}>
+    <article
+      class={`news-item ${curatorComment ? 'has-curator-note' : ''}`.trim()}
+      data-id={article.id}
+      data-created-at={article.created_at || ''}
+      data-liked={isLiked ? 'true' : undefined}
+    >
       {/* 1. HackerNews-like Compact Title Row */}
       <div class="news-row">
         {/* Left: Source badge + Title + Domain */}
@@ -109,12 +115,13 @@ export const ArticleCard: FC<ArticleCardProps> = ({ article, index, initialOpen 
           {/* Like Button (Icon-Only with counter) */}
           <button
             type="button"
-            class="action-icon-btn like-btn"
+            class={`action-icon-btn like-btn ${isLiked ? 'is-liked' : ''}`.trim()}
             data-id={article.id}
             aria-label="Like article"
+            aria-pressed={isLiked ? 'true' : undefined}
             title={`Like article (${article.follower_likes || 0} likes)`}
           >
-            <svg class="w-4 h-4 like-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <svg class="w-4 h-4 like-icon" fill={isLiked ? 'currentColor' : 'none'} stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z" />
             </svg>
             <svg class="w-4 h-4 animate-spin hidden loading-icon" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">

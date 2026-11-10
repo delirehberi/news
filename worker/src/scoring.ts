@@ -132,16 +132,29 @@ export function computeExpiresAt(
   sources: string[],
   importanceScore: number,
   now: Date,
-  currentExpiresAt?: string | null
+  currentExpiresAt?: string | null,
+  createdAt?: string | null
 ): string {
   const baseDays = sources.includes(NEWSLETTER_SOURCE) ? RETENTION_DAYS.newsletter : RETENTION_DAYS.default;
   const days = importanceScore >= HOT_PROMOTION_THRESHOLD ? Math.max(baseDays, RETENTION_DAYS.hot) : baseDays;
-  const candidate = new Date(now.getTime() + days * MS_PER_DAY);
+  const anchor = parseSqliteDateTime(createdAt) ?? now;
+  const candidate = new Date(anchor.getTime() + days * MS_PER_DAY);
 
   // Retention only ever extends: a re-sighting must never shorten a previously granted lifetime.
   const current = parseSqliteDateTime(currentExpiresAt);
   const effective = current && current.getTime() > candidate.getTime() ? current : candidate;
   return toSqliteDateTime(effective);
+}
+
+export function isArticleLive(
+  article: { created_at?: string | null; expires_at?: string | null },
+  now: Date
+): boolean {
+  const expires = parseSqliteDateTime(article.expires_at);
+  if (expires) return expires.getTime() >= now.getTime();
+  const created = parseSqliteDateTime(article.created_at);
+  if (created) return created.getTime() + RETENTION_DAYS.default * MS_PER_DAY >= now.getTime();
+  return true;
 }
 
 export interface RankableArticle {
@@ -434,6 +447,7 @@ export interface CollapsibleArticle extends ClusterMember {
   source: string;
   sources?: string[];
   source_count?: number;
+  is_liked?: boolean | number | null;
   curator_comment?: string | null;
 }
 
@@ -468,9 +482,11 @@ export function collapseClusters<T extends CollapsibleArticle>(ranked: T[]): Arr
     const mergedComment = primary.curator_comment && primary.curator_comment.trim().length > 0
       ? primary.curator_comment
       : siblingComment;
+    const anyLiked = group.some(m => Boolean(m.is_liked));
     result.push({
       ...primary,
       ...(mergedComment !== undefined ? { curator_comment: mergedComment } : {}),
+      ...(anyLiked && !primary.is_liked ? { is_liked: 1 } : {}),
       sources,
       source_count: Math.max(primary.source_count ?? 0, sources.length),
       related: group

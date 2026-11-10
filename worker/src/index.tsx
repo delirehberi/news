@@ -14,6 +14,7 @@ import {
   parseEmbedding,
   calculateImportanceScore,
   computeExpiresAt,
+  isArticleLive,
   toSqliteDateTime,
   rankHot,
   groupDigest,
@@ -1750,7 +1751,7 @@ async function reclusterLiveArticles(env: Bindings, dryRun: boolean, now: Date, 
       sources.length,
       importanceScore,
       clusterId,
-      computeExpiresAt(sources, importanceScore, now, row.expires_at),
+      computeExpiresAt(sources, importanceScore, now, row.expires_at, row.created_at),
       row.id
     ));
   }
@@ -2067,7 +2068,7 @@ async function handleIngestion(env: Bindings, targetSource?: string) {
     const placeholders = urls.map(() => '?').join(',');
     try {
       const existing = await env.news_db.prepare(
-        `SELECT id, url, source, sources, source_count, seen_count, importance_score, expires_at FROM articles WHERE url IN (${placeholders})`
+        `SELECT id, url, source, sources, source_count, seen_count, importance_score, created_at, expires_at FROM articles WHERE url IN (${placeholders})`
       ).bind(...urls).all<ExistingArticleRow>();
       for (const row of existing.results || []) {
         existingByUrl.set(row.url, row);
@@ -2083,6 +2084,11 @@ async function handleIngestion(env: Bindings, targetSource?: string) {
     const dbRec = existingByUrl.get(article.url);
     if (!dbRec) {
       newRawArticles.push(article);
+      continue;
+    }
+    // Already-expired rows (such as liked articles retained forever) are still skipped as new
+    // insertions, but must never be resurrected back into the live feed by a late re-sighting.
+    if (!isArticleLive(dbRec, now)) {
       continue;
     }
     const dbSources = parseSources(dbRec.sources, dbRec.source);
@@ -2103,7 +2109,7 @@ async function handleIngestion(env: Bindings, targetSource?: string) {
       mergedSources.length,
       seenCount,
       importanceScore,
-      computeExpiresAt(mergedSources, importanceScore, now, dbRec.expires_at),
+      computeExpiresAt(mergedSources, importanceScore, now, dbRec.expires_at, dbRec.created_at),
       nowSql,
       dbRec.id
     ));
@@ -2222,7 +2228,7 @@ async function handleIngestion(env: Bindings, targetSource?: string) {
       const recentRes = await env.news_db.prepare(
         `SELECT ${RECENT_CLUSTER_COLUMNS}
          FROM articles
-         WHERE embedding IS NOT NULL AND coalesce(last_seen_at, created_at) >= datetime('now', ?1)
+         WHERE embedding IS NOT NULL AND (${LIVE_ARTICLE_CONDITION}) AND coalesce(last_seen_at, created_at) >= datetime('now', ?1)
          ORDER BY coalesce(last_seen_at, created_at) DESC
          LIMIT ?2`
       ).bind(`-${CLUSTER_LOOKBACK_HOURS} hours`, CLUSTER_MAX_CANDIDATES).all<RecentClusterRow>();
@@ -2309,7 +2315,7 @@ async function handleIngestion(env: Bindings, targetSource?: string) {
         entry.sources.length,
         importanceScore,
         entry.clusterId,
-        computeExpiresAt(entry.sources, importanceScore, now, row.expires_at),
+        computeExpiresAt(entry.sources, importanceScore, now, row.expires_at, row.created_at),
         nowSql,
         row.id
       ));
@@ -2411,13 +2417,13 @@ interface ExistingArticleRow {
   source_count: number | null;
   seen_count: number | null;
   importance_score: number | null;
+  created_at: string | null;
   expires_at: string | null;
 }
 
 interface RecentClusterRow extends ExistingArticleRow {
   title: string;
   summary: string | null;
-  created_at: string | null;
   cluster_id: string | null;
   embedding: string | null;
 }

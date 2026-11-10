@@ -1298,13 +1298,16 @@ describe('Curator Comments, Nostr Highlight Flow, SSR & RSS Rendering', () => {
     expect(tastePrompts[0]).toContain(curatorNote);
     expect(savedTasteProfile).toContain('deterministic systems');
 
-    // 3. SSR Home Feed and Article Permalink render .curator-note callout
+    // 3. SSR Home Feed and Article Permalink render .curator-note callout and liked state
     const feedRes = await app.request('https://news.emre.xyz/', {}, env);
     expect(feedRes.status).toBe(200);
     const feedHtml = await feedRes.text();
     expect(feedHtml).toContain('curator-note');
     expect(feedHtml).toContain('Curator Note');
     expect(feedHtml).toContain(curatorNote);
+    expect(feedHtml).toContain('data-liked="true"');
+    expect(feedHtml).toContain('action-icon-btn like-btn is-liked');
+    expect(feedHtml).toContain('aria-pressed="true"');
 
     const detailRes = await app.request('https://news.emre.xyz/article/hn-777', {}, env);
     expect(detailRes.status).toBe(200);

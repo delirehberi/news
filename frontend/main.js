@@ -41,6 +41,14 @@ function updateLikeUI(btn, countDisplay, articleId) {
     const currentCount = parseInt(countDisplay.textContent || '0', 10);
     countDisplay.textContent = currentCount + 1;
   }
+
+  const card = btn.closest('.news-item, .news-card');
+  if (card) {
+    card.dataset.liked = 'true';
+    card.classList.remove('is-new');
+    const newBadge = card.querySelector('.new-badge');
+    if (newBadge) newBadge.hidden = true;
+  }
   
   const likedArticles = JSON.parse(localStorage.getItem('likedArticles') || '[]');
   if (!likedArticles.includes(articleId)) {
@@ -128,6 +136,7 @@ function attachCardListeners(card) {
   // 2. Restore local storage liked state
   const likedArticles = JSON.parse(localStorage.getItem('likedArticles') || '[]');
   if (likedArticles.includes(articleId) && likeBtn) {
+    card.dataset.liked = 'true';
     likeBtn.classList.add('is-liked');
     likeBtn.disabled = true;
     likeBtn.setAttribute('aria-pressed', 'true');
@@ -449,14 +458,18 @@ function writeLastVisit(timestamp) {
 }
 
 // Marks cards that arrived since the previous visit. The baseline is only advanced when the page is
-// hidden or left, so a refresh during the same visit keeps the badges.
-function markNewSinceLastVisit(cards) {
+// hidden or left, so a refresh during the same visit keeps the badges. Already-liked cards were
+// already seen and interacted with (possibly on another device), so they are never marked as NEW.
+export function markNewSinceLastVisit(cards) {
   const lastVisit = readLastVisit();
   const visitStartedAt = Date.now();
 
   if (lastVisit !== null) {
     let newCount = 0;
     cards.forEach((card) => {
+      if (card.dataset.liked === 'true' || card.querySelector('.like-btn.is-liked')) {
+        return;
+      }
       const createdAt = parseUtcTimestamp(card.dataset.createdAt);
       if (Number.isFinite(createdAt) && createdAt > lastVisit) {
         card.classList.add('is-new');
