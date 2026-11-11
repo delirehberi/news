@@ -522,6 +522,7 @@ describe('Weekly Video Pipeline End-to-End & Security Audit', () => {
     const renderResult = await runRenderCommand(ctx, {
       workerClient,
       outRoot: tempDir,
+      dnsLookup: async () => [{ address: '93.184.216.34', family: 4 }],
       fetchImpl: mockFetch,
       remotionAdapter,
       stdout,

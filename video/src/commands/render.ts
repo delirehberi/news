@@ -47,6 +47,7 @@ import { buildVoiceSegments } from './voice.ts';
 
 export const IMAGE_DOWNLOAD_TIMEOUT_MS = 15_000;
 export const MAX_IMAGE_BYTES = 15 * 1024 * 1024;
+export const MAX_IMAGE_REDIRECTS = 5;
 
 const ALLOWED_IMAGE_MIME_EXTENSIONS: Readonly<Record<string, string>> = {
   'image/jpeg': '.jpg',
@@ -56,6 +57,80 @@ const ALLOWED_IMAGE_MIME_EXTENSIONS: Readonly<Record<string, string>> = {
   'image/gif': '.gif',
   'image/avif': '.avif',
 };
+
+/**
+ * Checks whether the leading magic bytes of `bytes` match the claimed `mimeType`.
+ */
+export function matchesImageMagicBytes(bytes: Uint8Array, mimeType: string): boolean {
+  switch (mimeType) {
+    case 'image/jpeg':
+    case 'image/jpg':
+      // FF D8 FF
+      return (
+        bytes.byteLength >= 3 &&
+        bytes[0] === 0xff &&
+        bytes[1] === 0xd8 &&
+        bytes[2] === 0xff
+      );
+
+    case 'image/png':
+      // 89 50 4E 47 0D 0A 1A 0A (\x89PNG\r\n\x1a\n)
+      return (
+        bytes.byteLength >= 8 &&
+        bytes[0] === 0x89 &&
+        bytes[1] === 0x50 &&
+        bytes[2] === 0x4e &&
+        bytes[3] === 0x47 &&
+        bytes[4] === 0x0d &&
+        bytes[5] === 0x0a &&
+        bytes[6] === 0x1a &&
+        bytes[7] === 0x0a
+      );
+
+    case 'image/gif':
+      // "GIF87a" (47 49 46 38 37 61) or "GIF89a" (47 49 46 38 39 61)
+      return (
+        bytes.byteLength >= 6 &&
+        bytes[0] === 0x47 &&
+        bytes[1] === 0x49 &&
+        bytes[2] === 0x46 &&
+        bytes[3] === 0x38 &&
+        (bytes[4] === 0x37 || bytes[4] === 0x39) &&
+        bytes[5] === 0x61
+      );
+
+    case 'image/webp':
+      // "RIFF" .... "WEBP"
+      return (
+        bytes.byteLength >= 12 &&
+        bytes[0] === 0x52 &&
+        bytes[1] === 0x49 &&
+        bytes[2] === 0x46 &&
+        bytes[3] === 0x46 &&
+        bytes[8] === 0x57 &&
+        bytes[9] === 0x45 &&
+        bytes[10] === 0x42 &&
+        bytes[11] === 0x50
+      );
+
+    case 'image/avif':
+      // ISO BMFF ftyp box at bytes 4..7 ("ftyp") with major brand "avif" or "avis" at bytes 8..11
+      return (
+        bytes.byteLength >= 12 &&
+        bytes[4] === 0x66 &&
+        bytes[5] === 0x74 &&
+        bytes[6] === 0x79 &&
+        bytes[7] === 0x70 &&
+        bytes[8] === 0x61 &&
+        bytes[9] === 0x76 &&
+        bytes[10] === 0x69 &&
+        (bytes[11] === 0x66 || bytes[11] === 0x73)
+      );
+
+    default:
+      return false;
+  }
+}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const DEFAULT_REMOTION_ENTRY_POINT = path.resolve(
@@ -96,13 +171,64 @@ export interface DownloadStoryImageOptions {
   imagesDir: string;
   signal?: AbortSignal;
   timeoutMs?: number;
+  maxBytes?: number;
+  maxRedirects?: number;
+  dnsLookup?: DnsLookupAllFn;
   fetchImpl?: typeof fetch;
   onWarn?: (msg: string) => void;
 }
 
 /**
- * Downloads a story's OG image to `out/<week>/images/<storyIndex>.<ext>` with a timeout,
- * HTTP status check, `Content-Type` validation (`image/*`), and byte size limit.
+ * Reads a `Response` body stream up to `maxBytes`. If the stream exceeds `maxBytes`,
+ * cancels the reader and aborts `streamAbortController` immediately without buffering further.
+ */
+async function readBoundedResponseBytes(
+  response: Response,
+  maxBytes: number,
+  streamAbortController: AbortController
+): Promise<{ bytes: Uint8Array; exceeded: false } | { totalBytes: number; exceeded: true }> {
+  if (!response.body) {
+    return { bytes: new Uint8Array(0), exceeded: false };
+  }
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      if (!value || value.byteLength === 0) {
+        continue;
+      }
+      totalBytes += value.byteLength;
+      if (totalBytes > maxBytes) {
+        await reader.cancel().catch(() => {});
+        streamAbortController.abort();
+        return { totalBytes, exceeded: true };
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const combined = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    combined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return { bytes: combined, exceeded: false };
+}
+
+/**
+ * Downloads a story's OG image to `out/<week>/images/<storyIndex>.<ext>` with SSRF validation,
+ * manual redirect hop checks, timeout, HTTP status check, `Content-Type` validation (`image/*`),
+ * streaming byte size limit, and magic byte verification.
  * If the URL is missing or the download/validation fails, logs a warning and returns `null`
  * so `StoryScene` falls back to the branded card.
  */
@@ -115,6 +241,9 @@ export async function downloadStoryImage(
     imagesDir,
     signal,
     timeoutMs = IMAGE_DOWNLOAD_TIMEOUT_MS,
+    maxBytes = MAX_IMAGE_BYTES,
+    maxRedirects = MAX_IMAGE_REDIRECTS,
+    dnsLookup,
     fetchImpl = fetch,
     onWarn,
   } = options;
@@ -128,38 +257,71 @@ export async function downloadStoryImage(
     throw signal.reason ?? new DOMException('Aborted', 'AbortError');
   }
 
-  let parsedUrl: URL;
-  try {
-    parsedUrl = new URL(trimmedUrl);
-  } catch {
-    onWarn?.(
-      `Story #${storyIndex}: invalid image_url "${trimmedUrl}", falling back to branded card.`
-    );
-    return null;
-  }
-
-  if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
-    onWarn?.(
-      `Story #${storyIndex}: unsupported image protocol "${parsedUrl.protocol}", falling back to branded card.`
-    );
-    return null;
-  }
-
   const timeoutSignal = AbortSignal.timeout(timeoutMs);
+  const streamAbortController = new AbortController();
   const combinedSignal = signal
-    ? AbortSignal.any([signal, timeoutSignal])
-    : timeoutSignal;
+    ? AbortSignal.any([signal, timeoutSignal, streamAbortController.signal])
+    : AbortSignal.any([timeoutSignal, streamAbortController.signal]);
 
   try {
-    const response = await fetchImpl(trimmedUrl, {
-      method: 'GET',
-      headers: {
-        Accept: 'image/avif,image/webp,image/png,image/jpeg,image/*;q=0.8',
-      },
-      signal: combinedSignal,
-    });
+    let currentUrl = trimmedUrl;
+    let response: Response | null = null;
+
+    for (let hop = 0; hop <= maxRedirects; hop++) {
+      if (signal?.aborted) {
+        throw signal.reason ?? new DOMException('Aborted', 'AbortError');
+      }
+
+      const safeUrl = await assertSafeHttpUrl(currentUrl, { dnsLookup });
+
+      const hopResponse = await fetchImpl(safeUrl.toString(), {
+        method: 'GET',
+        headers: {
+          Accept: 'image/avif,image/webp,image/png,image/jpeg,image/*;q=0.8',
+        },
+        redirect: 'manual',
+        signal: combinedSignal,
+      });
+
+      if (hopResponse.status >= 300 && hopResponse.status < 400) {
+        await hopResponse.body?.cancel().catch(() => {});
+
+        if (hop === maxRedirects) {
+          onWarn?.(
+            `Story #${storyIndex}: image download exceeded max redirects (${maxRedirects}) for ${trimmedUrl}, falling back to branded card.`
+          );
+          return null;
+        }
+
+        const location = hopResponse.headers.get('location')?.trim() ?? '';
+        if (!location) {
+          onWarn?.(
+            `Story #${storyIndex}: image redirect HTTP ${hopResponse.status} missing Location header for ${safeUrl.toString()}, falling back to branded card.`
+          );
+          return null;
+        }
+
+        try {
+          currentUrl = new URL(location, safeUrl).toString();
+        } catch {
+          onWarn?.(
+            `Story #${storyIndex}: invalid redirect Location "${location}" for ${safeUrl.toString()}, falling back to branded card.`
+          );
+          return null;
+        }
+        continue;
+      }
+
+      response = hopResponse;
+      break;
+    }
+
+    if (!response) {
+      return null;
+    }
 
     if (!response.ok) {
+      await response.body?.cancel().catch(() => {});
       onWarn?.(
         `Story #${storyIndex}: image download returned HTTP ${response.status} for ${trimmedUrl}, falling back to branded card.`
       );
@@ -171,6 +333,7 @@ export async function downloadStoryImage(
     const ext = ALLOWED_IMAGE_MIME_EXTENSIONS[mimeType];
 
     if (!ext) {
+      await response.body?.cancel().catch(() => {});
       onWarn?.(
         `Story #${storyIndex}: unsupported Content-Type "${rawContentType || 'none'}" for ${trimmedUrl}, falling back to branded card.`
       );
@@ -180,7 +343,9 @@ export async function downloadStoryImage(
     const contentLengthHeader = response.headers.get('content-length');
     if (contentLengthHeader) {
       const declaredBytes = Number.parseInt(contentLengthHeader, 10);
-      if (Number.isFinite(declaredBytes) && declaredBytes > MAX_IMAGE_BYTES) {
+      if (Number.isFinite(declaredBytes) && declaredBytes > maxBytes) {
+        await response.body?.cancel().catch(() => {});
+        streamAbortController.abort();
         onWarn?.(
           `Story #${storyIndex}: image exceeds max size (${declaredBytes} bytes) for ${trimmedUrl}, falling back to branded card.`
         );
@@ -188,8 +353,20 @@ export async function downloadStoryImage(
       }
     }
 
-    const arrayBuffer = await response.arrayBuffer();
-    const bytes = new Uint8Array(arrayBuffer);
+    const streamResult = await readBoundedResponseBytes(
+      response,
+      maxBytes,
+      streamAbortController
+    );
+
+    if (streamResult.exceeded) {
+      onWarn?.(
+        `Story #${storyIndex}: downloaded image exceeds max size (${streamResult.totalBytes} bytes) for ${trimmedUrl}, falling back to branded card.`
+      );
+      return null;
+    }
+
+    const { bytes } = streamResult;
 
     if (bytes.byteLength === 0) {
       onWarn?.(
@@ -198,9 +375,9 @@ export async function downloadStoryImage(
       return null;
     }
 
-    if (bytes.byteLength > MAX_IMAGE_BYTES) {
+    if (!matchesImageMagicBytes(bytes, mimeType)) {
       onWarn?.(
-        `Story #${storyIndex}: downloaded image exceeds max size (${bytes.byteLength} bytes) for ${trimmedUrl}, falling back to branded card.`
+        `Story #${storyIndex}: image magic bytes do not match Content-Type "${mimeType}" for ${trimmedUrl}, falling back to branded card.`
       );
       return null;
     }
@@ -667,6 +844,7 @@ export async function runRenderCommand(
       imagesDir: paths.imagesDir,
       signal: ctx.signal,
       timeoutMs: deps.imageTimeoutMs,
+      dnsLookup: deps.dnsLookup,
       fetchImpl: deps.fetchImpl,
       onWarn: (msg) => stdout(`[warn] ${msg}`),
     });

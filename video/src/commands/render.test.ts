@@ -12,12 +12,18 @@ import {
   countMissingPageCaptures,
   countStoryVisualModes,
   downloadStoryImage,
+  matchesImageMagicBytes,
+  MAX_IMAGE_BYTES,
   resolveStoryImageUrl,
   runRenderCommand,
   type RemotionRendererAdapter,
   type RenderCaptureRunner,
 } from './render.ts';
 import type { DnsLookupAllFn } from '../lib/ssrf.ts';
+
+const VALID_PNG_BYTES = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const VALID_JPEG_BYTES = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]);
+const PUBLIC_DNS_LOOKUP: DnsLookupAllFn = async () => [{ address: '93.184.216.34', family: 4 }];
 
 function createTestEnv(): VideoEnv {
   return {
@@ -68,10 +74,9 @@ describe('src/commands/render.ts', () => {
   describe('downloadStoryImage', () => {
     it('downloads valid image/* responses to images/<storyIndex>.<ext> and returns relative path', async () => {
       const imagesDir = path.join(tempDir, 'images');
-      const fakeJpeg = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]);
 
       const mockFetch = vi.fn<typeof fetch>().mockResolvedValue(
-        new Response(fakeJpeg, {
+        new Response(VALID_JPEG_BYTES, {
           status: 200,
           headers: { 'content-type': 'image/jpeg; charset=binary' },
         })
@@ -81,12 +86,17 @@ describe('src/commands/render.ts', () => {
         imageUrl: 'https://cdn.example.com/og-story-1.jpg',
         storyIndex: 1,
         imagesDir,
+        dnsLookup: PUBLIC_DNS_LOOKUP,
         fetchImpl: mockFetch,
       });
 
       expect(relPath).toBe('images/1.jpg');
+      expect(mockFetch).toHaveBeenCalledWith(
+        'https://cdn.example.com/og-story-1.jpg',
+        expect.objectContaining({ redirect: 'manual' })
+      );
       const savedBytes = await fs.readFile(path.join(imagesDir, '1.jpg'));
-      expect(new Uint8Array(savedBytes)).toEqual(fakeJpeg);
+      expect(new Uint8Array(savedBytes)).toEqual(VALID_JPEG_BYTES);
     });
 
     it('falls back to null when image download fails, returns non-image content-type, or has empty URL', async () => {
@@ -98,6 +108,7 @@ describe('src/commands/render.ts', () => {
         imageUrl: null,
         storyIndex: 1,
         imagesDir,
+        dnsLookup: PUBLIC_DNS_LOOKUP,
         onWarn: (msg) => warnings.push(msg),
       });
       expect(emptyResult).toBeNull();
@@ -111,6 +122,7 @@ describe('src/commands/render.ts', () => {
         imageUrl: 'https://cdn.example.com/missing.png',
         storyIndex: 2,
         imagesDir,
+        dnsLookup: PUBLIC_DNS_LOOKUP,
         fetchImpl: notFoundFetch,
         onWarn: (msg) => warnings.push(msg),
       });
@@ -128,6 +140,7 @@ describe('src/commands/render.ts', () => {
         imageUrl: 'https://cdn.example.com/page',
         storyIndex: 3,
         imagesDir,
+        dnsLookup: PUBLIC_DNS_LOOKUP,
         fetchImpl: htmlFetch,
         onWarn: (msg) => warnings.push(msg),
       });
@@ -142,11 +155,293 @@ describe('src/commands/render.ts', () => {
         imageUrl: 'https://cdn.example.com/slow.webp',
         storyIndex: 4,
         imagesDir,
+        dnsLookup: PUBLIC_DNS_LOOKUP,
         fetchImpl: errorFetch,
         onWarn: (msg) => warnings.push(msg),
       });
       expect(errorResult).toBeNull();
       expect(warnings.at(-1)).toContain('ETIMEDOUT');
+    });
+
+    it('rejects private-IP, loopback, link-local, and DNS-rebound hosts before making a network request', async () => {
+      const imagesDir = path.join(tempDir, 'images');
+      const mockFetch = vi.fn<typeof fetch>();
+      const warnings: string[] = [];
+
+      const blockedUrls = [
+        'http://127.0.0.1:8080/internal.png',
+        'http://192.168.1.42/router.jpg',
+        'http://169.254.169.254/latest/meta-data/iam',
+        'http://localhost:3000/secret.png',
+      ];
+
+      for (const url of blockedUrls) {
+        const res = await downloadStoryImage({
+          imageUrl: url,
+          storyIndex: 1,
+          imagesDir,
+          dnsLookup: PUBLIC_DNS_LOOKUP,
+          fetchImpl: mockFetch,
+          onWarn: (msg) => warnings.push(msg),
+        });
+        expect(res).toBeNull();
+      }
+
+      // Also reject a hostname that resolves via DNS to a private/loopback IP
+      const rebindRes = await downloadStoryImage({
+        imageUrl: 'https://rebind.attacker.example/og.png',
+        storyIndex: 2,
+        imagesDir,
+        dnsLookup: async () => [{ address: '10.0.0.12', family: 4 }],
+        fetchImpl: mockFetch,
+        onWarn: (msg) => warnings.push(msg),
+      });
+      expect(rebindRes).toBeNull();
+      expect(mockFetch).not.toHaveBeenCalled();
+      expect(warnings).toHaveLength(blockedUrls.length + 1);
+      expect(warnings.at(-1)).toContain('10.0.0.12');
+    });
+
+    it('follows safe redirects manually, rejects a redirect to a private IP without fetching it, and enforces the hop limit', async () => {
+      const imagesDir = path.join(tempDir, 'images');
+      const warnings: string[] = [];
+
+      // 1. Redirect from a public URL to a private IP -> blocked before second fetch
+      const redirectToPrivateFetch = vi.fn<typeof fetch>().mockImplementation(async (input) => {
+        const url = String(input);
+        if (url === 'https://cdn.example.com/start.png') {
+          return new Response(null, {
+            status: 302,
+            headers: { location: 'http://169.254.169.254/latest/meta-data/' },
+          });
+        }
+        return new Response(VALID_PNG_BYTES, {
+          status: 200,
+          headers: { 'content-type': 'image/png' },
+        });
+      });
+
+      const privateRedirectResult = await downloadStoryImage({
+        imageUrl: 'https://cdn.example.com/start.png',
+        storyIndex: 1,
+        imagesDir,
+        dnsLookup: PUBLIC_DNS_LOOKUP,
+        fetchImpl: redirectToPrivateFetch,
+        onWarn: (msg) => warnings.push(msg),
+      });
+
+      expect(privateRedirectResult).toBeNull();
+      expect(redirectToPrivateFetch).toHaveBeenCalledTimes(1);
+      expect(redirectToPrivateFetch).toHaveBeenCalledWith(
+        'https://cdn.example.com/start.png',
+        expect.objectContaining({ redirect: 'manual' })
+      );
+      expect(warnings.at(-1)).toContain('169.254.169.254');
+
+      // 2. Redirect to a hostname that resolves to loopback -> blocked before second fetch
+      const redirectToInternalHostFetch = vi.fn<typeof fetch>().mockImplementation(async () => {
+        return new Response(null, {
+          status: 301,
+          headers: { location: 'https://internal.corp.example/og.png' },
+        });
+      });
+
+      const internalHostResult = await downloadStoryImage({
+        imageUrl: 'https://cdn.example.com/hop.png',
+        storyIndex: 2,
+        imagesDir,
+        dnsLookup: async (hostname) =>
+          hostname === 'internal.corp.example'
+            ? [{ address: '127.0.0.1', family: 4 }]
+            : [{ address: '93.184.216.34', family: 4 }],
+        fetchImpl: redirectToInternalHostFetch,
+        onWarn: (msg) => warnings.push(msg),
+      });
+
+      expect(internalHostResult).toBeNull();
+      expect(redirectToInternalHostFetch).toHaveBeenCalledTimes(1);
+      expect(warnings.at(-1)).toContain('127.0.0.1');
+
+      // 3. Valid public redirect hop succeeds
+      const safeRedirectFetch = vi.fn<typeof fetch>().mockImplementation(async (input) => {
+        const url = String(input);
+        if (url === 'https://cdn.example.com/redirect-ok') {
+          return new Response(null, {
+            status: 302,
+            headers: { location: '/assets/final.png' },
+          });
+        }
+        return new Response(VALID_PNG_BYTES, {
+          status: 200,
+          headers: { 'content-type': 'image/png' },
+        });
+      });
+
+      const safeRedirectResult = await downloadStoryImage({
+        imageUrl: 'https://cdn.example.com/redirect-ok',
+        storyIndex: 3,
+        imagesDir,
+        dnsLookup: PUBLIC_DNS_LOOKUP,
+        fetchImpl: safeRedirectFetch,
+      });
+
+      expect(safeRedirectResult).toBe('images/3.png');
+      expect(safeRedirectFetch).toHaveBeenCalledTimes(2);
+
+      // 4. Redirect loop exceeding maxRedirects falls back to null
+      const loopFetch = vi.fn<typeof fetch>().mockImplementation(async () => {
+        return new Response(null, {
+          status: 302,
+          headers: { location: 'https://cdn.example.com/loop' },
+        });
+      });
+
+      const loopResult = await downloadStoryImage({
+        imageUrl: 'https://cdn.example.com/loop',
+        storyIndex: 4,
+        imagesDir,
+        maxRedirects: 3,
+        dnsLookup: PUBLIC_DNS_LOOKUP,
+        fetchImpl: loopFetch,
+        onWarn: (msg) => warnings.push(msg),
+      });
+
+      expect(loopResult).toBeNull();
+      expect(loopFetch).toHaveBeenCalledTimes(4); // initial + 3 hops
+      expect(warnings.at(-1)).toContain('exceeded max redirects (3)');
+    });
+
+    it('streams chunked responses without Content-Length and aborts as soon as MAX_IMAGE_BYTES is exceeded without buffering the rest', async () => {
+      const imagesDir = path.join(tempDir, 'images');
+      const warnings: string[] = [];
+
+      // Each chunk is 6 MiB; MAX_IMAGE_BYTES is 15 MiB.
+      // Chunk 1 (6 MiB) + Chunk 2 (12 MiB) + Chunk 3 (18 MiB -> exceeds 15 MiB limit!).
+      // Chunk 4 and Chunk 5 must NEVER be pulled.
+      const chunkSize = 6 * 1024 * 1024;
+      const totalChunks = 6;
+      let pulledChunks = 0;
+      let streamCancelled = false;
+
+      const chunkedStream = new ReadableStream<Uint8Array>(
+        {
+          pull(controller) {
+            pulledChunks++;
+            const chunk = new Uint8Array(chunkSize);
+            if (pulledChunks === 1) {
+              chunk.set(VALID_PNG_BYTES, 0);
+            }
+            controller.enqueue(chunk);
+            if (pulledChunks >= totalChunks) {
+              controller.close();
+            }
+          },
+          cancel() {
+            streamCancelled = true;
+          },
+        },
+        { highWaterMark: 0 }
+      );
+
+      let capturedSignal: AbortSignal | null | undefined;
+      const chunkedFetch = vi.fn<typeof fetch>().mockImplementation(async (_input, init) => {
+        capturedSignal = init?.signal;
+        return new Response(chunkedStream, {
+          status: 200,
+          headers: { 'content-type': 'image/png' }, // No content-length header!
+        });
+      });
+
+      const result = await downloadStoryImage({
+        imageUrl: 'https://cdn.example.com/huge-chunked.png',
+        storyIndex: 1,
+        imagesDir,
+        dnsLookup: PUBLIC_DNS_LOOKUP,
+        fetchImpl: chunkedFetch,
+        onWarn: (msg) => warnings.push(msg),
+      });
+
+      expect(result).toBeNull();
+      expect(streamCancelled).toBe(true);
+      expect(capturedSignal?.aborted).toBe(true);
+      // Stopped at chunk 3 (18 MiB > 15 MiB MAX_IMAGE_BYTES), never pulled chunks 4..6
+      expect(pulledChunks).toBe(3);
+      expect(warnings.at(-1)).toContain('exceeds max size');
+      await expect(fs.stat(path.join(imagesDir, '1.png'))).rejects.toThrow();
+    });
+
+    it('verifies leading magic bytes against claimed MIME type and rejects spoofed bodies', async () => {
+      const imagesDir = path.join(tempDir, 'images');
+      const warnings: string[] = [];
+
+      // Claimed image/png but payload is HTML
+      const spoofedHtmlFetch = vi.fn<typeof fetch>().mockResolvedValue(
+        new Response(new TextEncoder().encode('<!DOCTYPE html><html></html>'), {
+          status: 200,
+          headers: { 'content-type': 'image/png' },
+        })
+      );
+
+      const spoofedResult = await downloadStoryImage({
+        imageUrl: 'https://cdn.example.com/fake.png',
+        storyIndex: 1,
+        imagesDir,
+        dnsLookup: PUBLIC_DNS_LOOKUP,
+        fetchImpl: spoofedHtmlFetch,
+        onWarn: (msg) => warnings.push(msg),
+      });
+
+      expect(spoofedResult).toBeNull();
+      expect(warnings.at(-1)).toContain('magic bytes do not match Content-Type "image/png"');
+      await expect(fs.stat(path.join(imagesDir, '1.png'))).rejects.toThrow();
+
+      // Claimed image/jpeg but payload has PNG magic bytes
+      const mismatchedMimeFetch = vi.fn<typeof fetch>().mockResolvedValue(
+        new Response(VALID_PNG_BYTES, {
+          status: 200,
+          headers: { 'content-type': 'image/jpeg' },
+        })
+      );
+
+      const mismatchedResult = await downloadStoryImage({
+        imageUrl: 'https://cdn.example.com/mismatch.jpg',
+        storyIndex: 2,
+        imagesDir,
+        dnsLookup: PUBLIC_DNS_LOOKUP,
+        fetchImpl: mismatchedMimeFetch,
+        onWarn: (msg) => warnings.push(msg),
+      });
+
+      expect(mismatchedResult).toBeNull();
+      expect(warnings.at(-1)).toContain('magic bytes do not match Content-Type "image/jpeg"');
+
+      // Direct unit checks for supported magic byte signatures
+      expect(matchesImageMagicBytes(VALID_JPEG_BYTES, 'image/jpeg')).toBe(true);
+      expect(matchesImageMagicBytes(VALID_JPEG_BYTES, 'image/jpg')).toBe(true);
+      expect(matchesImageMagicBytes(VALID_PNG_BYTES, 'image/png')).toBe(true);
+      expect(
+        matchesImageMagicBytes(
+          new Uint8Array([0x47, 0x49, 0x46, 0x38, 0x39, 0x61]),
+          'image/gif'
+        )
+      ).toBe(true);
+      expect(
+        matchesImageMagicBytes(
+          new Uint8Array([
+            0x52, 0x49, 0x46, 0x46, 0x24, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50,
+          ]),
+          'image/webp'
+        )
+      ).toBe(true);
+      expect(
+        matchesImageMagicBytes(
+          new Uint8Array([
+            0x00, 0x00, 0x00, 0x1c, 0x66, 0x74, 0x79, 0x70, 0x61, 0x76, 0x69, 0x66,
+          ]),
+          'image/avif'
+        )
+      ).toBe(true);
+      expect(MAX_IMAGE_BYTES).toBe(15 * 1024 * 1024);
     });
   });
 
@@ -242,7 +537,7 @@ describe('src/commands/render.ts', () => {
       const mockFetch = vi.fn<typeof fetch>().mockImplementation(async (input) => {
         const url = String(input);
         if (url.endsWith('story-1.png')) {
-          return new Response(new Uint8Array([0x89, 0x50, 0x4e, 0x47]), {
+          return new Response(VALID_PNG_BYTES, {
             status: 200,
             headers: { 'content-type': 'image/png' },
           });
@@ -257,7 +552,7 @@ describe('src/commands/render.ts', () => {
         .fn<RemotionRendererAdapter['renderComposition']>()
         .mockImplementation(async ({ videoOutputPath, thumbnailOutputPath }) => {
           await writeBytesAtomic(videoOutputPath, new Uint8Array([0x00, 0x00, 0x00, 0x18]));
-          await writeBytesAtomic(thumbnailOutputPath, new Uint8Array([0x89, 0x50, 0x4e, 0x47]));
+          await writeBytesAtomic(thumbnailOutputPath, VALID_PNG_BYTES);
         });
 
       const controller = new AbortController();
@@ -272,6 +567,7 @@ describe('src/commands/render.ts', () => {
       const result = await runRenderCommand(ctx, {
         workerClient,
         outRoot: tempDir,
+        dnsLookup: PUBLIC_DNS_LOOKUP,
         fetchImpl: mockFetch,
         remotionAdapter: {
           bundleComposition,
@@ -357,7 +653,7 @@ describe('src/commands/render.ts', () => {
       // Seed page capture only for story #1 (story #2 has no capture -> falls back to OG/card)
       await writeBytesAtomic(
         path.join(paths.pagesDir, '1.png'),
-        new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+        VALID_PNG_BYTES
       );
       await writeJsonAtomic(path.join(paths.pagesDir, '1.json'), {
         index: 1,
@@ -434,7 +730,7 @@ describe('src/commands/render.ts', () => {
         .fn<RemotionRendererAdapter['renderComposition']>()
         .mockImplementation(async ({ videoOutputPath, thumbnailOutputPath }) => {
           await writeBytesAtomic(videoOutputPath, new Uint8Array([0x00, 0x00, 0x00, 0x18]));
-          await writeBytesAtomic(thumbnailOutputPath, new Uint8Array([0x89, 0x50, 0x4e, 0x47]));
+          await writeBytesAtomic(thumbnailOutputPath, VALID_PNG_BYTES);
         });
 
       const controller = new AbortController();
@@ -443,6 +739,7 @@ describe('src/commands/render.ts', () => {
         {
           workerClient,
           outRoot: tempDir,
+          dnsLookup: PUBLIC_DNS_LOOKUP,
           fetchImpl: mockFetch,
           remotionAdapter: {
             bundleComposition,
@@ -499,6 +796,7 @@ describe('src/commands/render.ts', () => {
       const deps = {
         workerClient,
         outRoot: tempDir,
+        dnsLookup: PUBLIC_DNS_LOOKUP,
         fetchImpl: failingFetch,
         remotionAdapter: { bundleComposition, renderComposition },
         captureRunner: async () => {},
@@ -533,7 +831,7 @@ describe('src/commands/render.ts', () => {
       };
       const imageFetch = vi.fn<typeof fetch>().mockImplementation(
         async () =>
-          new Response(new Uint8Array([0x89, 0x50, 0x4e, 0x47]), {
+          new Response(VALID_PNG_BYTES, {
             status: 200,
             headers: { 'content-type': 'image/png' },
           })
@@ -545,6 +843,7 @@ describe('src/commands/render.ts', () => {
         {
           workerClient,
           outRoot: tempDir,
+          dnsLookup: PUBLIC_DNS_LOOKUP,
           fetchImpl: imageFetch,
           remotionAdapter: {
             bundleComposition: vi.fn().mockResolvedValue('/tmp/fake-remotion-bundle'),
