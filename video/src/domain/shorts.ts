@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { countWords } from './script.ts';
+import { countWords, EMOTION_MARKER_PATTERN } from './script.ts';
 
 export const SHORT_WIDTH = 1080;
 export const SHORT_HEIGHT = 1920;
@@ -28,6 +28,10 @@ const CAPTION_MAX_CHARS = 1800;
 const MAX_HASHTAGS = 8;
 
 const singleLine = z.string().trim().min(1).refine((text) => !/[\r\n]/.test(text), 'Use a single line');
+// Emotion markers are voice directions for the narration only; they must never reach on-screen text.
+const noEmotionMarkers = (text: string) => text.search(EMOTION_MARKER_PATTERN) === -1;
+const EMOTION_MARKERS_FORBIDDEN_MESSAGE = 'Emotion markers are only allowed in hook and topic lines';
+// Budgets count spoken words only: countWords strips emotion markers before counting.
 const spokenLine = (budget: { min: number; max: number }) => singleLine.refine(
   (text) => countWords(text) >= budget.min && countWords(text) <= budget.max,
   (text) => ({ message: `Expected ${budget.min}–${budget.max} words; found ${countWords(text)}` })
@@ -37,9 +41,14 @@ export const ShortTopicSchema = z.object({
   line: spokenLine(SHORT_EDITED_TOPIC_WORDS),
 }).strict();
 export const ShortSchema = z.object({
-  title: singleLine.refine((text) => text.length <= TITLE_MAX_CHARS, 'Title is too long'),
+  title: singleLine
+    .refine((text) => text.length <= TITLE_MAX_CHARS, 'Title is too long')
+    .refine(noEmotionMarkers, EMOTION_MARKERS_FORBIDDEN_MESSAGE),
   hook: spokenLine(SHORT_HOOK_WORDS),
-  caption: singleLine.refine((text) => text.length <= CAPTION_MAX_CHARS, 'Caption is too long'),
+  caption: singleLine
+    .refine((text) => text.length <= CAPTION_MAX_CHARS, 'Caption is too long')
+    .refine(noEmotionMarkers, EMOTION_MARKERS_FORBIDDEN_MESSAGE),
+  // The hashtag pattern already rejects brackets, so markers cannot survive here.
   hashtags: z.array(z.string().regex(/^#[\p{L}\p{N}_]+$/u)).min(1).max(MAX_HASHTAGS),
   topics: z.array(ShortTopicSchema).length(SHORT_TOPICS),
 }).strict();
