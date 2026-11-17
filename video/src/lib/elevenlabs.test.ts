@@ -177,6 +177,48 @@ describe('src/lib/elevenlabs.ts', () => {
     });
   });
 
+  describe('emotion markers in synthesizeMockWithTimestamps', () => {
+    const MOCK_PAUSE_SECONDS = 0.6;
+    const MOCK_SPACE_SECONDS = 0.06;
+
+    function startOf(
+      alignment: { characters: string[]; character_start_times_seconds: number[] },
+      character: string
+    ): number {
+      const index = alignment.characters.indexOf(character);
+      return alignment.character_start_times_seconds[index];
+    }
+
+    it('never includes marker characters in the mock alignment', () => {
+      const result = synthesizeMockWithTimestamps('[thoughtful] Merhaba [long pause] dünya');
+      const spoken = result.alignment.characters.join('');
+      expect(spoken).not.toMatch(/[[\]]/);
+      expect(spoken.replace(/\s+/g, '')).toBe('Merhabadünya');
+    });
+
+    it('inserts silence for pause markers before the following speech', () => {
+      const plain = synthesizeMockWithTimestamps('Merhaba dünya');
+      const paused = synthesizeMockWithTimestamps('Merhaba [pause] dünya');
+      // The extra space left by the marker adds one mock space, and the pause adds silence.
+      const delta = startOf(paused.alignment, 'd') - startOf(plain.alignment, 'd');
+      expect(delta).toBeCloseTo(MOCK_PAUSE_SECONDS + MOCK_SPACE_SECONDS, 3);
+    });
+
+    it('adds no time for non-pause markers such as [thoughtful]', () => {
+      const plain = synthesizeMockWithTimestamps('Merhaba dünya');
+      const thoughtful = synthesizeMockWithTimestamps('[thoughtful]Merhaba dünya');
+      expect(thoughtful.alignment.character_start_times_seconds).toEqual(
+        plain.alignment.character_start_times_seconds
+      );
+    });
+
+    it('rejects text that contains only markers', () => {
+      expect(() => synthesizeMockWithTimestamps('[pause]')).toThrowError(
+        /empty after removing emotion markers/
+      );
+    });
+  });
+
   it('generates valid MPEG-1 Layer III silent MP3 frames and Turkish character alignment in synthesizeMockWithTimestamps', () => {
     const text = 'Merhaba arkadaşlar, bu hafta yazılım dünyasında neler oldu?';
     const result = synthesizeMockWithTimestamps(text);

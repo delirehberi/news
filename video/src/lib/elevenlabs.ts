@@ -3,7 +3,10 @@ import {
   CharacterAlignmentSchema,
   type CharacterAlignment,
 } from '../domain/captions.ts';
-import { WORDS_PER_MINUTE } from '../domain/script.ts';
+import {
+  EMOTION_MARKER_PATTERN,
+  WORDS_PER_MINUTE,
+} from '../domain/script.ts';
 import { fetchJson } from './http.ts';
 
 export const DEFAULT_ELEVENLABS_BASE_URL = 'https://api.elevenlabs.io';
@@ -23,6 +26,10 @@ const MP3_FRAME_SIZE_BYTES = 417;
 const MP3_HEADER_BYTES = [0xff, 0xfb, 0x90, 0xc4] as const;
 const MOCK_SPACE_DURATION_SECONDS = 0.06;
 const MOCK_MIN_WORD_DURATION_SECONDS = 0.18;
+const MOCK_PAUSE_SECONDS = 0.6;
+const MOCK_PAUSE_MARKER_PATTERN = /pause/i;
+// Capturing variant of the shared marker pattern: odd indices of `split` are the markers themselves.
+const MOCK_MARKER_SPLIT_PATTERN = new RegExp(`(${EMOTION_MARKER_PATTERN.source})`);
 const SECONDS_PER_MINUTE = 60;
 
 export const ElevenLabsWithTimestampsResponseSchema = z.object({
@@ -200,39 +207,58 @@ export function synthesizeMockWithTimestamps(
     targetSecondsPerWord - MOCK_SPACE_DURATION_SECONDS
   );
 
-  const tokens = trimmed.split(/(\s+)/);
   const characters: string[] = [];
   const starts: number[] = [];
   const ends: number[] = [];
 
   let cursor = 0;
 
-  for (const token of tokens) {
-    if (!token) continue;
-    const chars = Array.from(token);
-    if (chars.length === 0) continue;
-
-    if (/^\s+$/.test(token)) {
-      const perSpace = MOCK_SPACE_DURATION_SECONDS / chars.length;
-      for (const ch of chars) {
-        const start = Number(cursor.toFixed(4));
-        cursor += perSpace;
-        const end = Number(cursor.toFixed(4));
-        characters.push(ch);
-        starts.push(start);
-        ends.push(end);
+  // Emotion markers are never spoken characters. A pause marker advances the clock by silence;
+  // every other marker (e.g. `[thoughtful]`) contributes no time at all.
+  const segments = trimmed.split(MOCK_MARKER_SPLIT_PATTERN);
+  for (let segmentIndex = 0; segmentIndex < segments.length; segmentIndex++) {
+    const segment = segments[segmentIndex];
+    const isMarker = segmentIndex % 2 === 1;
+    if (isMarker) {
+      if (MOCK_PAUSE_MARKER_PATTERN.test(segment)) {
+        cursor += MOCK_PAUSE_SECONDS;
       }
-    } else {
-      const perChar = effectiveWordDuration / chars.length;
-      for (const ch of chars) {
-        const start = Number(cursor.toFixed(4));
-        cursor += perChar;
-        const end = Number(cursor.toFixed(4));
-        characters.push(ch);
-        starts.push(start);
-        ends.push(end);
+      continue;
+    }
+
+    for (const token of segment.split(/(\s+)/)) {
+      if (!token) continue;
+      const chars = Array.from(token);
+      if (chars.length === 0) continue;
+
+      if (/^\s+$/.test(token)) {
+        const perSpace = MOCK_SPACE_DURATION_SECONDS / chars.length;
+        for (const ch of chars) {
+          const start = Number(cursor.toFixed(4));
+          cursor += perSpace;
+          const end = Number(cursor.toFixed(4));
+          characters.push(ch);
+          starts.push(start);
+          ends.push(end);
+        }
+      } else {
+        const perChar = effectiveWordDuration / chars.length;
+        for (const ch of chars) {
+          const start = Number(cursor.toFixed(4));
+          cursor += perChar;
+          const end = Number(cursor.toFixed(4));
+          characters.push(ch);
+          starts.push(start);
+          ends.push(end);
+        }
       }
     }
+  }
+
+  if (characters.length === 0) {
+    throw new Error(
+      'Cannot synthesize mock speech: narration text is empty after removing emotion markers.'
+    );
   }
 
   const alignment: CharacterAlignment = {

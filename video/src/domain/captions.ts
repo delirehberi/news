@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { EMOTION_MARKER_PATTERN } from './script.ts';
 
 export const DEFAULT_MAX_CAPTION_CHARS = 42;
 
@@ -38,9 +39,35 @@ export interface CaptionChunk {
 }
 
 /**
+ * Flags every alignment entry that belongs to a bracketed emotion marker (including multi-word
+ * tags such as `[long pause]`). Matching runs over the joined text so a marker spanning several
+ * entries is flagged in full; entries are mapped back by code-unit offset.
+ */
+function findEmotionMarkerEntries(characters: readonly string[]): boolean[] {
+  const flagged = new Array<boolean>(characters.length).fill(false);
+  const owners: number[] = [];
+  characters.forEach((entry, index) => {
+    for (let unit = 0; unit < entry.length; unit++) {
+      owners.push(index);
+    }
+  });
+
+  const joined = characters.join('');
+  for (const match of joined.matchAll(EMOTION_MARKER_PATTERN)) {
+    const start = match.index ?? 0;
+    for (let offset = start; offset < start + match[0].length; offset++) {
+      flagged[owners[offset]] = true;
+    }
+  }
+  return flagged;
+}
+
+/**
  * Pure function that converts character-level ElevenLabs timings into word-level timings.
  * Preserves Turkish characters (`ç ğ ı İ ö ş ü Ç Ğ I Ö Ş Ü`) and attached punctuation,
  * and collapses leading, trailing, or consecutive whitespace characters.
+ * Bracketed emotion markers (e.g. `[pause]`, `[long pause]`) are not spoken words, so their
+ * characters are dropped and they act as word boundaries.
  */
 export function alignmentToWords(alignment: CharacterAlignment): WordTiming[] {
   const parsed = CharacterAlignmentSchema.safeParse(alignment);
@@ -51,6 +78,8 @@ export function alignmentToWords(alignment: CharacterAlignment): WordTiming[] {
 
   const { characters, character_start_times_seconds, character_end_times_seconds } =
     parsed.data;
+
+  const isMarkerEntry = findEmotionMarkerEntries(characters);
 
   const words: WordTiming[] = [];
   let currentWordChars: string[] = [];
@@ -75,6 +104,11 @@ export function alignmentToWords(alignment: CharacterAlignment): WordTiming[] {
     const end = character_end_times_seconds[i];
 
     if (ch.length === 0) {
+      continue;
+    }
+
+    if (isMarkerEntry[i]) {
+      flushCurrentWord();
       continue;
     }
 

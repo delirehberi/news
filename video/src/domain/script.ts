@@ -40,14 +40,30 @@ export interface FromMarkdownOptions {
 }
 
 /**
- * Counts whitespace-delimited words in a string.
+ * Matches a bracketed ElevenLabs emotion marker such as `[pause]`, `[thoughtful]`, or `[long pause]`.
+ * Only letters, spaces, and hyphens are accepted inside the brackets so that ordinary bracketed
+ * text (e.g. citations like `[1]`) is left untouched.
+ */
+export const EMOTION_MARKER_PATTERN = /\[\s*[A-Za-z][A-Za-z -]*\]/g;
+
+/**
+ * Removes emotion markers from narration text and collapses the result to single-space-separated
+ * spoken words. Each marker is replaced by a space so that `word[pause]word` yields two words.
+ */
+export function stripEmotionMarkers(text: string): string {
+  return text.replace(EMOTION_MARKER_PATTERN, ' ').replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Counts whitespace-delimited spoken words in a string. Emotion markers are not spoken words
+ * and are excluded from the count.
  */
 export function countWords(text: string): number {
-  const trimmed = text.trim();
-  if (!trimmed) {
+  const spoken = stripEmotionMarkers(text);
+  if (!spoken) {
     return 0;
   }
-  return trimmed.split(/\s+/).length;
+  return spoken.split(' ').length;
 }
 
 /**

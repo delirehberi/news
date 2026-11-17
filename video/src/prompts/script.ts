@@ -16,6 +16,7 @@ import {
 } from '../domain/pageCapture.ts';
 import {
   countScriptWords,
+  stripEmotionMarkers,
   WORDS_MAX,
   WORDS_MIN,
   WORDS_PER_MINUTE,
@@ -163,8 +164,9 @@ function toCuePageElements(
  * (Turkish-aware case/diacritic/punctuation-normalized token sequence or substring).
  */
 export function isAnchorInNarration(anchor: string, narrationTr: string): boolean {
-  const anchorTokens = tokenizeCueText(anchor);
-  const narrationTokens = tokenizeCueText(narrationTr);
+  // Emotion markers are not spoken, so they must not break phrase matching against the narration.
+  const anchorTokens = tokenizeCueText(stripEmotionMarkers(anchor));
+  const narrationTokens = tokenizeCueText(stripEmotionMarkers(narrationTr));
 
   if (anchorTokens.length === 0 || narrationTokens.length === 0) {
     return false;
