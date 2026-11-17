@@ -5,6 +5,23 @@ import { shortNarration, SHORT_CTA, SHORT_FPS } from './shorts.ts';
 import { synthesizeMockWithTimestamps } from '../lib/elevenlabs.ts';
 import { alignmentToWords, getAlignmentDurationSeconds } from './captions.ts';
 
+it('ignores emotion markers when aligning sections and keeps them out of section text', () => {
+  const marked = {
+    ...sampleShort,
+    hook: `[thoughtful] ${sampleShort.hook}`,
+    topics: sampleShort.topics.map((topic, index) =>
+      index === 0 ? { ...topic, line: `${topic.line} [pause]` } : topic
+    ),
+  };
+  const audio = synthesizeMockWithTimestamps(shortNarration(marked));
+  const words = alignmentToWords(audio.alignment);
+  const timing = buildShortTiming(marked, words, getAlignmentDurationSeconds(audio.alignment));
+  expect(timing.sections).toHaveLength(5);
+  expect(timing.sections[0].text).toBe(sampleShort.hook);
+  expect(timing.sections.some((section) => section.text.includes('['))).toBe(false);
+  expect(timing.sections[4].text).toBe(SHORT_CTA);
+});
+
 it('derives five contiguous scenes from speech and holds the CTA for six seconds', () => {
   const audio = synthesizeMockWithTimestamps(shortNarration(sampleShort));
   const words = alignmentToWords(audio.alignment);

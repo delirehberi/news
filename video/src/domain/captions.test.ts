@@ -6,6 +6,31 @@ import {
   type CharacterAlignment,
 } from './captions.ts';
 
+describe('alignmentToWords emotion markers', () => {
+  it('drops single-word markers so captions never display them', () => {
+    const words = alignmentToWords(buildCharAlignment('[thoughtful] Selam, [pause] dünya.'));
+    expect(words.map((w) => w.word)).toEqual(['Selam,', 'dünya.']);
+  });
+
+  it('drops multi-word markers such as [long pause] at the character level', () => {
+    const words = alignmentToWords(buildCharAlignment('Bir [long pause] iki'));
+    expect(words.map((w) => w.word)).toEqual(['Bir', 'iki']);
+  });
+
+  it('treats an attached marker as a word boundary', () => {
+    const words = alignmentToWords(buildCharAlignment('Merhaba[pause]dünya'));
+    expect(words.map((w) => w.word)).toEqual(['Merhaba', 'dünya']);
+  });
+
+  it('keeps word timings aligned to spoken characters when markers are present', () => {
+    const alignment = buildCharAlignment('a [pause] b', 0.1);
+    const words = alignmentToWords(alignment);
+    expect(words).toHaveLength(2);
+    expect(words[1].word).toBe('b');
+    expect(words[1].start).toBeCloseTo(alignment.character_start_times_seconds[10], 6);
+  });
+});
+
 function buildCharAlignment(
   text: string,
   charStepSeconds: number = 0.05

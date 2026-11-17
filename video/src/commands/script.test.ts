@@ -370,6 +370,81 @@ describe('src/commands/script.ts', () => {
     expect(savedMd).toContain('> circle @"yüzde 40" -> p1');
     expect(fromMarkdown(savedMd)).toEqual(result.script);
   });
+
+  it('accepts ElevenLabs emotion markers in spoken fields, keeps them through script.json and script.md round-trip, and strips them from headlines', async () => {
+    const week = '2026-W43';
+    const paths = getWeekPaths(week, tempDir);
+    await writeJsonAtomic(paths.translationJson, makeSampleTranslation(week));
+
+    const url1 = 'https://example.com/linux-kernel-rust';
+    const url2 = 'https://example.com/cloudflare-workers-sql';
+    const introWithMarkers = `[excited] ${generateWords(40, 'acilis')} [pause] bitti.`;
+    const narration1 =
+      `[thoughtful] Bu hafta yeni model yüzde 40 daha güvenli çalışıyor. [short pause] ` +
+      generateWords(120, 'haberbir');
+    const narration2 =
+      `[serious] Edge sunucularda önbellekleme gecikmeyi düşürüyor. ` + generateWords(120, 'haberiki');
+    const outroWithMarkers = `${generateWords(30, 'kapanis')} [sighs] görüşmek üzere.`;
+
+    const llmOutput = {
+      intro: introWithMarkers,
+      segments: [
+        {
+          item_url: url1,
+          headline_tr: '[excited] Linux Kernel Rust Soyutlamaları',
+          narration_tr: narration1,
+          visuals: [
+            { kind: 'focus', anchor: 'yeni model', target: 'h1' },
+            { kind: 'circle', anchor: 'yüzde 40', target: 'p1' },
+          ],
+        },
+        {
+          item_url: url2,
+          headline_tr: 'Edge Önbellekleme Stratejileri',
+          narration_tr: narration2,
+          visuals: [{ kind: 'highlight', anchor: '[curious] önbellekleme', target: 'h1' }],
+        },
+      ],
+      outro: outroWithMarkers,
+    };
+
+    const mockFetch = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(makeOpenAiChatResponse(llmOutput));
+
+    const env = validateEnv({
+      INGESTION_SECRET: 'test-secret',
+      AI_GATEWAY_BASE_URL: 'https://ai.workouse.com/v1',
+      AI_GATEWAY_API_KEY: 'ai-key-123',
+      AI_MODEL: 'gpt-4o-mini',
+    });
+
+    const logs: string[] = [];
+    const result = await runScriptCommand(
+      { week, env, signal: new AbortController().signal },
+      { outRoot: tempDir, stdout: (msg) => logs.push(msg), fetchImpl: mockFetch }
+    );
+
+    // Markers survive in spoken fields of script.json
+    expect(result.script.intro).toBe(introWithMarkers);
+    expect(result.script.outro).toBe(outroWithMarkers);
+    expect(result.script.segments[0].narration_tr).toBe(narration1);
+    // Headline markers are removed (and warned about); cues with markers in anchor are dropped
+    expect(result.script.segments[0].headline_tr).toBe('Linux Kernel Rust Soyutlamaları');
+    expect(result.script.segments[0].visuals).toEqual([
+      { kind: 'focus', anchor: 'yeni model', target: 'h1' },
+      { kind: 'circle', anchor: 'yüzde 40', target: 'p1' },
+    ]);
+    expect(result.script.segments[1].visuals).toBeUndefined();
+    expect(logs.filter((l) => l.startsWith('[warn]')).length).toBeGreaterThanOrEqual(2);
+
+    // script.md keeps the markers in narration and round-trips to the same Script
+    const savedMd = await readText(paths.scriptMd);
+    expect(savedMd).toContain('[excited]');
+    expect(savedMd).toContain('[short pause]');
+    expect(savedMd).toContain('[sighs]');
+    expect(fromMarkdown(savedMd)).toEqual(result.script);
+  });
 });
 
 

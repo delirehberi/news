@@ -1,19 +1,27 @@
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { parseCliArgs, type CommandContext } from './cli.ts';
 import { runApproveCommand } from './commands/approve.ts';
 import { runCaptureCommand } from './commands/capture.ts';
 import { runRenderCommand, type RemotionRendererAdapter } from './commands/render.ts';
 import { runScriptCommand } from './commands/script.ts';
 import { runSelectCommand } from './commands/select.ts';
+import { runShortsPostingCommand } from './commands/shorts-posting.ts';
+import { runShortsRenderCommand, type ShortsRenderer } from './commands/shorts-render.ts';
+import { runShortsScriptCommand } from './commands/shorts-script.ts';
+import { runShortsVoiceCommand } from './commands/shorts-voice.ts';
 import { runTranslateCommand } from './commands/translate.ts';
 import { runUploadCommand } from './commands/upload.ts';
 import { runVoiceCommand } from './commands/voice.ts';
-import { validateFullEnv } from './config/env.ts';
+import { DEFAULT_ELEVENLABS_MODEL_ID, validateFullEnv } from './config/env.ts';
+import { resolveCueTimes } from './domain/cues.ts';
+import { stripEmotionMarkers } from './domain/script.ts';
+import { captionAt } from './domain/shortCaptions.ts';
 import { buildSilentMp3Bytes } from './lib/elevenlabs.ts';
 import { getWeekPaths, isValidIsoWeek, readText, writeTextAtomic } from './lib/paths.ts';
+import { getShortsPaths } from './lib/shortsPaths.ts';
 import {
   createWorkerClient,
   type WeeklyCandidateRow,
@@ -612,6 +620,494 @@ describe('Weekly Video Pipeline End-to-End & Security Audit', () => {
       await expect(client.putEdition(badWeek, { status: 'draft' })).rejects.toThrowError(
         /Invalid week format/
       );
+    }
+  });
+
+  it('runs end-to-end video and Shorts pipelines with ElevenLabs emotion markers on default eleven_v4 without warnings or marker leaks', async () => {
+    const week = '2026-W43';
+    const logs: string[] = [];
+    const stdout = (msg: string): void => {
+      logs.push(msg);
+    };
+    const warnSpy = vi.spyOn(console, 'warn');
+
+    try {
+      // Omit ELEVENLABS_MODEL_ID to verify the default model is eleven_v4
+      const env = validateFullEnv({
+        NEWS_API_BASE_URL: 'https://news.emre.xyz',
+        INGESTION_SECRET: CANARY_SECRETS.INGESTION_SECRET,
+        AI_GATEWAY_BASE_URL: 'https://ai.workouse.com/v1',
+        AI_GATEWAY_API_KEY: CANARY_SECRETS.AI_GATEWAY_API_KEY,
+        CF_ACCESS_CLIENT_ID: CANARY_SECRETS.CF_ACCESS_CLIENT_ID,
+        CF_ACCESS_CLIENT_SECRET: CANARY_SECRETS.CF_ACCESS_CLIENT_SECRET,
+        AI_MODEL: 'gpt-4o-mini',
+        ELEVENLABS_API_KEY: CANARY_SECRETS.ELEVENLABS_API_KEY,
+        ELEVENLABS_VOICE_ID: 'voice_tr_v4',
+        YOUTUBE_CLIENT_ID: 'yt-client-id.apps.googleusercontent.com',
+        YOUTUBE_CLIENT_SECRET: CANARY_SECRETS.YOUTUBE_CLIENT_SECRET,
+        YOUTUBE_REFRESH_TOKEN: CANARY_SECRETS.YOUTUBE_REFRESH_TOKEN,
+        YOUTUBE_PRIVACY: 'private',
+        VIDEO_ITEM_COUNT: '3',
+      });
+      expect(env.ELEVENLABS_MODEL_ID).toBe(DEFAULT_ELEVENLABS_MODEL_ID);
+      expect(env.ELEVENLABS_MODEL_ID).toBe('eleven_v4');
+
+      const candidateRows: WeeklyCandidateRow[] = [
+        {
+          week,
+          url: 'https://example.com/story-rust-kernel',
+          article_id: 'hn-101',
+          title: 'Rust in the Linux Kernel Reaches Major Milestone',
+          source: 'hackernews',
+          summary: 'New Rust abstractions land in mainline kernel.',
+          image_url: null,
+          is_liked: 1,
+          follower_likes: 6,
+          importance_score: 3.4,
+          source_count: 3,
+          seen_count: 4,
+          cluster_id: 'c-rust',
+          captured_at: '2026-10-25T10:00:00.000Z',
+        },
+        {
+          week,
+          url: 'https://example.com/story-sqlite-edge',
+          article_id: 'lobsters-202',
+          title: 'Distributed SQLite Replication at the Edge',
+          source: 'lobsters',
+          summary: 'Low-latency read replicas with deterministic conflict resolution.',
+          image_url: null,
+          is_liked: 0,
+          follower_likes: 4,
+          importance_score: 2.8,
+          source_count: 2,
+          seen_count: 2,
+          cluster_id: 'c-sqlite',
+          captured_at: '2026-10-25T11:00:00.000Z',
+        },
+        {
+          week,
+          url: 'https://example.com/story-wasm-component',
+          article_id: 'hn-303',
+          title: 'WebAssembly Component Model Stabilizes Multi-Language Sandboxes',
+          source: 'hackernews',
+          summary: 'Cross-language WASI components run with near-zero cold start.',
+          image_url: null,
+          is_liked: 0,
+          follower_likes: 2,
+          importance_score: 2.2,
+          source_count: 1,
+          seen_count: 2,
+          cluster_id: 'c-wasm',
+          captured_at: '2026-10-25T12:00:00.000Z',
+        },
+      ];
+
+      const editionsStore = new Map<string, WeeklyEdition>();
+      const elevenLabsRequests: Array<{ model_id: string; text: string }> = [];
+      let ttsCallIndex = 0;
+
+      const mockFetch: typeof fetch = async (input, init) => {
+        const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+        const method = (init?.method ?? 'GET').toUpperCase();
+
+        // 1. Worker Admin API
+        if (url.startsWith('https://news.emre.xyz/api/admin/weekly/')) {
+          const suffix = url.slice('https://news.emre.xyz/api/admin/weekly/'.length);
+          if (suffix.endsWith('/candidates')) {
+            return new Response(JSON.stringify(candidateRows), { status: 200 });
+          }
+          if (suffix.endsWith('/used-stories')) {
+            return new Response(JSON.stringify([]), { status: 200 });
+          }
+          const targetWeek = decodeURIComponent(suffix);
+          if (method === 'GET') {
+            const existing = editionsStore.get(targetWeek);
+            return existing
+              ? new Response(JSON.stringify(existing), { status: 200 })
+              : new Response(JSON.stringify({ error: 'Not Found' }), { status: 404 });
+          }
+          if (method === 'PUT') {
+            const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+            const existing = editionsStore.get(targetWeek);
+            const nextStatus = (body.status as WeeklyStatus | undefined) ?? existing?.status ?? 'draft';
+            const updated: WeeklyEdition = {
+              week: targetWeek,
+              status: nextStatus,
+              title_tr:
+                body.title_tr !== undefined
+                  ? (body.title_tr as string | null)
+                  : (existing?.title_tr ?? null),
+              intro_tr:
+                body.intro_tr !== undefined
+                  ? (body.intro_tr as string | null)
+                  : (existing?.intro_tr ?? null),
+              items:
+                body.items !== undefined
+                  ? (body.items as WeeklyEdition['items'])
+                  : (existing?.items ?? []),
+              script: body.script !== undefined ? body.script : (existing?.script ?? null),
+              youtube_video_id:
+                body.youtube_video_id !== undefined
+                  ? (body.youtube_video_id as string | null)
+                  : (existing?.youtube_video_id ?? null),
+              published_at:
+                nextStatus === 'published'
+                  ? (existing?.published_at ?? '2026-10-26T15:00:00.000Z')
+                  : (existing?.published_at ?? null),
+              updated_at: '2026-10-26T15:00:00.000Z',
+            };
+            editionsStore.set(targetWeek, updated);
+            return new Response(JSON.stringify(updated), { status: 200 });
+          }
+        }
+
+        // 2. AI Gateway (/chat/completions)
+        if (url === 'https://ai.workouse.com/v1/chat/completions') {
+          const reqBody = JSON.parse(String(init?.body ?? '{}')) as {
+            messages: Array<{ role: string; content: string }>;
+          };
+          const systemContent = reqBody.messages[0]?.content ?? '';
+
+          if (systemContent.includes('title_tr') && systemContent.includes('summary_tr')) {
+            return new Response(
+              JSON.stringify({
+                choices: [
+                  {
+                    message: {
+                      content: JSON.stringify({
+                        title_tr: 'Linux Rust, Edge SQLite ve WebAssembly Bileşen Modeli',
+                        intro_tr: 'Bu haftanın öne çıkan sistem ve bulut mühendisliği gelişmeleri.',
+                        items: [
+                          {
+                            url: 'https://example.com/story-rust-kernel',
+                            title_tr: 'Linux Çekirdeğinde Rust Soyutlamaları',
+                            summary_tr: 'Bellek güvenliği sağlayan yeni Rust sürücü katmanları kabul edildi.',
+                          },
+                          {
+                            url: 'https://example.com/story-sqlite-edge',
+                            title_tr: 'Edge Üzerinde Dağıtık SQLite Replikasyonu',
+                            summary_tr: 'Düşük gecikmeli okuma kopyaları ve deterministik çakışma çözümü sunuldu.',
+                          },
+                          {
+                            url: 'https://example.com/story-wasm-component',
+                            title_tr: 'WebAssembly Bileşen Modeli Çoklu Dil Kum Havuzu',
+                            summary_tr: 'Farklı programlama dilleri tek bir güvenli WASI bileşeninde birleşiyor.',
+                          },
+                        ],
+                      }),
+                    },
+                  },
+                ],
+              }),
+              { status: 200 }
+            );
+          }
+
+          if (systemContent.includes('Turkish technology news Shorts')) {
+            const generatedShorts = {
+              shorts: [
+                {
+                  title: 'Haftanın Üç Kritik Altyapı Haberi',
+                  hook: '[excited] Bu hafta sistem dünyasında [pause] hangi kritik yenilikler çıktı?',
+                  caption: 'Linux Rust sürücüleri, dağıtık SQLite ve WebAssembly bileşen modeli özeti.',
+                  hashtags: ['#teknoloji', '#yazılım', '#rust'],
+                  topics: [
+                    {
+                      item_url: 'https://example.com/story-rust-kernel',
+                      line: '[thoughtful] Linux çekirdeğinde yeni Rust sürücü katmanları [short pause] bellek güvenliği sağlayarak ana sürüme kabul edildi.',
+                    },
+                    {
+                      item_url: 'https://example.com/story-sqlite-edge',
+                      line: '[curious] Kenar sunucularda dağıtık SQLite replikasyonu [pause] düşük gecikmeli okuma kopyaları ve çakışma çözümü sunuyor.',
+                    },
+                    {
+                      item_url: 'https://example.com/story-wasm-component',
+                      line: '[serious] WebAssembly bileşen modeli farklı programlama dillerini tek bir güvenli kum havuzunda hızla birleştiriyor.',
+                    },
+                  ],
+                },
+              ],
+            };
+            return new Response(
+              JSON.stringify({
+                choices: [{ message: { content: JSON.stringify(generatedShorts) } }],
+              }),
+              { status: 200 }
+            );
+          }
+
+          const generatedScript = {
+            intro: `[excited] ${generateTurkishWords(40, 'acilis')} [pause] hoş geldiniz.`,
+            segments: [
+              {
+                item_url: 'https://example.com/story-rust-kernel',
+                headline_tr: 'Linux Çekirdeğinde Rust Soyutlamaları',
+                narration_tr:
+                  `[thoughtful] Bu hafta yeni model [short pause] yüzde kırk daha güvenli çalışıyor. ` +
+                  generateTurkishWords(85, 'rusthaber'),
+                visuals: [{ kind: 'focus', anchor: 'yeni model yüzde kırk', target: 'h1' }],
+              },
+              {
+                item_url: 'https://example.com/story-sqlite-edge',
+                headline_tr: 'Edge Üzerinde Dağıtık SQLite',
+                narration_tr:
+                  `[curious] Kenar sunucularda dağıtık replikasyon [pause] düşük gecikme sunuyor. ` +
+                  generateTurkishWords(85, 'sqlitehaber'),
+              },
+              {
+                item_url: 'https://example.com/story-wasm-component',
+                headline_tr: 'WebAssembly Bileşen Modeli',
+                narration_tr:
+                  `[serious] Farklı diller tek kum havuzunda birleşiyor. ` +
+                  generateTurkishWords(85, 'wasmhaber'),
+              },
+            ],
+            outro: `${generateTurkishWords(30, 'kapanis')} [sighs] görüşmek üzere.`,
+          };
+          return new Response(
+            JSON.stringify({
+              choices: [{ message: { content: JSON.stringify(generatedScript) } }],
+            }),
+            { status: 200 }
+          );
+        }
+
+        // 3. ElevenLabs TTS with-timestamps: exercise both raw marker alignment and pre-stripped alignment
+        if (url.startsWith('https://api.elevenlabs.io/v1/text-to-speech/')) {
+          const body = JSON.parse(String(init?.body ?? '{}')) as { model_id: string; text: string };
+          elevenLabsRequests.push(body);
+          const currentCall = ttsCallIndex++;
+          const alignedText = currentCall % 2 === 0 ? body.text : stripEmotionMarkers(body.text);
+          const alignment = buildMockAlignment(alignedText);
+          const duration = alignment.character_end_times_seconds.at(-1) ?? 2.0;
+          const mp3Bytes = buildSilentMp3Bytes(duration);
+          return new Response(
+            JSON.stringify({
+              audio_base64: Buffer.from(mp3Bytes).toString('base64'),
+              alignment,
+            }),
+            { status: 200 }
+          );
+        }
+
+        // 4. Google OAuth2 & YouTube Upload
+        if (url === 'https://oauth2.googleapis.com/token') {
+          return new Response(
+            JSON.stringify({
+              access_token: CANARY_SECRETS.YOUTUBE_ACCESS_TOKEN,
+              expires_in: 3600,
+              token_type: 'Bearer',
+            }),
+            { status: 200 }
+          );
+        }
+        if (url.startsWith('https://www.googleapis.com/upload/youtube/v3/videos')) {
+          return new Response(null, {
+            status: 200,
+            headers: {
+              location: 'https://www.googleapis.com/upload/youtube/v3/resumable-session-43',
+            },
+          });
+        }
+        if (url === 'https://www.googleapis.com/upload/youtube/v3/resumable-session-43') {
+          return new Response(JSON.stringify({ id: '4wAwR9J1Z4E' }), { status: 200 });
+        }
+        if (url.startsWith('https://www.googleapis.com/upload/youtube/v3/thumbnails/set')) {
+          return new Response(JSON.stringify({ items: [] }), { status: 200 });
+        }
+
+        return new Response(`Unhandled mock URL: ${method} ${url}`, { status: 500 });
+      };
+
+      const workerClient = createWorkerClient({
+        baseUrl: env.NEWS_API_BASE_URL,
+        ingestionSecret: env.INGESTION_SECRET,
+        fetchImpl: mockFetch,
+      });
+
+      const ctx: CommandContext = {
+        week,
+        env,
+        signal: new AbortController().signal,
+      };
+
+      // --- Full Video Pipeline ---
+      await runSelectCommand(ctx, { workerClient, outRoot: tempDir, stdout });
+      await runTranslateCommand(ctx, { workerClient, outRoot: tempDir, fetchImpl: mockFetch, stdout });
+      await runCaptureCommand(ctx, {
+        outRoot: tempDir,
+        dnsLookup: async () => [{ address: '93.184.216.34', family: 4 }],
+        browserFactory: async () => ({
+          captureUrl: async ({ url }) => ({
+            screenshotPng: new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+            extraction: {
+              pageHeight: 2200,
+              excerpt: `Captured article text for ${url}`,
+              elements: [
+                {
+                  kind: 'h1',
+                  tagName: 'h1',
+                  text: `Title for ${url}`,
+                  box: { x: 120, y: 90, width: 820, height: 64 },
+                },
+              ],
+            },
+          }),
+          close: async () => {},
+        }),
+        stdout,
+      });
+
+      const scriptResult = await runScriptCommand(ctx, {
+        outRoot: tempDir,
+        fetchImpl: mockFetch,
+        stdout,
+      });
+      // Word count excludes all 8 bracketed emotion markers across intro, 3 segments, and outro
+      expect(scriptResult.script.intro).toContain('[excited]');
+      expect(scriptResult.script.segments[0]?.visuals).toEqual([
+        { kind: 'focus', anchor: 'yeni model yüzde kırk', target: 'h1' },
+      ]);
+
+      const approveResult = await runApproveCommand(ctx, {
+        workerClient,
+        outRoot: tempDir,
+        fetchImpl: mockFetch,
+        stdout,
+      });
+      expect(approveResult.wordCount).toBe(scriptResult.wordCount);
+
+      const voiceResult = await runVoiceCommand(ctx, {
+        workerClient,
+        outRoot: tempDir,
+        fetchImpl: mockFetch,
+        stdout,
+      });
+      expect(voiceResult.synthesizedCount).toBe(5);
+      expect(elevenLabsRequests).toHaveLength(5);
+      for (const req of elevenLabsRequests) {
+        expect(req.model_id).toBe('eleven_v4');
+      }
+      expect(elevenLabsRequests[0]?.text).toContain('[excited]');
+      expect(elevenLabsRequests[1]?.text).toContain('[short pause]');
+
+      // Spoken words and caption chunks never include bracketed emotion markers
+      for (const segment of voiceResult.segments) {
+        expect(segment.words.some((w) => w.word.includes('[') || w.word.includes(']'))).toBe(false);
+        expect(segment.captions.some((c) => c.text.includes('[') || c.text.includes(']'))).toBe(false);
+      }
+
+      // Cue anchor spanning across [short pause] resolves against spoken word timings
+      const resolvedCues = resolveCueTimes(
+        approveResult.script.segments[0]?.visuals ?? [],
+        voiceResult.segments[1]?.words ?? []
+      );
+      expect(resolvedCues).toHaveLength(1);
+      expect(resolvedCues[0]?.matched).toBe(true);
+
+      const remotionAdapter: RemotionRendererAdapter = {
+        async bundleComposition({ publicDir }) {
+          return publicDir;
+        },
+        async renderComposition({ videoOutputPath, thumbnailOutputPath }) {
+          await fs.writeFile(videoOutputPath, Buffer.from('mock-h264'));
+          await fs.writeFile(thumbnailOutputPath, Buffer.from('mock-png'));
+        },
+      };
+      const renderResult = await runRenderCommand(ctx, {
+        workerClient,
+        outRoot: tempDir,
+        dnsLookup: async () => [{ address: '93.184.216.34', family: 4 }],
+        fetchImpl: mockFetch,
+        remotionAdapter,
+        stdout,
+      });
+      for (const story of renderResult.props.stories) {
+        expect(story.headline_tr).not.toMatch(/\[|\]/);
+        expect(story.captions.some((c) => c.text.includes('[') || c.text.includes(']'))).toBe(false);
+      }
+
+      const uploadResult = await runUploadCommand(ctx, {
+        workerClient,
+        outRoot: tempDir,
+        fetchImpl: mockFetch,
+        stdout,
+      });
+      expect(uploadResult.videoId).toBe('4wAwR9J1Z4E');
+
+      // --- Shorts Pipeline ---
+      const shortsDraft = await runShortsScriptCommand(ctx, {
+        outRoot: tempDir,
+        workerClient,
+        fetchImpl: mockFetch,
+        stdout,
+      });
+      expect(shortsDraft.shorts).toHaveLength(1);
+      expect(shortsDraft.shorts[0]?.hook).toContain('[excited]');
+
+      await runShortsVoiceCommand(ctx, {
+        outRoot: tempDir,
+        workerClient,
+        fetchImpl: mockFetch,
+        stdout,
+      });
+      expect(elevenLabsRequests).toHaveLength(6);
+      expect(elevenLabsRequests[5]?.model_id).toBe('eleven_v4');
+      expect(elevenLabsRequests[5]?.text).toContain('[excited]');
+      expect(elevenLabsRequests[5]?.text).toContain('[short pause]');
+
+      const musicBedPath = path.join(tempDir, 'bed.mp3');
+      await fs.writeFile(musicBedPath, buildSilentMp3Bytes(1.0));
+      let renderedShortProps: Parameters<ShortsRenderer['render']>[1] | undefined;
+      const shortsRenderer: ShortsRenderer = {
+        bundle: async (publicDir) => publicDir,
+        render: async (_serveUrl, props, videoPath, coverPath) => {
+          renderedShortProps = props;
+          await fs.writeFile(videoPath, Buffer.from('mock-short-mp4'));
+          await fs.writeFile(coverPath, Buffer.from('mock-short-png'));
+        },
+      };
+
+      await runShortsRenderCommand(ctx, {
+        outRoot: tempDir,
+        workerClient,
+        fetchImpl: mockFetch,
+        renderer: shortsRenderer,
+        musicFile: musicBedPath,
+        stdout,
+      });
+      expect(renderedShortProps).toBeDefined();
+      expect(
+        renderedShortProps?.timing.sections.some((s) => s.text.includes('[') || s.text.includes(']'))
+      ).toBe(false);
+      expect(
+        renderedShortProps?.words.some((w) => w.word.includes('[') || w.word.includes(']'))
+      ).toBe(false);
+
+      // Verify animated short captions at first word timestamp contain zero emotion markers
+      const firstWordTime = renderedShortProps?.words[0]?.start ?? 0;
+      const activeCaptionPage = captionAt(renderedShortProps?.words ?? [], firstWordTime);
+      expect(activeCaptionPage).not.toBeNull();
+      expect(activeCaptionPage?.some((w) => w.text.includes('[') || w.text.includes(']'))).toBe(false);
+
+      await runShortsPostingCommand(ctx, {
+        outRoot: tempDir,
+        workerClient,
+        fetchImpl: mockFetch,
+        stdout,
+      });
+      const shortsPaths = getShortsPaths(week, tempDir);
+      const postingMd = await readText(shortsPaths.posting);
+      expect(postingMd).toContain('https://youtu.be/4wAwR9J1Z4E');
+      expect(postingMd).not.toContain('[excited]');
+      expect(postingMd).not.toContain('[pause]');
+
+      // Zero console warnings or CLI warnings throughout valid v4 emotion-tagged execution
+      expect(warnSpy).not.toHaveBeenCalled();
+      expect(logs.filter((l) => l.toLowerCase().includes('warn'))).toEqual([]);
+    } finally {
+      warnSpy.mockRestore();
     }
   });
 });

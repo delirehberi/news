@@ -3,12 +3,41 @@ import {
   countScriptWords,
   countWords,
   fromMarkdown,
+  stripEmotionMarkers,
   toMarkdown,
   validateScriptWordBudget,
   WORDS_MAX,
   WORDS_MIN,
   type Script,
 } from './script.ts';
+
+describe('emotion markers', () => {
+  it('strips bracketed markers, including multi-word tags, and collapses spacing', () => {
+    expect(stripEmotionMarkers('[thoughtful] Merhaba [pause] dünya')).toBe('Merhaba dünya');
+    expect(stripEmotionMarkers('Bir [long pause] iki')).toBe('Bir iki');
+    expect(stripEmotionMarkers('word[pause]word')).toBe('word word');
+  });
+
+  it('leaves bracketed text that is not an emotion marker untouched', () => {
+    expect(stripEmotionMarkers('Kaynak [1] ve [not-a-tag!]')).toBe('Kaynak [1] ve [not-a-tag!]');
+  });
+
+  it('does not count markers as spoken words', () => {
+    expect(countWords('[thoughtful] Merhaba [pause] dünya')).toBe(2);
+    expect(countWords('[pause]')).toBe(0);
+  });
+
+  it('keeps the script word total unchanged when markers are added to narration', () => {
+    const plain = makeBudgetScript(350);
+    const marked: Script = {
+      ...plain,
+      intro: `[thoughtful] ${plain.intro} [pause]`,
+      outro: `${plain.outro} [long pause]`,
+    };
+    expect(countScriptWords(marked)).toBe(countScriptWords(plain));
+    expect(validateScriptWordBudget(marked)).toBe(validateScriptWordBudget(plain));
+  });
+});
 
 function generateWords(count: number, prefix: string = 'kelime'): string {
   return Array.from({ length: count }, (_, idx) => `${prefix}${idx + 1}`).join(' ');

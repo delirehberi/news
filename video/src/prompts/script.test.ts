@@ -316,4 +316,134 @@ describe('src/prompts/script.ts', () => {
       ).toBe(true);
     });
   });
+
+  describe('emotion marker instructions and validation', () => {
+    const storyUrl = 'https://example.com/story-markers';
+    const elements = [
+      { id: 'h1', kind: 'h1' as const, text: 'Yeni Model Performans Sonuçları' },
+      { id: 'p1', kind: 'paragraph' as const, text: 'Testlerde yüzde 40 daha hızlı sonuç alındı.' },
+    ];
+    const captures = new Map([[storyUrl, { excerpt: 'Excerpt', elements }]]);
+    const narrationWithMarkers =
+      `[thoughtful] Yeni model çıkarım hızında yüzde 40 artış sağlıyor. [pause] ` +
+      generateWords(260, 'kelime');
+
+    function buildInput(
+      segmentOverrides: Partial<{
+        headline_tr: string;
+        visuals: unknown[];
+      }>
+    ): unknown {
+      return {
+        intro: generateWords(40, 'intro'),
+        segments: [
+          {
+            item_url: storyUrl,
+            headline_tr: 'Yeni Model Performansı',
+            narration_tr: narrationWithMarkers,
+            ...segmentOverrides,
+          },
+        ],
+        outro: generateWords(30, 'outro'),
+      };
+    }
+
+    it('instructs the model to use the allowed markers only in spoken fields and forbids them elsewhere', () => {
+      for (const marker of [
+        '[pause]',
+        '[short pause]',
+        '[thoughtful]',
+        '[excited]',
+        '[curious]',
+        '[serious]',
+        '[surprised]',
+        '[sighs]',
+      ]) {
+        expect(SCRIPT_SYSTEM_PROMPT).toContain(marker);
+      }
+      expect(SCRIPT_SYSTEM_PROMPT).toContain('intro');
+      expect(SCRIPT_SYSTEM_PROMPT).toContain('segments[].narration_tr');
+      expect(SCRIPT_SYSTEM_PROMPT).toContain('outro');
+      expect(SCRIPT_SYSTEM_PROMPT).toContain('headline_tr');
+      expect(SCRIPT_SYSTEM_PROMPT).toContain('item_url');
+      expect(SCRIPT_SYSTEM_PROMPT).toContain('visuals[].anchor');
+      expect(SCRIPT_SYSTEM_PROMPT).toContain('visuals[].target');
+      expect(SCRIPT_SYSTEM_PROMPT).toContain('visuals[].value');
+      expect(SCRIPT_SYSTEM_PROMPT).toContain('KESİNLİKLE');
+    });
+
+    it('keeps narration markers out of the word budget and lets cues match the spoken words', () => {
+      const warnings: string[] = [];
+      const schema = createScriptResponseSchema([storyUrl], {
+        pageCapturesByUrl: captures,
+        onWarn: (msg) => warnings.push(msg),
+      });
+
+      const parsed = schema.parse(
+        buildInput({
+          visuals: [
+            { kind: 'focus', anchor: 'yeni model', target: 'h1' },
+            { kind: 'stat', anchor: 'yüzde 40 artış', target: '%40' },
+          ],
+        })
+      );
+
+      expect(warnings).toHaveLength(0);
+      expect(parsed.segments[0].narration_tr).toBe(narrationWithMarkers);
+      expect(parsed.segments[0].visuals).toHaveLength(2);
+    });
+
+    it('drops visual cues whose anchor, target, or value embeds an emotion marker with a warning', () => {
+      const warnings: string[] = [];
+      const schema = createScriptResponseSchema([storyUrl], {
+        pageCapturesByUrl: captures,
+        onWarn: (msg) => warnings.push(msg),
+      });
+
+      const parsed = schema.parse(
+        buildInput({
+          visuals: [
+            { kind: 'focus', anchor: '[thoughtful] yeni model', target: 'h1' },
+            { kind: 'focus', anchor: 'yeni model', target: '[pause]h1' },
+            { kind: 'stat', anchor: 'yüzde 40 artış', value: '%40 [excited]' },
+            { kind: 'circle', anchor: 'yüzde 40', target: 'p1' },
+          ],
+        })
+      );
+
+      expect(warnings).toHaveLength(3);
+      expect(warnings[0]).toContain('anchor contains an emotion marker');
+      expect(warnings[1]).toContain('target contains an emotion marker');
+      expect(warnings[2]).toContain('value contains an emotion marker');
+      expect(parsed.segments[0].visuals).toEqual([{ kind: 'circle', anchor: 'yüzde 40', target: 'p1' }]);
+    });
+
+    it('strips emotion markers from headline_tr with a warning and keeps the story', () => {
+      const warnings: string[] = [];
+      const schema = createScriptResponseSchema([storyUrl], {
+        pageCapturesByUrl: captures,
+        onWarn: (msg) => warnings.push(msg),
+      });
+
+      const parsed = schema.parse(buildInput({ headline_tr: '[excited] Yeni   Model [pause]' }));
+
+      expect(parsed.segments[0].headline_tr).toBe('Yeni Model');
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain('removed emotion marker(s) from headline_tr');
+    });
+
+    it('rejects a headline_tr that contains only emotion markers', () => {
+      const schema = createScriptResponseSchema([storyUrl], { pageCapturesByUrl: captures });
+
+      const result = schema.safeParse(buildInput({ headline_tr: '[pause] [sighs]' }));
+
+      expect(result.success).toBe(false);
+      if (result.success) {
+        return;
+      }
+      expect(result.error.issues.map((i) => i.message).join(' ')).toContain(
+        'contains only emotion markers'
+      );
+    });
+  });
 });

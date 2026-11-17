@@ -1,4 +1,5 @@
 import type { WordTiming } from './captions.ts';
+import { stripEmotionMarkers } from './script.ts';
 import { SHORT_CTA, SHORT_FPS, SHORT_MAX_SECONDS, SHORT_SECTION_SECONDS, SHORT_TARGET_SECONDS, type Short } from './shorts.ts';
 
 export interface ShortSection { startFrame: number; endFrame: number; text: string }
@@ -7,7 +8,8 @@ const normalizeWord = (word: string): string => word.toLocaleLowerCase('tr').rep
 
 /** Boundaries follow actual aligned words; the end card holds long enough to read both handles. */
 export function buildShortTiming(short: Short, words: readonly WordTiming[], durationSeconds: number): ShortTiming {
-  const texts = [short.hook, ...short.topics.map((topic) => topic.line), SHORT_CTA];
+  // Emotion markers are voice directions, not spoken words, so they never appear in sections or word matching.
+  const texts = [short.hook, ...short.topics.map((topic) => topic.line), SHORT_CTA].map(stripEmotionMarkers);
   const expected = texts.flatMap((text) => text.split(/\s+/));
   if (expected.length !== words.length || expected.some((word, index) => normalizeWord(word) !== normalizeWord(words[index].word))) {
     throw new Error('Short word alignment does not match narration. Regenerate voice with original-text timestamps.');

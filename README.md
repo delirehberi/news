@@ -124,7 +124,7 @@ The `video/` package is a standalone Node.js (v22+ native TypeScript) CLI and Re
 | `AI_MODEL` | `translate`, `script` | — | Model identifier for Turkish translation and narration script generation. |
 | `ELEVENLABS_API_KEY` | `voice` | — | ElevenLabs API key (`xi-api-key`). If omitted alongside `ELEVENLABS_VOICE_ID`, `voice` falls back to deterministic silent mock audio and alignments. |
 | `ELEVENLABS_VOICE_ID` | `voice` | — | ElevenLabs Turkish-capable voice ID. |
-| `ELEVENLABS_MODEL_ID` | `voice` | `eleven_multilingual_v2` | ElevenLabs TTS model ID. |
+| `ELEVENLABS_MODEL_ID` | `voice` | `eleven_v4` | ElevenLabs TTS model ID. `eleven_v4` and `eleven_v3` interpret bracketed emotion markers (`[pause]`, `[thoughtful]`); other models have these markers stripped with a warning before synthesis. |
 | `YOUTUBE_CLIENT_ID` | `auth`, `upload` | — | Google Cloud OAuth 2.0 Desktop client ID (YouTube Data API v3 enabled). |
 | `YOUTUBE_CLIENT_SECRET` | `auth`, `upload` | — | Google Cloud OAuth 2.0 Desktop client secret. |
 | `YOUTUBE_REFRESH_TOKEN` | `upload` | — | Refresh token printed by `make video-auth`. |
