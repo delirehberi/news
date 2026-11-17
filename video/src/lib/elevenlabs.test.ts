@@ -77,6 +77,106 @@ describe('src/lib/elevenlabs.ts', () => {
     ).rejects.toThrowError(/missing character alignment object/);
   });
 
+  describe('emotion tag guard', () => {
+    const MODEL_V4 = 'eleven_v4';
+    const MODEL_V3 = 'eleven_v3';
+    const MODEL_MULTILINGUAL_V2 = 'eleven_multilingual_v2';
+
+    function buildSuccessFetch(): ReturnType<typeof vi.fn<typeof fetch>> {
+      const fakeMp3Bytes = new Uint8Array([0xff, 0xfb, 0x90, 0xc4]);
+      return vi.fn<typeof fetch>().mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            audio_base64: Buffer.from(fakeMp3Bytes).toString('base64'),
+            alignment: {
+              characters: ['a'],
+              character_start_times_seconds: [0],
+              character_end_times_seconds: [0.1],
+            },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        )
+      );
+    }
+
+    function sentText(mockFetch: ReturnType<typeof buildSuccessFetch>): string {
+      const [, requestInit] = mockFetch.mock.calls[0];
+      const body = JSON.parse(String(requestInit?.body)) as { text: string };
+      return body.text;
+    }
+
+    it('keeps bracketed audio tags unchanged for eleven_v4 and eleven_v3 without warning', async () => {
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+      for (const modelId of [MODEL_V4, MODEL_V3]) {
+        const mockFetch = buildSuccessFetch();
+        await synthesizeWithTimestamps({
+          apiKey: 'el-secret-key',
+          voiceId: 'voice-tr-123',
+          modelId,
+          text: '[thoughtful] Merhaba [pause] dünya',
+          fetchImpl: mockFetch,
+        });
+        expect(sentText(mockFetch)).toBe('[thoughtful] Merhaba [pause] dünya');
+      }
+
+      expect(warnSpy).not.toHaveBeenCalled();
+      warnSpy.mockRestore();
+    });
+
+    it('strips bracketed markers and warns when a non-v3/v4 model is configured', async () => {
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      const mockFetch = buildSuccessFetch();
+
+      await synthesizeWithTimestamps({
+        apiKey: 'el-secret-key',
+        voiceId: 'voice-tr-123',
+        modelId: MODEL_MULTILINGUAL_V2,
+        text: '[thoughtful] Merhaba   [pause]  dünya',
+        fetchImpl: mockFetch,
+      });
+
+      expect(sentText(mockFetch)).toBe('Merhaba dünya');
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(String(warnSpy.mock.calls[0][0])).toContain(MODEL_MULTILINGUAL_V2);
+      warnSpy.mockRestore();
+    });
+
+    it('does not warn when a non-v3/v4 model receives text without markers', async () => {
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      const mockFetch = buildSuccessFetch();
+
+      await synthesizeWithTimestamps({
+        apiKey: 'el-secret-key',
+        voiceId: 'voice-tr-123',
+        modelId: MODEL_MULTILINGUAL_V2,
+        text: 'Merhaba dünya',
+        fetchImpl: mockFetch,
+      });
+
+      expect(sentText(mockFetch)).toBe('Merhaba dünya');
+      expect(warnSpy).not.toHaveBeenCalled();
+      warnSpy.mockRestore();
+    });
+
+    it('rejects text that only contains markers for a non-v3/v4 model', async () => {
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      const mockFetch = buildSuccessFetch();
+
+      await expect(
+        synthesizeWithTimestamps({
+          apiKey: 'el-secret-key',
+          voiceId: 'voice-tr-123',
+          modelId: MODEL_MULTILINGUAL_V2,
+          text: '[pause]',
+          fetchImpl: mockFetch,
+        })
+      ).rejects.toThrowError(/empty after removing unsupported emotion tags/);
+      expect(mockFetch).not.toHaveBeenCalled();
+      warnSpy.mockRestore();
+    });
+  });
+
   it('generates valid MPEG-1 Layer III silent MP3 frames and Turkish character alignment in synthesizeMockWithTimestamps', () => {
     const text = 'Merhaba arkadaşlar, bu hafta yazılım dünyasında neler oldu?';
     const result = synthesizeMockWithTimestamps(text);

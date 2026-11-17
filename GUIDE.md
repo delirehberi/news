@@ -84,7 +84,7 @@ CF_ACCESS_CLIENT_SECRET=
 
 ELEVENLABS_API_KEY=replace-with-your-elevenlabs-key
 ELEVENLABS_VOICE_ID=replace-with-your-turkish-capable-voice-id
-ELEVENLABS_MODEL_ID=eleven_multilingual_v2
+ELEVENLABS_MODEL_ID=eleven_v4
 
 YOUTUBE_CLIENT_ID=replace-with-your-desktop-oauth-client-id
 YOUTUBE_CLIENT_SECRET=replace-with-your-desktop-oauth-client-secret
@@ -100,6 +100,7 @@ VIDEO_ITEM_COUNT=6
 - If Cloudflare Access protects the gateway, set both `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET` to your Access service-token credentials. Translation and script requests send them as `CF-Access-Client-Id` and `CF-Access-Client-Secret`, alongside gateway authentication. The Access application must have a Service Auth policy allowing that service token. Keep `AI_GATEWAY_API_KEY` set to the gateway API token; it is a separate credential. See [Cloudflare service-token authentication](https://developers.cloudflare.com/cloudflare-one/access-controls/service-credentials/service-tokens/).
 - Set both ElevenLabs credentials for real narration. If both are missing, the current implementation generates silent mock audio automatically. Render and upload do not currently reject that audio. Do not use mock audio for the final video.
 - Set `NEWS_API_BASE_URL` and `ELEVENLABS_MODEL_ID` explicitly, rather than leaving their template entries empty.
+- `ELEVENLABS_MODEL_ID` defaults to `eleven_v4`, which interprets bracketed emotion markers such as `[pause]` and `[thoughtful]`. `eleven_v3` also supports them. Any other model receives the narration with these markers stripped, and the voice step logs a warning.
 - `VIDEO_ITEM_COUNT` defaults to six and accepts 1–20. The actual selection may contain fewer stories if there are fewer distinct candidates.
 - `YOUTUBE_PRIVACY=private` lets you review the upload before making it public. `unlisted` and `public` are also accepted.
 
@@ -282,7 +283,7 @@ Stop on an error, read its message, and resolve the cause before retrying the af
 | Approval rejects the script | Correct the required headings, sequential story numbers, nonempty narration, or 280–2000 word budget; rerun `make video-approve WEEK="$WEEK"`. |
 | Production says the edition is a draft | Complete script review and approval first. |
 | Audio is silent or the log says `[mock]` | Set both ElevenLabs credentials, run `weekly_step voice`, listen again, then rerender. Changing from mock to real mode invalidates the matching mock cache. |
-| ElevenLabs reports an invalid model ID | Set `ELEVENLABS_MODEL_ID=eleven_multilingual_v2` in `video/.env`, the pipeline's default for Turkish narration. Model IDs must match the API identifiers exactly; `eleven-v4-turbo` is invalid. Check for an exported shell value overriding the file before retrying voice. |
+| ElevenLabs reports an invalid model ID | Set `ELEVENLABS_MODEL_ID=eleven_v4` in `video/.env`, the pipeline's default. Model IDs must match the API identifiers exactly; `eleven-v4-turbo` is invalid. Check for an exported shell value overriding the file before retrying voice. |
 | Narration needs a correction before upload | Edit `script.md`, approve again, then rerun voice and render. Voice reuses unchanged narration segments. |
 | Voice settings changed but audio was skipped | The cache checks narration and mock mode, not voice/model settings. Back up and remove the affected MP3/JSON pairs from this week's `audio/` directory before regenerating them. |
 | Rendering fails | Check the reported browser, dependency, or missing-audio error. Resolve it and rerun `weekly_step render`. |

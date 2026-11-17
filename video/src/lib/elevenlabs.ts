@@ -10,6 +10,12 @@ export const DEFAULT_ELEVENLABS_BASE_URL = 'https://api.elevenlabs.io';
 export const ELEVENLABS_OUTPUT_FORMAT = 'mp3_44100_128';
 export const DEFAULT_TTS_TIMEOUT_MS = 60_000;
 
+// Only the v3 and v4 model families interpret bracketed audio tags such as `[pause]`.
+// Other models read them aloud literally, so they are stripped before synthesis.
+const EMOTION_TAG_MODEL_PATTERN = /^eleven_v[34](?:_|$)/;
+// Matches a bracketed marker of letters/spaces/hyphens (e.g. `[pause]`, `[thoughtful]`) plus surrounding whitespace.
+const EMOTION_TAG_PATTERN = /\s*\[\s*[A-Za-z][A-Za-z -]*\]\s*/g;
+
 // MPEG-1 Layer III, 44100 Hz, 128 kbps, Mono frame constants for deterministic silent MP3 generation
 const MP3_SAMPLE_RATE_HZ = 44_100;
 const MP3_SAMPLES_PER_FRAME = 1_152;
@@ -55,17 +61,46 @@ function buildTtsWithTimestampsUrl(
   return `${trimmedBase}/v1/text-to-speech/${encodedVoiceId}/with-timestamps?output_format=${encodedFormat}`;
 }
 
+export function supportsEmotionTags(modelId: string): boolean {
+  return EMOTION_TAG_MODEL_PATTERN.test(modelId.trim());
+}
+
+/**
+ * Removes bracketed emotion markers when the configured model cannot interpret them,
+ * so they are never spoken literally. Emits a warning whenever markers are stripped.
+ */
+function stripUnsupportedEmotionTags(text: string, modelId: string): string {
+  if (supportsEmotionTags(modelId)) return text;
+
+  const markers = text.match(EMOTION_TAG_PATTERN);
+  if (!markers) return text;
+
+  console.warn(
+    `ElevenLabs model "${modelId}" does not support emotion audio tags; stripped ${markers.length} bracketed marker(s) before synthesis. Use eleven_v3 or eleven_v4 to keep them.`
+  );
+  return text.replace(EMOTION_TAG_PATTERN, ' ').trim();
+}
+
 /**
  * Calls ElevenLabs `POST /v1/text-to-speech/{voice_id}/with-timestamps` with `xi-api-key`,
  * `model_id`, and `output_format=mp3_44100_128`.
+ * Bracketed emotion markers are stripped (with a warning) unless the model is v3 or v4,
+ * so the returned alignment matches the text that was actually spoken.
  * Decodes `audio_base64` into raw MP3 bytes and validates character-level alignment.
  */
 export async function synthesizeWithTimestamps(
   options: SynthesizeWithTimestampsOptions
 ): Promise<SynthesizedSpeechResult> {
-  const text = options.text.trim();
-  if (!text) {
+  const trimmedText = options.text.trim();
+  if (!trimmedText) {
     throw new Error('Cannot synthesize speech for empty narration text.');
+  }
+
+  const text = stripUnsupportedEmotionTags(trimmedText, options.modelId);
+  if (!text) {
+    throw new Error(
+      'Cannot synthesize speech: narration text is empty after removing unsupported emotion tags.'
+    );
   }
 
   const url = buildTtsWithTimestampsUrl(

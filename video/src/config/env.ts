@@ -3,7 +3,7 @@ import path from 'node:path';
 import { z } from 'zod';
 
 export const DEFAULT_NEWS_API_BASE_URL = 'https://news.emre.xyz';
-export const DEFAULT_ELEVENLABS_MODEL_ID = 'eleven_multilingual_v2';
+export const DEFAULT_ELEVENLABS_MODEL_ID = 'eleven_v4';
 export const DEFAULT_YOUTUBE_PRIVACY = 'private' as const;
 export const DEFAULT_VIDEO_ITEM_COUNT = 6;
 export const MIN_VIDEO_ITEM_COUNT = 1;

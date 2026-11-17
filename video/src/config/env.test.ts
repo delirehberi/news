@@ -59,6 +59,7 @@ describe('src/config/env.ts', () => {
 
     expect(env.NEWS_API_BASE_URL).toBe(DEFAULT_NEWS_API_BASE_URL);
     expect(env.INGESTION_SECRET).toBe('secret-token-123');
+    expect(DEFAULT_ELEVENLABS_MODEL_ID).toBe('eleven_v4');
     expect(env.ELEVENLABS_MODEL_ID).toBe(DEFAULT_ELEVENLABS_MODEL_ID);
     expect(env.YOUTUBE_PRIVACY).toBe(DEFAULT_YOUTUBE_PRIVACY);
     expect(env.VIDEO_ITEM_COUNT).toBe(DEFAULT_VIDEO_ITEM_COUNT);
