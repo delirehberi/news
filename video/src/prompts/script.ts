@@ -16,6 +16,7 @@ import {
 } from '../domain/pageCapture.ts';
 import {
   countScriptWords,
+  EMOTION_MARKER_PATTERN,
   stripEmotionMarkers,
   WORDS_MAX,
   WORDS_MIN,
@@ -75,6 +76,13 @@ Yazım, Seslendirme, Görsel Yönetmenlik ve Kelime Bütçesi Kuralları:
 2. Doğal Konuşma ve Sunum Dili:
    - Metin sesli okunacaktır (ElevenLabs TTS). Yazı dili yerine kulağa doğal gelen, net, enerjik ve profesyonel bir yayıncı/sunucu Türkçesi kullan.
    - Çok uzun, karmaşık veya iç içe geçmiş yan cümlelerden kaçın; nefes payı bırakan akıcı cümleler kur.
+   - Duygu ve Tempo İşaretleri (ElevenLabs ses etiketleri):
+     - Yalnızca \`intro\`, \`segments[].narration_tr\` ve \`outro\` alanlarında, seyrek ve doğal biçimde köşeli parantez içinde ses etiketi kullanabilirsin: \`[pause]\`, \`[short pause]\`, \`[thoughtful]\`, \`[excited]\`, \`[curious]\`, \`[serious]\`, \`[surprised]\`, \`[sighs]\`.
+     - Bir haber segmentinde en fazla 2 etiket kullan; çoğu cümlede etiket olmasın. Etiketi cümle başında veya noktalama işaretinden sonra koy.
+     - Etiketler sesli okunmaz ve kelime sayımına dahil edilmez; etiketsiz metin yine de kelime bütçesini karşılamalıdır.
+     - Yukarıdaki listedeki kısa ifadeler dışında köşeli parantez açma (ör. \`[2 saniye bekle]\`, \`[1]\` gibi kaynak numaraları yazma).
+     - \`headline_tr\`, \`item_url\` ve \`visuals[].anchor\`, \`visuals[].target\`, \`visuals[].value\` alanlarında KESİNLİKLE köşeli parantezli ses etiketi kullanma.
+     - \`visuals[].anchor\` ifadesi, \`narration_tr\` içinde etiketler çıkarıldığında geçen kelimelerle birebir eşleşmelidir; etiketi anchor'a ekleme.
 3. Teknik Terimler:
    - Türkçe teknoloji yayıncılığında doğal olarak İngilizce kullanılan terimleri (open source, LLM, runtime, cloud, kernel, benchmark, framework, API, SDK, GPU, serverless vb.) olduğu gibi koru.
 4. Yapı ve Görsel Koreografi (\`visuals\`):
@@ -157,6 +165,28 @@ function toCuePageElements(
           height: 60,
         },
   }));
+}
+
+function hasEmotionMarker(text: string): boolean {
+  // String#search ignores the global flag's lastIndex state, so this is safe to call repeatedly.
+  return text.search(EMOTION_MARKER_PATTERN) !== -1;
+}
+
+/**
+ * Returns the first visual cue text field (`anchor`, `target`, `value`) that embeds an emotion
+ * marker. Those fields are matched against on-screen content and element ids, so markers are never allowed.
+ */
+function findEmotionMarkedCueField(cue: VisualCue): 'anchor' | 'target' | 'value' | undefined {
+  if (hasEmotionMarker(cue.anchor)) {
+    return 'anchor';
+  }
+  if (cue.target !== undefined && hasEmotionMarker(cue.target)) {
+    return 'target';
+  }
+  if (cue.value !== undefined && hasEmotionMarker(cue.value)) {
+    return 'value';
+  }
+  return undefined;
 }
 
 /**
@@ -302,6 +332,14 @@ export function sanitizeSegmentVisualCues(options: {
 
     const cue = parsed.data;
 
+    const markedField = findEmotionMarkedCueField(cue);
+    if (markedField) {
+      warn(
+        `Story #${storyIndex} (${itemUrl}): dropping visual cue #${idx + 1} (${cue.kind}) because ${markedField} contains an emotion marker; markers are only allowed in narration_tr.`
+      );
+      continue;
+    }
+
     if (!isAnchorInNarration(cue.anchor, narrationTr)) {
       warn(
         `Story #${storyIndex} (${itemUrl}): dropping visual cue #${idx + 1} (${cue.kind}) because anchor "${cue.anchor}" does not appear in narration_tr.`
@@ -410,6 +448,16 @@ export function createScriptResponseSchema(
       return;
     }
 
+    for (const [idx, seg] of data.segments.entries()) {
+      if (stripEmotionMarkers(seg.headline_tr) === '') {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['segments', idx, 'headline_tr'],
+          message: `Story ${idx + 1} headline_tr contains only emotion markers; it must include visible text.`,
+        });
+      }
+    }
+
     for (let i = 0; i < expectedUrls.length; i++) {
       const expectedUrl = expectedUrls[i].trim();
       const actualUrl = data.segments[i].item_url.trim();
@@ -452,9 +500,18 @@ export function createScriptResponseSchema(
         onWarn,
       });
 
+      // Headlines render as on-screen card text, so markers are removed rather than spoken or shown.
+      let headlineTr = seg.headline_tr;
+      if (hasEmotionMarker(headlineTr)) {
+        headlineTr = stripEmotionMarkers(headlineTr);
+        (onWarn ?? ((msg: string) => console.warn(msg)))(
+          `Story #${storyIndex} (${seg.item_url}): removed emotion marker(s) from headline_tr; markers are only allowed in narration_tr.`
+        );
+      }
+
       return {
         item_url: seg.item_url,
-        headline_tr: seg.headline_tr,
+        headline_tr: headlineTr,
         narration_tr: seg.narration_tr,
         ...(visuals ? { visuals } : {}),
       };
